@@ -1,0 +1,6 @@
+package/
+*.tar
+*.tar.gz
+*.tgz
+*.tar.zst
+*.sha256

@@ -45,6 +45,32 @@ The executable should either:
 
 When optional features such as Parquet output are unavailable, the tool should say so directly and suggest a supported output format.
 
+### Portable Linux Bundle
+
+The current practical Linux deployment unit is a relocatable bundle:
+
+```text
+hypersync-linux-x86_64/
+  bin/hypersync
+  bin/hypersync.bin
+  lib/
+  config/default.yaml
+  manifest.txt
+  checksums.sha256
+```
+
+Users should be able to unpack it on a Linux server and run:
+
+```bash
+./bin/hypersync --version
+./bin/hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
+```
+
+The wrapper at `bin/hypersync` sets `LD_LIBRARY_PATH` to the bundle's `lib/`
+directory before starting the real executable. The bundle is produced by
+`hypersync/deploy/package-linux.sh` and should be built on Linux so the staged
+binary and `.so` files match the target platform.
+
 ### Local Test Installation
 
 Users should be able to test the tool without NFS:

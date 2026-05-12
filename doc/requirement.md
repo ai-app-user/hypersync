@@ -288,6 +288,33 @@ Remaining:
 - Add JSON or NDJSON summaries if needed.
 - Document every output column and field.
 
+### Portable Deployment
+
+Status: Partial
+
+Requirements:
+- Hypersync must support a Linux deployment bundle that can be copied to a
+  server and run without installing DuckDB, libnfs, or other optional runtime
+  libraries globally.
+- The bundle must include the compiled executable, required staged shared
+  libraries, default config, a manifest, checksums, and a wrapper that sets the
+  runtime library path relative to the bundle.
+- The packaging process must be repeatable from the repository, not manual.
+- The package verification step must run the staged executable from the bundle
+  before reporting success.
+
+Current state:
+- `hypersync/deploy/package-linux.sh` builds or stages a Linux release binary,
+  copies selected runtime libraries reported by `ldd`, writes a manifest and
+  checksums, verifies `--version`, and optionally creates a `.tar.gz` archive.
+- `hypersync/deploy/run-hypersync` is the relocatable runtime wrapper copied to
+  `bin/hypersync` in the bundle.
+
+Remaining:
+- Add CI or release automation that produces signed Linux artifacts.
+- Decide whether production release bundles should include all resolved dynamic
+  libraries or only optional non-system libraries.
+
 ### Configuration
 
 Status: Partial
