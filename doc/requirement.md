@@ -299,8 +299,10 @@ Requirements:
 - The bundle must be a simple flat folder, not a nested `bin/`, `lib/`,
   `config/`, and `doc/` tree.
 - The bundle must include the launcher script, compiled executable, required
-  staged shared libraries, default config, a runtime library list, a manifest,
-  and checksums in that one folder.
+  staged shared libraries, default config, a README, a manifest, and checksums
+  in that one folder.
+- The README must name the expected runtime library families directly; do not
+  create a separate runtime-library listing file for that.
 - The launcher must set the runtime library path relative to itself.
 - The packaging process must be repeatable from the repository, not manual.
 - The package verification step must run the staged executable from the bundle
@@ -314,8 +316,7 @@ Current state:
   checksums, verifies `--version`, and optionally creates a `.tar.gz` archive.
 - `hypersync/deploy/package-linux.sh` produces a flat bundle with
   `hypersync`, `hypersync.bin`, `default.yaml`, copied `.so` files,
-  `runtime-libraries.txt`, `README.txt`, `manifest.txt`, and
-  `checksums.sha256`.
+  `README.txt`, `manifest.txt`, and `checksums.sha256`.
 - `hypersync/deploy/run-hypersync` is the relocatable runtime launcher copied
   to `hypersync` in the bundle.
 - `hypersync/deploy/install-hypersync.sh` is the one-command new-server

@@ -16,8 +16,21 @@ hypersync-linux-<arch>/
   hypersync                 # launcher script; this is what users run
   hypersync.bin             # compiled executable
   default.yaml              # default config
-  *.so*                     # copied runtime libraries
-  runtime-libraries.txt     # exact copied library list
+  libduckdb.so*             # DuckDB and Parquet writer support
+  libnfs.so*                # direct libnfs access for nfs:// URLs
+  libssl.so*, libcrypto.so* # OpenSSL runtime dependencies when linked
+  libzstd.so*               # Zstandard compression when linked
+  libsnappy.so*             # Snappy compression when linked
+  liblz4.so*                # LZ4 compression when linked
+  libz.so*                  # zlib compression when linked
+  libstdc++.so*             # C++ runtime when needed on the target host
+  libgcc_s.so*              # GCC runtime when needed on the target host
+  libtirpc.so*              # RPC dependency when required
+  libgssapi*.so*            # Kerberos/GSSAPI dependency when required
+  libkrb5*.so*              # Kerberos dependency when required
+  libk5crypto.so*           # Kerberos crypto dependency when required
+  libcom_err.so*            # Kerberos/platform dependency when required
+  libkeyutils.so*           # Kerberos/platform dependency when required
   README.txt
   manifest.txt
   checksums.sha256
@@ -79,31 +92,12 @@ relocatable by setting `LD_LIBRARY_PATH` to its own directory before starting
 
 ## Runtime Libraries
 
-`runtime-libraries.txt` in the bundle contains the exact copied library list
-from the packaging host. The expected runtime library families are:
+The bundle layout above lists the runtime library families Hypersync may copy.
+Not every bundle will contain every library above. The exact list depends on how
+the Linux binary was linked on the packaging host.
 
-```text
-libduckdb.so*       DuckDB and Parquet writer support
-libnfs.so*          Direct libnfs access for nfs:// URLs
-libssl.so*          OpenSSL runtime dependency when linked
-libcrypto.so*       OpenSSL-backed hashing/crypto dependency when linked
-libzstd.so*         Zstandard compression
-libsnappy.so*       Snappy compression
-liblz4.so*          LZ4 compression
-libz.so*            zlib compression
-libstdc++.so*       C++ runtime when needed on the target host
-libgcc_s.so*        GCC runtime when needed on the target host
-libtirpc.so*        RPC dependency when required by libnfs/platform libs
-libgssapi*.so*      Kerberos/GSSAPI dependency when required
-libkrb5*.so*        Kerberos dependency when required
-libk5crypto.so*     Kerberos crypto dependency when required
-libcom_err.so*      Kerberos/platform dependency when required
-libkeyutils.so*     Kerberos/platform dependency when required
-```
-
-Not every bundle will contain every library above. The exact list depends on
-how the Linux binary was linked. The packager records what it actually copied
-in `runtime-libraries.txt` and records full `ldd` output in `manifest.txt`.
+The packager records full `ldd` output in `manifest.txt`, and
+`checksums.sha256` records every file shipped in the bundle.
 
 ## Build A Bundle On Linux
 

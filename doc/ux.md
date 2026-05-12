@@ -57,8 +57,13 @@ hypersync-linux-x86_64/
   hypersync
   hypersync.bin
   default.yaml
-  *.so*
-  runtime-libraries.txt
+  libduckdb.so*
+  libnfs.so*
+  libssl.so*, libcrypto.so*
+  libzstd.so*, libsnappy.so*, liblz4.so*, libz.so*
+  libstdc++.so*, libgcc_s.so*
+  libtirpc.so*, libgssapi*.so*, libkrb5*.so*, libk5crypto.so*
+  libcom_err.so*, libkeyutils.so*
   README.txt
   manifest.txt
   checksums.sha256
@@ -145,10 +150,9 @@ When a server has no internet access, the same archive should be copied with
 runtime experience is identical because all required non-system runtime
 libraries live in the same folder as the `hypersync` launcher.
 
-The bundle must include a human-readable `runtime-libraries.txt` that lists the
-expected runtime library families and the exact `.so` files copied during
-packaging. Users should not need to run `ldd` to understand what came with the
-bundle.
+The bundle README must list the expected runtime library families directly so
+users do not need a separate text file to understand which `.so` files may be
+present. The exact linker view remains in `manifest.txt`.
 
 ### Local Test Installation
 
