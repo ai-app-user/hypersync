@@ -19,6 +19,9 @@ This document defines general development principles for the application. It sho
 - Keep command behavior stable enough for automation.
 - Add configuration only when it has a clear operational purpose.
 - Keep defaults safe for small local tests, with explicit options for high-performance runs.
+- Keep deployment UX brutally simple: prefer one-command install/run flows and
+  flat deploy bundles over nested layout when the artifact contains only a few
+  files.
 - Move file payload buffers by ownership between jobs; do not copy data bytes into queue messages.
 - New hot-path pipeline jobs should consume and emit `BufferHandle` values through `BufQueue` and operate on `RawBufferPool` slots. Typed payload interpretation belongs at the element/view level only.
 - Preallocate payload buffers for high-volume data paths; do not allocate or free per-chunk payload memory during steady-state reads, writes, hashing, or transfer.

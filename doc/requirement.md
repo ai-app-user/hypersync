@@ -296,19 +296,30 @@ Requirements:
 - Hypersync must support a Linux deployment bundle that can be copied to a
   server and run without installing DuckDB, libnfs, or other optional runtime
   libraries globally.
-- The bundle must include the compiled executable, required staged shared
-  libraries, default config, a manifest, checksums, and a wrapper that sets the
-  runtime library path relative to the bundle.
+- The bundle must be a simple flat folder, not a nested `bin/`, `lib/`,
+  `config/`, and `doc/` tree.
+- The bundle must include the launcher script, compiled executable, required
+  staged shared libraries, default config, a runtime library list, a manifest,
+  and checksums in that one folder.
+- The launcher must set the runtime library path relative to itself.
 - The packaging process must be repeatable from the repository, not manual.
 - The package verification step must run the staged executable from the bundle
   before reporting success.
+- There must be a one-command installer script for new servers that downloads,
+  verifies, unpacks, and smoke-tests the bundle.
 
 Current state:
 - `hypersync/deploy/package-linux.sh` builds or stages a Linux release binary,
   copies selected runtime libraries reported by `ldd`, writes a manifest and
   checksums, verifies `--version`, and optionally creates a `.tar.gz` archive.
-- `hypersync/deploy/run-hypersync` is the relocatable runtime wrapper copied to
-  `bin/hypersync` in the bundle.
+- `hypersync/deploy/package-linux.sh` produces a flat bundle with
+  `hypersync`, `hypersync.bin`, `default.yaml`, copied `.so` files,
+  `runtime-libraries.txt`, `README.txt`, `manifest.txt`, and
+  `checksums.sha256`.
+- `hypersync/deploy/run-hypersync` is the relocatable runtime launcher copied
+  to `hypersync` in the bundle.
+- `hypersync/deploy/install-hypersync.sh` is the one-command new-server
+  installer.
 
 Remaining:
 - Add CI or release automation that produces signed Linux artifacts.

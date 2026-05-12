@@ -2,7 +2,6 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-bundle_root="$(cd -- "$script_dir/.." && pwd -P)"
 
-export LD_LIBRARY_PATH="$bundle_root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$script_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$script_dir/hypersync.bin" "$@"

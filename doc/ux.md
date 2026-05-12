@@ -47,14 +47,19 @@ When optional features such as Parquet output are unavailable, the tool should s
 
 ### Portable Linux Bundle
 
-The current practical Linux deployment unit is a relocatable bundle:
+The current practical Linux deployment unit is a relocatable flat folder. The
+folder intentionally avoids `bin/`, `lib/`, `config/`, and `doc/` subfolders
+because there are only a few files and the user should immediately see the
+launcher, binary, config, and runtime libraries.
 
 ```text
 hypersync-linux-x86_64/
-  bin/hypersync
-  bin/hypersync.bin
-  lib/
-  config/default.yaml
+  hypersync
+  hypersync.bin
+  default.yaml
+  *.so*
+  runtime-libraries.txt
+  README.txt
   manifest.txt
   checksums.sha256
 ```
@@ -62,50 +67,54 @@ hypersync-linux-x86_64/
 Users should be able to unpack it on a Linux server and run:
 
 ```bash
-./bin/hypersync --version
-./bin/hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
+./hypersync --version
+./hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
 ```
 
-The wrapper at `bin/hypersync` sets `LD_LIBRARY_PATH` to the bundle's `lib/`
-directory before starting the real executable. The bundle is produced by
+The `hypersync` launcher sets `LD_LIBRARY_PATH` to its own directory before
+starting `hypersync.bin`, so the copied `.so` files are used without installing
+anything globally. The bundle is produced by
 `hypersync/deploy/package-linux.sh` and should be built on Linux so the staged
 binary and `.so` files match the target platform.
 
 ### New Server Download And Run
 
 A user setting up a new Linux server should not need to understand the build
-system, DuckDB, libnfs, or dynamic linker details. The expected flow is:
-
-1. Download one release asset for the server architecture.
-2. Verify the archive checksum.
-3. Unpack it into any user-writable directory.
-4. Run `bin/hypersync --version`.
-5. Run a small local scan or NFS scan.
-6. Move to the real scan/hash/copy command once the smoke test succeeds.
+system, DuckDB, libnfs, checksums, or dynamic linker details. The expected flow
+is one command that downloads the installer script and runs it:
 
 Example desired first-run flow:
 
 ```bash
-mkdir -p "$HOME/opt"
-cd "$HOME/opt"
+curl -fsSL https://raw.githubusercontent.com/ai-app-user/hypersync/main/deploy/install-hypersync.sh | sh
+```
 
-curl -L -o hypersync-linux-x86_64.tar.gz \
-  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz
-curl -L -o hypersync-linux-x86_64.tar.gz.sha256 \
-  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz.sha256
-sha256sum -c hypersync-linux-x86_64.tar.gz.sha256
+The installer should:
+- download the release archive for the current architecture
+- download and verify the `.sha256` checksum
+- unpack the flat bundle into `$HOME/hypersync` by default
+- run `$HOME/hypersync/hypersync --version`
+- print the exact command to use next
 
-tar -xzf hypersync-linux-x86_64.tar.gz
-cd hypersync-linux-x86_64
+For a private GitHub release, users can export a token once and still run one
+pipeline command:
 
-./bin/hypersync --version
-./bin/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
+```bash
+export GITHUB_TOKEN=...
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/ai-app-user/hypersync/main/deploy/install-hypersync.sh | sh
+```
+
+After install, the smoke test is:
+
+```bash
+$HOME/hypersync/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
 ```
 
 For a direct NFS smoke test:
 
 ```bash
-./bin/hypersync scan \
+$HOME/hypersync/hypersync scan \
   --source nfs://172.27.255.2/volumes/example/data \
   --output /mnt/local-nvme/hypersync-smoke.parquet \
   --output-format parquet \
@@ -127,14 +136,19 @@ The user should be able to add Hypersync to the shell path without moving the
 bundle internals:
 
 ```bash
-export PATH="$HOME/opt/hypersync-linux-x86_64/bin:$PATH"
+export PATH="$HOME/hypersync:$PATH"
 hypersync --version
 ```
 
 When a server has no internet access, the same archive should be copied with
 `scp`, `rsync`, or the site's artifact tool and unpacked in the same way. The
 runtime experience is identical because all required non-system runtime
-libraries live in the bundle's `lib/` directory.
+libraries live in the same folder as the `hypersync` launcher.
+
+The bundle must include a human-readable `runtime-libraries.txt` that lists the
+expected runtime library families and the exact `.so` files copied during
+packaging. Users should not need to run `ldd` to understand what came with the
+bundle.
 
 ### Local Test Installation
 

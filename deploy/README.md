@@ -8,67 +8,102 @@ runtime libraries globally.
 
 ## Bundle Layout
 
-`package-linux.sh` creates this layout:
+`package-linux.sh` creates a flat folder. The release artifact should be simple
+enough that users can inspect it with `ls` and immediately see what matters:
 
 ```text
 hypersync-linux-<arch>/
-  bin/
-    hypersync        # wrapper that sets LD_LIBRARY_PATH
-    hypersync.bin    # compiled executable
-  lib/
-    *.so*            # copied runtime libraries
-  config/
-    default.yaml
-  doc/
-    README.txt
+  hypersync                 # launcher script; this is what users run
+  hypersync.bin             # compiled executable
+  default.yaml              # default config
+  *.so*                     # copied runtime libraries
+  runtime-libraries.txt     # exact copied library list
+  README.txt
   manifest.txt
   checksums.sha256
 ```
 
-Run the deployed tool through the wrapper:
+Run the deployed tool with one command from the bundle folder:
 
 ```bash
-./bin/hypersync --version
-./bin/hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
+./hypersync --version
+./hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
 ```
 
 ## New Server UX
 
-The operator experience on a new Linux server should be a short copy, unpack,
-verify, run loop. No package installs should be required for DuckDB, libnfs, or
-other bundled runtime libraries.
+The operator experience on a new Linux server is one shell command. The command
+downloads the release archive, verifies the checksum, unpacks it into
+`$HOME/hypersync` by default, and runs `./hypersync --version`.
 
 ```bash
-mkdir -p "$HOME/opt"
-cd "$HOME/opt"
+curl -fsSL https://raw.githubusercontent.com/ai-app-user/hypersync/main/deploy/install-hypersync.sh | sh
+```
 
-curl -L -o hypersync-linux-x86_64.tar.gz \
-  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz
-curl -L -o hypersync-linux-x86_64.tar.gz.sha256 \
-  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz.sha256
-sha256sum -c hypersync-linux-x86_64.tar.gz.sha256
+For a private GitHub release, export a token first so both the script download
+and release asset download can authenticate:
 
-tar -xzf hypersync-linux-x86_64.tar.gz
-cd hypersync-linux-x86_64
+```bash
+export GITHUB_TOKEN=...
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://raw.githubusercontent.com/ai-app-user/hypersync/main/deploy/install-hypersync.sh | sh
+```
 
-./bin/hypersync --version
-./bin/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
+Useful installer overrides:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ai-app-user/hypersync/main/deploy/install-hypersync.sh | \
+  HYPERSYNC_VERSION=0.0.2 INSTALL_DIR=/opt/hypersync sh
+```
+
+After install, users run:
+
+```bash
+$HOME/hypersync/hypersync --version
+$HOME/hypersync/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
 ```
 
 For servers without outbound internet, copy the same `.tar.gz` and checksum
-with `scp`, `rsync`, or an internal artifact system, then run the same unpack
-and smoke-test commands.
-
-After unpacking, users may add the bundle to `PATH`:
+with `scp`, `rsync`, or an internal artifact system. Then unpack into one
+folder and run the launcher:
 
 ```bash
-export PATH="$HOME/opt/hypersync-linux-x86_64/bin:$PATH"
-hypersync --version
+mkdir -p "$HOME/hypersync"
+tar -xzf hypersync-linux-x86_64.tar.gz -C "$HOME/hypersync" --strip-components=1
+$HOME/hypersync/hypersync --version
 ```
 
-The `bin/hypersync` wrapper is the supported entrypoint. It keeps the bundle
-relocatable by setting `LD_LIBRARY_PATH` to the adjacent `lib/` directory before
-starting `bin/hypersync.bin`.
+The `hypersync` launcher is the supported entrypoint. It keeps the bundle
+relocatable by setting `LD_LIBRARY_PATH` to its own directory before starting
+`hypersync.bin`. Keep the launcher, binary, and `.so` files together.
+
+## Runtime Libraries
+
+`runtime-libraries.txt` in the bundle contains the exact copied library list
+from the packaging host. The expected runtime library families are:
+
+```text
+libduckdb.so*       DuckDB and Parquet writer support
+libnfs.so*          Direct libnfs access for nfs:// URLs
+libssl.so*          OpenSSL runtime dependency when linked
+libcrypto.so*       OpenSSL-backed hashing/crypto dependency when linked
+libzstd.so*         Zstandard compression
+libsnappy.so*       Snappy compression
+liblz4.so*          LZ4 compression
+libz.so*            zlib compression
+libstdc++.so*       C++ runtime when needed on the target host
+libgcc_s.so*        GCC runtime when needed on the target host
+libtirpc.so*        RPC dependency when required by libnfs/platform libs
+libgssapi*.so*      Kerberos/GSSAPI dependency when required
+libkrb5*.so*        Kerberos dependency when required
+libk5crypto.so*     Kerberos crypto dependency when required
+libcom_err.so*      Kerberos/platform dependency when required
+libkeyutils.so*     Kerberos/platform dependency when required
+```
+
+Not every bundle will contain every library above. The exact list depends on
+how the Linux binary was linked. The packager records what it actually copied
+in `runtime-libraries.txt` and records full `ldd` output in `manifest.txt`.
 
 ## Build A Bundle On Linux
 
@@ -109,7 +144,7 @@ hypersync/deploy/package-linux.sh
 - `BUILD`: set to `0` to skip `make release` and package an existing binary.
 - `MAKE_ARGS`: make arguments; defaults to `release -j$(nproc)`.
 - `CREATE_ARCHIVE`: set to `0` to skip creating the `.tar.gz` archive.
-- `EXTRA_LIBS`: colon-separated extra `.so` files to copy into `lib/`.
+- `EXTRA_LIBS`: colon-separated extra `.so` files to copy into the bundle.
 - `COPY_SYSTEM_LIBS`: set to `1` to copy every resolved `ldd` library except
   the dynamic loader and `linux-vdso`. The default copies portable optional
   runtime libraries such as DuckDB, libnfs, OpenSSL, zstd, snappy, lz4, zlib,
