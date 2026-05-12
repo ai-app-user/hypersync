@@ -1,0 +1,99 @@
+engine:
+  mode: transfer
+  small_file_threshold: 4096
+  large_chunk_bytes: 1048576
+  small_pool_slots: 8
+  large_pool_slots: 8
+  max_retries: 3
+  skip_verify: false
+
+runtime:
+  sender:
+    remote_host: 127.0.0.1
+    priority_port: 42001
+    data_port: 42002
+    recursive: true
+    cache_file_threshold_bytes: 0
+  receiver:
+    bind_host: 127.0.0.1
+    priority_port: 42001
+    data_port: 42002
+    backpressure_window_bytes: 0
+    backpressure_pause_ms: 0
+
+jobs:
+  defaults:
+    connection_count: 8
+  input_provider:
+    max_queue_entries: 1000000
+    refill_threshold: 100
+    refill_batch_size: 128
+    input_csv_path: input.csv
+    overflow_csv_path: input_overflow.csv
+  nfs_meta_reader:
+    worker_count: 8
+    async_directory_depth: 1
+    recbuf_window: 1000000
+    streaming_mode_threshold: 1000000
+    async_readdir: true
+    source_root: .
+    recursive: true
+  checker:
+    discard_checked_records: false
+  metadata_stats_discarder:
+    enabled: false
+    print_interval_seconds: 5
+    output: stderr
+  buffer_generator:
+    worker_count: 1
+    buffer_count: 0
+    pattern: xoshiro256
+    seed: 11400714819323198485
+    compression_ratio: 1.0
+  buffer_discarder:
+    worker_count: 1
+  data_hasher:
+    worker_count: 1
+    algorithm: xxh64
+    work_factor: 1
+  metadata_record_writer:
+    enabled: false
+    output_path: metadata.csv
+    format: auto
+    write_files: true
+    write_folders: true
+    flush_per_batch: false
+    duckdb_memory_limit: 32GB
+    duckdb_threads: 0
+    duckdb_checkpoint_threshold: 2GB
+    parquet_compression: zstd
+  nfs_data_reader:
+    data_reader_worker_count: 2
+    outstanding_requests: 256
+    large_file_parallelism: 8
+    small_file_threshold: 4096
+    large_chunk_bytes: 1048576
+    pause_large_pool_percent: 85.0
+    resume_large_pool_percent: 70.0
+    source_root: .
+    copy_data_from_nfs: true
+  data_cacher:
+    role: sender
+    spill_threshold_percent: 85.0
+    drain_threshold_percent: 70.0
+    cache_path: /cache
+    drive_count: 7
+    queue_depth_per_drive: 256
+  data_sender:
+    connection_count: 8
+    socket_buffer_bytes: 1073741824
+    zero_copy: false
+  data_receiver:
+    connection_count: 8
+    refill_below_percent: 50.0
+  data_writer:
+    handle_cache_limit: 10000
+    verify_hash: true
+  scan_writer:
+    scan_side: S
+    flush_per_file: true

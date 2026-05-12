@@ -1,0 +1,10 @@
+#ifndef HYPERSYNC_COMMON_VERSION_HPP
+#define HYPERSYNC_COMMON_VERSION_HPP
+
+namespace hypersync {
+
+inline constexpr const char* kVersion = "0.0.2";
+
+}  // namespace hypersync
+
+#endif
