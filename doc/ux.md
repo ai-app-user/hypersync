@@ -71,6 +71,71 @@ directory before starting the real executable. The bundle is produced by
 `hypersync/deploy/package-linux.sh` and should be built on Linux so the staged
 binary and `.so` files match the target platform.
 
+### New Server Download And Run
+
+A user setting up a new Linux server should not need to understand the build
+system, DuckDB, libnfs, or dynamic linker details. The expected flow is:
+
+1. Download one release asset for the server architecture.
+2. Verify the archive checksum.
+3. Unpack it into any user-writable directory.
+4. Run `bin/hypersync --version`.
+5. Run a small local scan or NFS scan.
+6. Move to the real scan/hash/copy command once the smoke test succeeds.
+
+Example desired first-run flow:
+
+```bash
+mkdir -p "$HOME/opt"
+cd "$HOME/opt"
+
+curl -L -o hypersync-linux-x86_64.tar.gz \
+  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz
+curl -L -o hypersync-linux-x86_64.tar.gz.sha256 \
+  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz.sha256
+sha256sum -c hypersync-linux-x86_64.tar.gz.sha256
+
+tar -xzf hypersync-linux-x86_64.tar.gz
+cd hypersync-linux-x86_64
+
+./bin/hypersync --version
+./bin/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
+```
+
+For a direct NFS smoke test:
+
+```bash
+./bin/hypersync scan \
+  --source nfs://172.27.255.2/volumes/example/data \
+  --output /mnt/local-nvme/hypersync-smoke.parquet \
+  --output-format parquet \
+  --max-duration-seconds 30 \
+  --stats-interval-seconds 5
+```
+
+The command output should make the deployment state obvious:
+- `--version` prints the Hypersync version and exits.
+- A future `doctor` or extended `--version` output should report whether libnfs,
+  DuckDB/Parquet, OpenSSL, and fast hash support are available.
+- If a bundled library cannot be loaded, the wrapper or executable should fail
+  before starting work and show the missing library name.
+- If Parquet support is missing, scan/hash commands should reject
+  `--output-format parquet` with a clear message instead of silently falling
+  back to another format.
+
+The user should be able to add Hypersync to the shell path without moving the
+bundle internals:
+
+```bash
+export PATH="$HOME/opt/hypersync-linux-x86_64/bin:$PATH"
+hypersync --version
+```
+
+When a server has no internet access, the same archive should be copied with
+`scp`, `rsync`, or the site's artifact tool and unpacked in the same way. The
+runtime experience is identical because all required non-system runtime
+libraries live in the bundle's `lib/` directory.
+
 ### Local Test Installation
 
 Users should be able to test the tool without NFS:

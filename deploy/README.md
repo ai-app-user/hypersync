@@ -32,6 +32,44 @@ Run the deployed tool through the wrapper:
 ./bin/hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
 ```
 
+## New Server UX
+
+The operator experience on a new Linux server should be a short copy, unpack,
+verify, run loop. No package installs should be required for DuckDB, libnfs, or
+other bundled runtime libraries.
+
+```bash
+mkdir -p "$HOME/opt"
+cd "$HOME/opt"
+
+curl -L -o hypersync-linux-x86_64.tar.gz \
+  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz
+curl -L -o hypersync-linux-x86_64.tar.gz.sha256 \
+  https://github.com/ai-app-user/hypersync/releases/download/v0.0.2/hypersync-linux-x86_64.tar.gz.sha256
+sha256sum -c hypersync-linux-x86_64.tar.gz.sha256
+
+tar -xzf hypersync-linux-x86_64.tar.gz
+cd hypersync-linux-x86_64
+
+./bin/hypersync --version
+./bin/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
+```
+
+For servers without outbound internet, copy the same `.tar.gz` and checksum
+with `scp`, `rsync`, or an internal artifact system, then run the same unpack
+and smoke-test commands.
+
+After unpacking, users may add the bundle to `PATH`:
+
+```bash
+export PATH="$HOME/opt/hypersync-linux-x86_64/bin:$PATH"
+hypersync --version
+```
+
+The `bin/hypersync` wrapper is the supported entrypoint. It keeps the bundle
+relocatable by setting `LD_LIBRARY_PATH` to the adjacent `lib/` directory before
+starting `bin/hypersync.bin`.
+
 ## Build A Bundle On Linux
 
 From the workspace root that contains sibling `piper/` and `hypersync/`:
