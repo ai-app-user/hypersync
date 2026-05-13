@@ -303,6 +303,11 @@ Requirements:
   in that one folder.
 - The README must name the expected runtime library families directly; do not
   create a separate runtime-library listing file for that.
+- Production Linux builds should statically link libnfs and the app's C++
+  runtime so NFS support does not require host package installation.
+- Parquet support may bundle `libduckdb.so` until a self-contained static
+  DuckDB build is available. Any shared libraries required by the bundled
+  DuckDB shared object must also be bundled.
 - The launcher must set the runtime library path relative to itself.
 - The packaging process must be repeatable from the repository, not manual.
 - The package verification step must run the staged executable from the bundle
@@ -317,6 +322,9 @@ Current state:
 - `hypersync/deploy/package-linux.sh` produces a flat bundle with
   `hypersync`, `hypersync.bin`, `default.yaml`, copied `.so` files,
   `README.txt`, `manifest.txt`, and `checksums.sha256`.
+- Static-link experiments on transfer1 showed the practical current bundle is
+  about `3.19 MiB` for a stripped mostly-static app plus `67.04 MiB` for
+  `libduckdb.so`; fully static libnfs without DuckDB is about `3.74 MiB`.
 - `hypersync/deploy/run-hypersync` is the relocatable runtime launcher copied
   to `hypersync` in the bundle.
 - `hypersync/deploy/install-hypersync.sh` is the one-command new-server
@@ -324,8 +332,8 @@ Current state:
 
 Remaining:
 - Add CI or release automation that produces signed Linux artifacts.
-- Decide whether production release bundles should include all resolved dynamic
-  libraries or only optional non-system libraries.
+- Build or obtain a self-contained static DuckDB library with required Parquet
+  support so the release can eventually move closer to a single binary.
 
 ### Configuration
 

@@ -58,12 +58,7 @@ hypersync-linux-x86_64/
   hypersync.bin
   default.yaml
   libduckdb.so*
-  libnfs.so*
-  libssl.so*, libcrypto.so*
-  libzstd.so*, libsnappy.so*, liblz4.so*, libz.so*
-  libstdc++.so*, libgcc_s.so*
-  libtirpc.so*, libgssapi*.so*, libkrb5*.so*, libk5crypto.so*
-  libcom_err.so*, libkeyutils.so*
+  libstdc++.so*, libgcc_s.so*   # only if needed by bundled DuckDB
   README.txt
   manifest.txt
   checksums.sha256
@@ -150,9 +145,11 @@ When a server has no internet access, the same archive should be copied with
 runtime experience is identical because all required non-system runtime
 libraries live in the same folder as the `hypersync` launcher.
 
-The bundle README must list the expected runtime library families directly so
-users do not need a separate text file to understand which `.so` files may be
-present. The exact linker view remains in `manifest.txt`.
+The desired bundle should statically link the app C++ runtime and libnfs, so
+users do not need to install libnfs or compiler runtime packages. Parquet
+support currently ships with bundled `libduckdb.so`; if that shared library
+needs `libstdc++.so.6` or `libgcc_s.so.1`, those must be bundled too. The exact
+linker view remains in `manifest.txt`.
 
 ### Local Test Installation
 

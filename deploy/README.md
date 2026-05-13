@@ -14,23 +14,11 @@ enough that users can inspect it with `ls` and immediately see what matters:
 ```text
 hypersync-linux-<arch>/
   hypersync                 # launcher script; this is what users run
-  hypersync.bin             # compiled executable
+  hypersync.bin             # compiled executable, with libnfs and app C++ runtime linked statically
   default.yaml              # default config
   libduckdb.so*             # DuckDB and Parquet writer support
-  libnfs.so*                # direct libnfs access for nfs:// URLs
-  libssl.so*, libcrypto.so* # OpenSSL runtime dependencies when linked
-  libzstd.so*               # Zstandard compression when linked
-  libsnappy.so*             # Snappy compression when linked
-  liblz4.so*                # LZ4 compression when linked
-  libz.so*                  # zlib compression when linked
-  libstdc++.so*             # C++ runtime when needed on the target host
-  libgcc_s.so*              # GCC runtime when needed on the target host
-  libtirpc.so*              # RPC dependency when required
-  libgssapi*.so*            # Kerberos/GSSAPI dependency when required
-  libkrb5*.so*              # Kerberos dependency when required
-  libk5crypto.so*           # Kerberos crypto dependency when required
-  libcom_err.so*            # Kerberos/platform dependency when required
-  libkeyutils.so*           # Kerberos/platform dependency when required
+  libstdc++.so*             # optional: bundled if the DuckDB shared library needs it
+  libgcc_s.so*              # optional: bundled if the DuckDB shared library needs it
   README.txt
   manifest.txt
   checksums.sha256
@@ -92,12 +80,43 @@ relocatable by setting `LD_LIBRARY_PATH` to its own directory before starting
 
 ## Runtime Libraries
 
-The bundle layout above lists the runtime library families Hypersync may copy.
-Not every bundle will contain every library above. The exact list depends on how
-the Linux binary was linked on the packaging host.
+The target production bundle should be small:
+
+```text
+hypersync                 launcher
+hypersync.bin             about 3.2 MiB stripped in the current mostly-static build
+libduckdb.so              about 67 MiB in the current DuckDB 1.5.2 bundle
+default.yaml
+README.txt
+manifest.txt
+checksums.sha256
+```
+
+The app should statically link its own C++ runtime and `libnfs`, so users do not
+need to install libnfs. The current practical blocker to a single binary is
+DuckDB: the available `libduckdb_static.a` is not self-contained for this
+project, so Parquet support currently requires bundling `libduckdb.so`.
+
+If the bundled `libduckdb.so` depends on `libstdc++.so.6` or `libgcc_s.so.1`,
+package those beside it as well. Do not make users install them. Avoid bundling
+glibc or the dynamic loader by default; build on an old enough Linux baseline
+for compatibility with modern distributions.
 
 The packager records full `ldd` output in `manifest.txt`, and
 `checksums.sha256` records every file shipped in the bundle.
+
+Observed transfer1 build sizes:
+
+```text
+variant                                      stripped size
+static libnfs + static app C++ runtime         2.77 MiB
+fully static libnfs build without DuckDB       3.74 MiB
+static libnfs + static app runtime + DuckDB    3.19 MiB app + 67.04 MiB libduckdb.so
+```
+
+Static DuckDB is still a release goal, but it requires building a proper
+self-contained DuckDB static library or amalgamation with the needed Parquet
+support included.
 
 ## Build A Bundle On Linux
 
