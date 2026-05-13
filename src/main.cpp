@@ -62,7 +62,7 @@ void print_usage() {
         << "  hypersync status --socket <path>\n"
         << "  hypersync [--config <config.yaml>] send --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
-        << "  hypersync [--config <config.yaml>] diff --source-scan <scan.csv> --target-scan <scan.csv> [--compare size|time|content] [--output <diff.csv>]\n"
+        << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--max-duration-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
@@ -373,13 +373,23 @@ int main(int argc, char** argv) {
         }
 
         if (command == "diff") {
+            std::filesystem::path source_root;
+            std::filesystem::path target_root;
             std::string source_scan_path;
             std::string target_scan_path;
             std::string output_path;
             std::string compare_mode = "time";
+            bool recursive = true;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
+            double max_duration_seconds = 0.0;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
-                if (args[i] == "--source-scan") {
+                if (args[i] == "--source") {
+                    source_root = require_option(args, i, "--source");
+                } else if (args[i] == "--target") {
+                    target_root = require_option(args, i, "--target");
+                } else if (args[i] == "--source-scan") {
                     source_scan_path = require_option(args, i, "--source-scan");
                 } else if (args[i] == "--target-scan") {
                     target_scan_path = require_option(args, i, "--target-scan");
@@ -387,21 +397,54 @@ int main(int argc, char** argv) {
                     output_path = require_option(args, i, "--output");
                 } else if (args[i] == "--compare" || args[i] == "--mode") {
                     compare_mode = require_option(args, i, args[i]);
+                } else if (args[i] == "--non-recursive") {
+                    recursive = false;
+                } else if (args[i] == "--meta-reader-threads") {
+                    meta_reader_threads = parse_size_t_option(require_option(args, i, "--meta-reader-threads"),
+                                                              "--meta-reader-threads");
+                } else if (args[i] == "--metadata-async-depth") {
+                    metadata_async_depth = parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
+                                                               "--metadata-async-depth");
+                } else if (args[i] == "--max-duration-seconds") {
+                    max_duration_seconds = parse_positive_double_option(
+                        require_option(args, i, "--max-duration-seconds"),
+                        "--max-duration-seconds");
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
             }
 
-            if (source_scan_path.empty()) {
-                throw std::runtime_error("--source-scan is required");
-            }
-            if (target_scan_path.empty()) {
-                throw std::runtime_error("--target-scan is required");
+            if ((!source_root.empty() || !target_root.empty()) &&
+                (!source_scan_path.empty() || !target_scan_path.empty())) {
+                throw std::runtime_error("use either --source/--target or --source-scan/--target-scan, not both");
             }
 
-            const auto source_scan = hypersync::TransferEngine::load_scan_csv(source_scan_path);
-            const auto target_scan = hypersync::TransferEngine::load_scan_csv(target_scan_path);
-            const auto report = engine.diff_scan_indexes(source_scan, target_scan, compare_mode);
+            hypersync::TransferReport report;
+            if (!source_root.empty() || !target_root.empty()) {
+                if (source_root.empty()) {
+                    throw std::runtime_error("--source is required");
+                }
+                if (target_root.empty()) {
+                    throw std::runtime_error("--target is required");
+                }
+                report = engine.diff_metadata_trees(source_root,
+                                                    target_root,
+                                                    compare_mode,
+                                                    recursive,
+                                                    meta_reader_threads,
+                                                    metadata_async_depth,
+                                                    max_duration_seconds);
+            } else {
+                if (source_scan_path.empty()) {
+                    throw std::runtime_error("--source-scan is required");
+                }
+                if (target_scan_path.empty()) {
+                    throw std::runtime_error("--target-scan is required");
+                }
+                const auto source_scan = hypersync::TransferEngine::load_scan_csv(source_scan_path);
+                const auto target_scan = hypersync::TransferEngine::load_scan_csv(target_scan_path);
+                report = engine.diff_scan_indexes(source_scan, target_scan, compare_mode);
+            }
             if (!output_path.empty()) {
                 hypersync::TransferEngine::write_diff_csv(report, output_path);
             }

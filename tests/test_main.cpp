@@ -2788,6 +2788,16 @@ void test_main_cli_scan_and_dry_run_smoke() {
     EXPECT_TRUE(first_class_diff.find("new.txt,new") != std::string::npos);
     EXPECT_TRUE(first_class_diff.find("extra.txt,target_only") != std::string::npos);
 
+    const fs::path live_diff_csv = output.path / "live_diff.csv";
+    EXPECT_TRUE(command_succeeds(app + " diff --source " + source.path.string() +
+                                 " --target " + source.path.string() +
+                                 " --compare size --meta-reader-threads 2 --metadata-async-depth 2" +
+                                 " --max-duration-seconds 10 --output " + live_diff_csv.string() +
+                                 " >/dev/null 2>&1"));
+    const std::string live_diff = hypersync::read_file_contents(live_diff_csv);
+    EXPECT_TRUE(live_diff.find("alpha.txt,skip") != std::string::npos);
+    EXPECT_TRUE(live_diff.find("nested/beta.bin,skip") != std::string::npos);
+
     EXPECT_FALSE(command_succeeds(app + " receive >/dev/null 2>&1"));
 }
 
@@ -3388,6 +3398,35 @@ void test_diff_scan_indexes_reports_changes_and_target_only() {
     EXPECT_TRUE(report.diff_csv.find("dir/changed.txt,changed,") != std::string::npos);
 }
 
+void test_live_metadata_diff_compares_flat_folders() {
+    TempDir source("hypersync_live_diff_source");
+    TempDir target("hypersync_live_diff_target");
+
+    write_file(source.path / "same.txt", "same");
+    write_file(target.path / "same.txt", "xxxx");
+    write_file(source.path / "changed.txt", "fresh");
+    write_file(target.path / "changed.txt", "old");
+    write_file(source.path / "new.txt", "new");
+    write_file(target.path / "extra.txt", "extra");
+    write_file(target.path / "target_only_dir" / "deep.txt", "deep");
+
+    EngineConfig config;
+    config.mode = Mode::dry_run;
+    const TransferEngine engine(config);
+    const auto report = engine.diff_metadata_trees(source.path, target.path, "size", true, 2, 2, 10.0);
+
+    EXPECT_EQ(report.files_total, 5U);
+    EXPECT_EQ(report.files_skipped, 1U);
+    EXPECT_EQ(report.files.at("same.txt").diff, DiffKind::skip);
+    EXPECT_EQ(report.files.at("changed.txt").diff, DiffKind::changed);
+    EXPECT_EQ(report.files.at("new.txt").diff, DiffKind::new_file);
+    EXPECT_EQ(report.files.at("extra.txt").diff, DiffKind::target_only);
+    EXPECT_EQ(report.files.at("target_only_dir/deep.txt").diff, DiffKind::target_only);
+    EXPECT_TRUE(report.folders.find("") != report.folders.end());
+    EXPECT_TRUE(report.folders.find("target_only_dir") != report.folders.end());
+    EXPECT_TRUE(report.diff_csv.find("target_only_dir/deep.txt,target_only") != std::string::npos);
+}
+
 void test_scan_mode_builds_source_scan_rows() {
     EngineConfig config;
     config.mode = Mode::scan;
@@ -3670,6 +3709,7 @@ int main(int argc, char** argv) {
         {"diff_scan_indexes_reports_changes_and_target_only",
          TestSuite::unit,
          test_diff_scan_indexes_reports_changes_and_target_only},
+        {"live_metadata_diff_compares_flat_folders", TestSuite::unit, test_live_metadata_diff_compares_flat_folders},
         {"scan_mode_builds_source_scan_rows", TestSuite::unit, test_scan_mode_builds_source_scan_rows},
         {"main_cli_scan_and_dry_run_smoke", TestSuite::integration, test_main_cli_scan_and_dry_run_smoke},
         {"main_cli_benchmark_meta_smoke", TestSuite::integration, test_main_cli_benchmark_meta_smoke},

@@ -222,6 +222,13 @@ public:
     [[nodiscard]] TransferReport diff_scan_indexes(const ScanIndex& source_scan,
                                                    const ScanIndex& target_scan,
                                                    const std::string& compare_mode = "time") const;
+    [[nodiscard]] TransferReport diff_metadata_trees(const std::filesystem::path& source_root,
+                                                     const std::filesystem::path& target_root,
+                                                     const std::string& compare_mode = "time",
+                                                     bool recursive = true,
+                                                     std::size_t meta_reader_threads = 0,
+                                                     std::size_t metadata_async_depth = 0,
+                                                     double max_duration_seconds = 0.0) const;
     [[nodiscard]] ScanIndex build_scan_index(const std::filesystem::path& source_root,
                                              char scan_side = 'S',
                                              bool recursive = true) const;

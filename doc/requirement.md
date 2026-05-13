@@ -179,15 +179,21 @@ Current state:
 - Basic scan CSV loading and comparison behavior exist.
 - A first-class `diff` command exists for comparing two scan CSV files using
   `size`, `time`, or `content` comparison modes.
+- The `diff` command can also compare live source and target trees using
+  `--source` and `--target` without first writing scan CSV files.
+- Live diff scans and compares one flat source folder at a time, uses the same
+  local/libnfs metadata backend as the scanner, and can be bounded with
+  `--max-duration-seconds`.
+- Live diff reports target-only files, including files under target-only
+  folders.
 - Diff output reports source-only/new, changed, equal, and target-only file
   records in CSV form.
 
 Remaining:
-- Make live NFS-to-NFS recursive diff a first-class command without requiring
-  prebuilt scan CSV inputs.
-- Add metadata-only and data-hash diff modes.
+- Add data-hash diff mode that reads file content only when requested.
 - Add resumable diff for very large trees.
 - Add diff summaries by folder and change type.
+- Add Parquet diff output.
 
 ### NFS Sync and Copy
 

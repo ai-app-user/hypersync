@@ -253,6 +253,16 @@ natural flat-folder unit used by the metadata reader, checker, and differ.
 Decoders reconstruct full relative paths for existing writers so the output
 schema remains unchanged.
 
+Live metadata diff uses the same flat-folder unit. Source metadata workers pop
+source folders from the shared work queue, read one flat source folder, read the
+matching flat target folder, and compare records with `size`, `time`, or
+available content-hash semantics. Child source folders are appended to the same
+work queue after the source folder batch is finalized. Target-only child
+folders are scanned as target-only subtrees so the report can include files
+that exist only on the target side without building a whole-tree index first.
+This is intentionally a checker/differ behavior layered on top of scanner
+batches; scanner, batcher, sender, receiver, and writer jobs remain reusable.
+
 ### 3.1 Buffer Types
 
 | Type | Data | Metadata trailer | Total | Pool size | RAM | Purpose |

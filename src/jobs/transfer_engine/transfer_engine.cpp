@@ -27,6 +27,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1255,6 +1256,309 @@ MonitorQueueSnapshot monitor_data_file_queue(std::string name, DataReadFileQueue
     snapshot.high_watermark = queue.files.size();
     snapshot.closed = queue.input_done || queue.stop;
     return snapshot;
+}
+
+std::uint64_t file_spec_logical_size(const FileSpec& file) {
+    return file.declared_size != 0 ? file.declared_size : file.content.size();
+}
+
+bool diff_file_specs_match(const FileSpec& source, const FileSpec& target, const std::string& compare_mode) {
+    const std::uint64_t source_size = file_spec_logical_size(source);
+    const std::uint64_t target_size = file_spec_logical_size(target);
+    if (compare_mode == "size") {
+        return source_size == target_size;
+    }
+    if (compare_mode == "time") {
+        return source_size == target_size && source.mtime == target.mtime;
+    }
+    if (!source.content_hash.empty() && !target.content_hash.empty() &&
+        (source.hash_algorithm.empty() || target.hash_algorithm.empty() ||
+         source.hash_algorithm == target.hash_algorithm)) {
+        return source_size == target_size && source.content_hash == target.content_hash;
+    }
+    return source_size == target_size && source.mtime == target.mtime;
+}
+
+std::string diff_csv_quote(std::string_view value) {
+    if (value.find_first_of(",\"\r\n") == std::string_view::npos) {
+        return std::string(value);
+    }
+    std::string quoted = "\"";
+    for (char ch : value) {
+        if (ch == '"') {
+            quoted += "\"\"";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('"');
+    return quoted;
+}
+
+void append_diff_csv_row(std::string& csv,
+                         std::string_view rel_path,
+                         DiffKind decision,
+                         std::uint64_t source_size,
+                         std::uint64_t source_mtime,
+                         std::uint64_t target_size,
+                         std::uint64_t target_mtime) {
+    csv += diff_csv_quote(rel_path) + "," + to_string(decision) + "," +
+           std::to_string(source_size) + "," + std::to_string(source_mtime) + "," +
+           std::to_string(target_size) + "," + std::to_string(target_mtime) + "\n";
+}
+
+FolderRecord make_done_folder_record(const FileSpec& folder,
+                                      std::uint64_t flat_file_count,
+                                      std::uint64_t flat_logical_size_bytes) {
+    FolderRecord record;
+    record.rel_path = normalize_path(folder.rel_path);
+    record.files_discovered = flat_file_count;
+    record.files_total = flat_file_count;
+    record.files_completed = flat_file_count;
+    record.flat_size_bytes = flat_logical_size_bytes;
+    record.state = FolderState::done;
+    record.remote_state = FolderState::done;
+    return record;
+}
+
+void merge_live_diff_results(TransferReport& report,
+                             const std::map<std::string, FileOutcome>& files,
+                             const std::map<std::string, FolderRecord>& folders,
+                             const std::string& csv_rows,
+                             std::size_t skipped_files,
+                             std::uint64_t bytes_planned,
+                             std::mutex& report_mutex) {
+    std::lock_guard<std::mutex> lock(report_mutex);
+    report.files.insert(files.begin(), files.end());
+    report.folders.insert(folders.begin(), folders.end());
+    report.diff_csv += csv_rows;
+    report.files_skipped += skipped_files;
+    report.bytes_planned += bytes_planned;
+    report.files_total = report.files.size();
+    report.folders_total = report.folders.size();
+}
+
+void add_target_only_tree(NfsBackend& target_backend,
+                          const FileSpec& target_folder,
+                          FlatMetadataWorkQueue& queue,
+                          TransferReport& report,
+                          std::mutex& report_mutex) {
+    if (flat_metadata_scan_should_stop(queue)) {
+        return;
+    }
+
+    std::map<std::string, FileOutcome> files;
+    std::map<std::string, FolderRecord> folders;
+    std::string csv_rows;
+    FileSpec normalized_target_folder = target_folder;
+    normalized_target_folder.rel_path = normalize_path(normalized_target_folder.rel_path);
+    folders[normalized_target_folder.rel_path] = make_done_folder_record(normalized_target_folder, 0, 0);
+
+    try {
+        target_backend.visit_metadata_at(
+            target_folder.rel_path,
+            true,
+            [&](FileSpec file) {
+                if (flat_metadata_scan_should_stop(queue)) {
+                    return;
+                }
+                file.rel_path = normalize_path(file.rel_path);
+                FileOutcome outcome;
+                outcome.rel_path = file.rel_path;
+                outcome.diff = DiffKind::target_only;
+                outcome.size = file_spec_logical_size(file);
+                files[outcome.rel_path] = outcome;
+                append_diff_csv_row(csv_rows, outcome.rel_path, DiffKind::target_only, 0, 0, outcome.size, file.mtime);
+            },
+            [&](FileSpec directory) {
+                if (flat_metadata_scan_should_stop(queue)) {
+                    return;
+                }
+                directory.rel_path = normalize_path(directory.rel_path);
+                folders[directory.rel_path] = make_done_folder_record(directory, 0, 0);
+            });
+    } catch (const std::exception& ex) {
+        FileOutcome outcome;
+        outcome.rel_path = normalize_path(target_folder.rel_path);
+        outcome.diff = DiffKind::failed;
+        files[outcome.rel_path] = outcome;
+        append_diff_csv_row(csv_rows, outcome.rel_path, DiffKind::failed, 0, 0, 0, 0);
+        std::cerr << "diff skipped target-only subtree '"
+                  << (outcome.rel_path.empty() ? "/" : outcome.rel_path)
+                  << "': " << ex.what() << '\n';
+    }
+
+    merge_live_diff_results(report, files, folders, csv_rows, 0, 0, report_mutex);
+}
+
+void record_live_diff_batch(bool recursive,
+                            const std::string& compare_mode,
+                            FlatMetadataWorkQueue& queue,
+                            NfsBackend& target_backend,
+                            TransferReport& report,
+                            std::mutex& report_mutex,
+                            FlatFolderScanBatch batch) {
+    if (batch.failed) {
+        std::cerr << "diff skipped source folder '"
+                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+        if (batch.folder.rel_path.empty()) {
+            const std::string message = batch.error.empty() ? "failed to scan source root" : batch.error;
+            fail_flat_folder_work(queue, std::make_exception_ptr(std::runtime_error(message)));
+            return;
+        }
+        finish_flat_folder_work(queue);
+        return;
+    }
+
+    const std::string folder_path = normalize_path(batch.folder.rel_path);
+    std::uint64_t flat_logical_size = 0;
+    std::vector<FileSpec> child_work;
+    std::unordered_set<std::string> source_directories;
+    if (recursive && !flat_metadata_scan_should_stop(queue)) {
+        child_work.reserve(batch.directories.size());
+    }
+    for (auto& directory : batch.directories) {
+        directory.rel_path = normalize_path(directory.rel_path);
+        source_directories.insert(directory.rel_path);
+        if (recursive && !flat_metadata_scan_should_stop(queue)) {
+            child_work.push_back(directory);
+        }
+    }
+
+    std::vector<FileSpec> target_files;
+    std::vector<FileSpec> target_directories;
+    try {
+        target_backend.visit_metadata_at(
+            folder_path,
+            false,
+            [&target_files](FileSpec file) {
+                file.rel_path = normalize_path(file.rel_path);
+                target_files.push_back(std::move(file));
+            },
+            [&target_directories](FileSpec directory) {
+                directory.rel_path = normalize_path(directory.rel_path);
+                target_directories.push_back(std::move(directory));
+            });
+    } catch (const std::exception& ex) {
+        std::cerr << "diff treats target folder '"
+                  << (folder_path.empty() ? "/" : folder_path)
+                  << "' as empty: " << ex.what() << '\n';
+    }
+
+    std::unordered_map<std::string, FileSpec> target_by_path;
+    target_by_path.reserve(target_files.size());
+    for (auto& file : target_files) {
+        target_by_path.emplace(file.rel_path, std::move(file));
+    }
+
+    std::map<std::string, FileOutcome> files;
+    std::map<std::string, FolderRecord> folders;
+    std::string csv_rows;
+    std::size_t skipped_files = 0;
+    std::uint64_t bytes_planned = 0;
+
+    for (auto& source : batch.files) {
+        source.rel_path = normalize_path(source.rel_path);
+        const std::uint64_t source_size = file_spec_logical_size(source);
+        flat_logical_size += source_size;
+        FileOutcome outcome;
+        outcome.rel_path = source.rel_path;
+        outcome.size = source_size;
+
+        const auto target_it = target_by_path.find(source.rel_path);
+        if (target_it == target_by_path.end()) {
+            outcome.diff = DiffKind::new_file;
+            bytes_planned += source_size;
+            append_diff_csv_row(csv_rows, source.rel_path, outcome.diff, source_size, source.mtime, 0, 0);
+        } else if (diff_file_specs_match(source, target_it->second, compare_mode)) {
+            outcome.diff = DiffKind::skip;
+            ++skipped_files;
+            append_diff_csv_row(csv_rows,
+                                source.rel_path,
+                                outcome.diff,
+                                source_size,
+                                source.mtime,
+                                file_spec_logical_size(target_it->second),
+                                target_it->second.mtime);
+        } else {
+            outcome.diff = DiffKind::changed;
+            bytes_planned += source_size;
+            append_diff_csv_row(csv_rows,
+                                source.rel_path,
+                                outcome.diff,
+                                source_size,
+                                source.mtime,
+                                file_spec_logical_size(target_it->second),
+                                target_it->second.mtime);
+        }
+
+        files[source.rel_path] = std::move(outcome);
+        if (target_it != target_by_path.end()) {
+            target_by_path.erase(target_it);
+        }
+    }
+
+    for (const auto& [path, target] : target_by_path) {
+        FileOutcome outcome;
+        outcome.rel_path = path;
+        outcome.diff = DiffKind::target_only;
+        outcome.size = file_spec_logical_size(target);
+        append_diff_csv_row(csv_rows, path, outcome.diff, 0, 0, outcome.size, target.mtime);
+        files[path] = std::move(outcome);
+    }
+
+    FileSpec normalized_folder = batch.folder;
+    normalized_folder.rel_path = folder_path;
+    folders[folder_path] = make_done_folder_record(normalized_folder, batch.files.size(), flat_logical_size);
+
+    merge_live_diff_results(report, files, folders, csv_rows, skipped_files, bytes_planned, report_mutex);
+
+    if (recursive && !flat_metadata_scan_should_stop(queue)) {
+        for (const auto& target_directory : target_directories) {
+            if (source_directories.find(target_directory.rel_path) == source_directories.end()) {
+                add_target_only_tree(target_backend, target_directory, queue, report, report_mutex);
+            }
+        }
+        enqueue_flat_folder_work(queue, std::move(child_work));
+    }
+    finish_flat_folder_work(queue);
+}
+
+void live_diff_metadata_worker(const std::string& source_root,
+                               const std::string& target_root,
+                               bool recursive,
+                               const std::string& compare_mode,
+                               std::size_t async_directory_depth,
+                               FlatMetadataWorkQueue& queue,
+                               TransferReport& report,
+                               std::mutex& report_mutex) {
+    auto source_backend = make_nfs_backend(source_root);
+    auto target_backend = make_nfs_backend(target_root);
+    try {
+        source_backend->scan_flat_folders(
+            async_directory_depth,
+            [&queue](bool wait_for_work) {
+                return take_flat_folder_work(queue, wait_for_work);
+            },
+            [&queue] {
+                return flat_metadata_scan_should_stop(queue);
+            },
+            [recursive, &compare_mode, &queue, &target_backend, &report, &report_mutex](FlatFolderScanBatch batch) {
+                record_live_diff_batch(recursive,
+                                       compare_mode,
+                                       queue,
+                                       *target_backend,
+                                       report,
+                                       report_mutex,
+                                       std::move(batch));
+            });
+        if (flat_metadata_scan_should_stop(queue)) {
+            request_flat_folder_stop(queue);
+        }
+    } catch (...) {
+        fail_flat_folder_work(queue);
+    }
 }
 
 std::size_t queued_data_read_files(DataReadFileQueue& queue) {
@@ -4061,6 +4365,73 @@ TransferReport TransferEngine::diff_scan_indexes(const ScanIndex& source_scan,
     }
 
     report.files_total = report.files.size();
+    return report;
+}
+
+TransferReport TransferEngine::diff_metadata_trees(const std::filesystem::path& source_root,
+                                                   const std::filesystem::path& target_root,
+                                                   const std::string& compare_mode,
+                                                   bool recursive,
+                                                   std::size_t meta_reader_threads,
+                                                   std::size_t metadata_async_depth,
+                                                   double max_duration_seconds) const {
+    if (compare_mode != "size" && compare_mode != "time" && compare_mode != "content") {
+        throw std::invalid_argument("diff compare mode must be size, time, or content");
+    }
+    if (source_root.empty()) {
+        throw std::invalid_argument("source root is required");
+    }
+    if (target_root.empty()) {
+        throw std::invalid_argument("target root is required");
+    }
+
+    NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
+    reader_config.source_root = source_root.string();
+    reader_config.recursive = recursive;
+    if (meta_reader_threads != 0) {
+        reader_config.worker_count = meta_reader_threads;
+        reader_config.thread_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0) {
+        reader_config.async_directory_depth = metadata_async_depth;
+    }
+
+    TransferReport report;
+    report.mode = Mode::dry_run;
+    report.diff_csv = "rel_path,decision,source_size,source_mtime,target_size,target_mtime\n";
+
+    FlatMetadataWorkQueue queue;
+    queue.folders.push_back(FileSpec{});
+    if (max_duration_seconds > 0.0) {
+        queue.stop_at = std::chrono::steady_clock::now() +
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(max_duration_seconds));
+    }
+
+    std::mutex report_mutex;
+    const std::size_t thread_count = std::max<std::size_t>(1, reader_config.worker_count);
+    std::vector<std::thread> workers;
+    workers.reserve(thread_count);
+    for (std::size_t index = 0; index < thread_count; ++index) {
+        workers.emplace_back(live_diff_metadata_worker,
+                             reader_config.source_root,
+                             target_root.string(),
+                             recursive,
+                             compare_mode,
+                             std::max<std::size_t>(1, reader_config.async_directory_depth),
+                             std::ref(queue),
+                             std::ref(report),
+                             std::ref(report_mutex));
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    if (queue.error) {
+        std::rethrow_exception(queue.error);
+    }
+
+    report.files_total = report.files.size();
+    report.folders_total = report.folders.size();
     return report;
 }
 

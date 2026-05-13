@@ -635,14 +635,24 @@ hypersync diff \
   --output diff.csv
 ```
 
-Live NFS desired command:
+Live metadata command:
 
 ```bash
-wsync nfs diff \
+hypersync diff \
   --source nfs://source-server/export \
   --target nfs://target-server/export \
-  --mode metadata
+  --compare time \
+  --meta-reader-threads 32 \
+  --metadata-async-depth 16 \
+  --max-duration-seconds 30 \
+  --output diff.csv
 ```
+
+The live command compares one flat source folder at a time and reads the
+matching flat target folder for that unit. It does not read file data unless a
+future hash/content mode explicitly requests hashes. `--compare content` uses
+recorded hashes when scan records contain hashes; live metadata-only diff falls
+back to size plus mtime until a content-hash pipeline is enabled.
 
 Common options:
 - `--source`
@@ -650,10 +660,11 @@ Common options:
 - `--source-scan`
 - `--target-scan`
 - `--compare size|time|content`
-- `--mode metadata|hash|full`
 - `--output`
 - `--format text|csv|parquet`
 - `--non-recursive`
+- `--meta-reader-threads`
+- `--metadata-async-depth`
 - `--max-duration-seconds`
 
 ### Copy
