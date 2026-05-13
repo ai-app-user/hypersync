@@ -23,6 +23,96 @@ NUMA topology:
 NUMA distance is 10 local and 20 remote. NUMA pinning is not a default yet;
 sharded queues are the default high-throughput strategy.
 
+## Latest Transfer1 Baseline
+
+Recorded on `ice1-transfer-001` at `2026-05-13T04:41:04Z`.
+
+Build label:
+
+```text
+transfer1-baseline-d0414af-duckdb-libnfs
+```
+
+Artifacts on transfer1:
+
+```text
+/mnt/local-nvme/hypersync-baseline-20260513T043441Z/job-performance-report.txt
+/mnt/local-nvme/hypersync-baseline-20260513T043441Z/job-performance-report.json
+```
+
+The report used 1MiB buffers, 512 pool slots, 128 buffers per lane, DuckDB
+enabled, direct libnfs enabled, and uncompressed Parquet writer output. This is
+the current regression checkpoint before folder batching and diff/checker
+pipeline work.
+
+### Raw Buffer Pipeline
+
+```text
+BufferGeneratorJob -> ShardedBufQueue -> BufferDiscarderJob
+```
+
+| Threads | GB/s | Gbit/s |
+|---:|---:|---:|
+| 1 | 9.54 | 76.33 |
+| 2 | 14.58 | 116.63 |
+| 8 | 57.16 | 457.29 |
+| 16 | 98.00 | 783.98 |
+| 32 | 207.70 | 1661.59 |
+| 64 | 277.31 | 2218.49 |
+| 96 | 360.02 | 2880.13 |
+| 128 | 397.39 | 3179.13 |
+
+### Transport Pipeline
+
+```text
+BufferGeneratorJob -> BufferSenderJob -> transport -> BufferReceiverJob -> BufferDiscarderJob
+```
+
+| Transport | Endpoints | GB/s | Gbit/s |
+|---|---:|---:|---:|
+| unix | 1 | 4.75 | 37.97 |
+| unix | 8 | 17.20 | 137.59 |
+| unix | 16 | 24.60 | 196.77 |
+| unix | 32 | 28.58 | 228.65 |
+| unix | 64 | 23.95 | 191.63 |
+| tcp | 1 | 2.45 | 19.61 |
+| tcp | 8 | 12.37 | 98.92 |
+| tcp | 16 | 22.28 | 178.20 |
+| tcp | 32 | 26.05 | 208.43 |
+| tcp | 64 | 26.96 | 215.67 |
+
+### Hash Speed
+
+| Algorithm | Threads | GB/s | Gbit/s |
+|---|---:|---:|---:|
+| xxh64 | 1 | 14.89 | 119.12 |
+| xxh64 | 32 | 473.76 | 3790.07 |
+| xxh3_64 | 1 | 28.04 | 224.32 |
+| xxh3_64 | 32 | 822.80 | 6582.36 |
+| sha256 | 1 | 1.84 | 14.73 |
+| sha256 | 32 | 58.20 | 465.62 |
+| md5 | 1 | 0.77 | 6.20 |
+| md5 | 32 | 24.51 | 196.06 |
+
+### Metadata Writer
+
+Synthetic workload: `200,000` files and `2,000` folders.
+
+| Format | Partition Mode | Partitions | Records/s |
+|---|---|---:|---:|
+| csv | threads | 1 | 1.10M |
+| csv | threads | 8 | 6.08M |
+| csv | threads | 32 | 8.69M |
+| csv | processes | 1 | 1.12M |
+| csv | processes | 8 | 6.70M |
+| csv | processes | 32 | 12.60M |
+| parquet | threads | 1 | 396K |
+| parquet | threads | 8 | 800K |
+| parquet | threads | 32 | 330K |
+| parquet | processes | 1 | 400K |
+| parquet | processes | 8 | 1.29M |
+| parquet | processes | 32 | 1.36M |
+
 ## Basic Jobs
 
 ### BufferGeneratorJob
