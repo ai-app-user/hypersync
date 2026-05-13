@@ -304,6 +304,48 @@ Current conclusion: the NFS metadata reader is capable of the 5M records/s
 target, but DuckDB/parquet export is not yet keeping up. The main cost is in
 writer/export completion after the scan timer, not in libnfs metadata discovery.
 
+## Checker And Data Transfer Smokes
+
+Recorded on `2026-05-12 22:44 PDT` from commit `9b5c589`. These are bounded
+remote smokes for the live checker and the runtime file-transfer path; they are
+not full-host calibration runs.
+
+### Live Checker Self-Diff
+
+Both runs compare a source NFS tree to the same target NFS tree using
+`--compare size`, 8 metadata-reader threads, async depth 16, and
+`--max-duration-seconds 10`.
+
+| Host | Source | Diff Records | Same | Changed | New | Target-Only | Elapsed | Max RSS |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| transfer1 | `nfs://nfs.crusoecloudcompute.com/.../HaWoR/video` | 46,239 | 46,239 | 0 | 0 | 0 | 1.16s | 54 MB |
+| nopo1 | `nfs://172.27.255.2-172.27.255.17/.../data` | 282,060 | 282,060 | 0 | 0 | 0 | 17.47s | 605 MB |
+
+Nopo reported several `NFS3ERR_PERM` folders; the checker skipped those folders
+and did not emit false target-only rows when the timer stopped a partial folder.
+
+### NFS Data Reader
+
+Both runs used 1 metadata thread, metadata async depth 16, 32 data-reader
+threads, 16 outstanding data requests per reader, copy mode, and
+`--max-duration-seconds 10`.
+
+| Host | Source | Bytes Read | Active Rate | Final Average | Notes |
+|---|---|---:|---:|---:|---|
+| transfer1 | `.../HaWoR/video` | 3.68 GB | 6.39 Gbit/s | 6.39 Gbit/s | Small tree completed before the timer. |
+| nopo1 | `.../b7ec3b01.../data` | 245.31 GB | 193.6-195.8 Gbit/s | 100.2 Gbit/s | Active samples hit near 200G; final average includes drain/tail time. |
+
+### Packed Small-File Runtime Transfer
+
+Runtime transfer packs many small file payloads into large data buffers before
+sending them. The smoke used local loopback TCP on each remote host with 1,000
+3-byte files and a local NVMe target.
+
+| Host | Files Sent | Files Received | Payload Bytes | Data Chunks Sent | Result |
+|---|---:|---:|---:|---:|---|
+| transfer1 | 1,000 | 1,000 | 3,000 | 85 | pass |
+| nopo1 | 1,000 | 1,000 | 3,000 | 114 | pass |
+
 ## Automated Tests
 
 Performance smoke tests live under `hypersync/tests/features/performance/` and are run
