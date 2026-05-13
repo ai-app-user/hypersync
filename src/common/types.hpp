@@ -232,6 +232,9 @@ struct TransferReport {
     std::size_t folders_total = 0;
     std::size_t files_transferred = 0;
     std::size_t files_skipped = 0;
+    std::size_t files_changed = 0;
+    std::size_t files_new = 0;
+    std::size_t files_target_only = 0;
     std::size_t files_failed = 0;
     std::size_t retries = 0;
     std::size_t chunks_sent = 0;

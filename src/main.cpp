@@ -62,7 +62,7 @@ void print_usage() {
         << "  hypersync status --socket <path>\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
-        << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--max-duration-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
@@ -381,9 +381,11 @@ int main(int argc, char** argv) {
             std::string output_path;
             std::string compare_mode = "time";
             bool recursive = true;
+            bool summary_only = false;
             std::size_t meta_reader_threads = 0;
             std::size_t metadata_async_depth = 0;
             double max_duration_seconds = 0.0;
+            std::uint32_t stats_interval_seconds = 0;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--source") {
@@ -400,6 +402,8 @@ int main(int argc, char** argv) {
                     compare_mode = require_option(args, i, args[i]);
                 } else if (args[i] == "--non-recursive") {
                     recursive = false;
+                } else if (args[i] == "--summary-only") {
+                    summary_only = true;
                 } else if (args[i] == "--meta-reader-threads") {
                     meta_reader_threads = parse_size_t_option(require_option(args, i, "--meta-reader-threads"),
                                                               "--meta-reader-threads");
@@ -410,6 +414,10 @@ int main(int argc, char** argv) {
                     max_duration_seconds = parse_positive_double_option(
                         require_option(args, i, "--max-duration-seconds"),
                         "--max-duration-seconds");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -418,6 +426,9 @@ int main(int argc, char** argv) {
             if ((!source_root.empty() || !target_root.empty()) &&
                 (!source_scan_path.empty() || !target_scan_path.empty())) {
                 throw std::runtime_error("use either --source/--target or --source-scan/--target-scan, not both");
+            }
+            if (summary_only && !output_path.empty()) {
+                throw std::runtime_error("--summary-only cannot be combined with --output");
             }
 
             hypersync::TransferReport report;
@@ -434,7 +445,9 @@ int main(int argc, char** argv) {
                                                     recursive,
                                                     meta_reader_threads,
                                                     metadata_async_depth,
-                                                    max_duration_seconds);
+                                                    max_duration_seconds,
+                                                    !summary_only,
+                                                    stats_interval_seconds);
             } else {
                 if (source_scan_path.empty()) {
                     throw std::runtime_error("--source-scan is required");
@@ -450,16 +463,19 @@ int main(int argc, char** argv) {
                 hypersync::TransferEngine::write_diff_csv(report, output_path);
             }
 
-            std::size_t changed = 0;
-            std::size_t created = 0;
-            std::size_t target_only = 0;
-            for (const auto& [_, outcome] : report.files) {
-                if (outcome.diff == hypersync::DiffKind::changed) {
-                    ++changed;
-                } else if (outcome.diff == hypersync::DiffKind::new_file) {
-                    ++created;
-                } else if (outcome.diff == hypersync::DiffKind::target_only) {
-                    ++target_only;
+            std::size_t changed = report.files_changed;
+            std::size_t created = report.files_new;
+            std::size_t target_only = report.files_target_only;
+            if (report.files_changed == 0 && report.files_new == 0 && report.files_target_only == 0 &&
+                !report.files.empty()) {
+                for (const auto& [_, outcome] : report.files) {
+                    if (outcome.diff == hypersync::DiffKind::changed) {
+                        ++changed;
+                    } else if (outcome.diff == hypersync::DiffKind::new_file) {
+                        ++created;
+                    } else if (outcome.diff == hypersync::DiffKind::target_only) {
+                        ++target_only;
+                    }
                 }
             }
             std::cout << "diff_records=" << report.files_total

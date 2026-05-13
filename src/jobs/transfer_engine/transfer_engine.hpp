@@ -228,7 +228,9 @@ public:
                                                      bool recursive = true,
                                                      std::size_t meta_reader_threads = 0,
                                                      std::size_t metadata_async_depth = 0,
-                                                     double max_duration_seconds = 0.0) const;
+                                                     double max_duration_seconds = 0.0,
+                                                     bool collect_detailed_records = true,
+                                                     std::uint32_t stats_interval_seconds = 0) const;
     [[nodiscard]] ScanIndex build_scan_index(const std::filesystem::path& source_root,
                                              char scan_side = 'S',
                                              bool recursive = true) const;

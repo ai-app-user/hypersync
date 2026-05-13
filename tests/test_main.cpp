@@ -3488,6 +3488,9 @@ void test_live_metadata_diff_compares_flat_folders() {
 
     EXPECT_EQ(report.files_total, 5U);
     EXPECT_EQ(report.files_skipped, 1U);
+    EXPECT_EQ(report.files_changed, 1U);
+    EXPECT_EQ(report.files_new, 1U);
+    EXPECT_EQ(report.files_target_only, 2U);
     EXPECT_EQ(report.files.at("same.txt").diff, DiffKind::skip);
     EXPECT_EQ(report.files.at("changed.txt").diff, DiffKind::changed);
     EXPECT_EQ(report.files.at("new.txt").diff, DiffKind::new_file);
@@ -3496,6 +3499,31 @@ void test_live_metadata_diff_compares_flat_folders() {
     EXPECT_TRUE(report.folders.find("") != report.folders.end());
     EXPECT_TRUE(report.folders.find("target_only_dir") != report.folders.end());
     EXPECT_TRUE(report.diff_csv.find("target_only_dir/deep.txt,target_only") != std::string::npos);
+}
+
+void test_live_metadata_diff_summary_only_counts_without_records() {
+    TempDir source("hypersync_live_diff_summary_source");
+    TempDir target("hypersync_live_diff_summary_target");
+
+    write_file(source.path / "same.txt", "same");
+    write_file(target.path / "same.txt", "same");
+    write_file(source.path / "changed.txt", "fresh");
+    write_file(target.path / "changed.txt", "old");
+    write_file(source.path / "new.txt", "new");
+    write_file(target.path / "extra.txt", "extra");
+
+    EngineConfig config;
+    config.mode = Mode::dry_run;
+    const TransferEngine engine(config);
+    const auto report = engine.diff_metadata_trees(source.path, target.path, "size", true, 2, 2, 0.0, false);
+
+    EXPECT_EQ(report.files_total, 4U);
+    EXPECT_EQ(report.files_skipped, 1U);
+    EXPECT_EQ(report.files_changed, 1U);
+    EXPECT_EQ(report.files_new, 1U);
+    EXPECT_EQ(report.files_target_only, 1U);
+    EXPECT_EQ(report.files.size(), 0U);
+    EXPECT_TRUE(report.diff_csv.empty());
 }
 
 void test_scan_mode_builds_source_scan_rows() {
@@ -3782,6 +3810,9 @@ int main(int argc, char** argv) {
          TestSuite::unit,
          test_diff_scan_indexes_reports_changes_and_target_only},
         {"live_metadata_diff_compares_flat_folders", TestSuite::unit, test_live_metadata_diff_compares_flat_folders},
+        {"live_metadata_diff_summary_only_counts_without_records",
+         TestSuite::unit,
+         test_live_metadata_diff_summary_only_counts_without_records},
         {"scan_mode_builds_source_scan_rows", TestSuite::unit, test_scan_mode_builds_source_scan_rows},
         {"main_cli_scan_and_dry_run_smoke", TestSuite::integration, test_main_cli_scan_and_dry_run_smoke},
         {"main_cli_benchmark_meta_smoke", TestSuite::integration, test_main_cli_benchmark_meta_smoke},

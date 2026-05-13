@@ -692,3 +692,59 @@ sha256           2    5.970    47.760
 sha256           4   11.867    94.938
 sha256           8   22.155   177.237
 ```
+
+## Live NFS Diff/Checker Expectations
+
+Summary-only live diff is the checker hot path: it compares flat-folder batches
+and updates counters without materializing per-file maps or CSV output. For
+time-limited runs, target-only reporting is disabled because a timer can stop a
+source directory mid-read and make the target look falsely ahead of the source.
+Run a full, untimed diff when target-only records are required.
+
+Transfer1 root self-diff against
+`nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+on 2026-05-13:
+
+```text
+command:
+  hypersync diff --source <root> --target <root> --compare size \
+    --summary-only --meta-reader-threads 96 --metadata-async-depth 128 \
+    --max-duration-seconds 5 --stats-interval-seconds 5
+
+observed:
+  5s average:  668,902 records/s, 3,344,675 compared records
+  10s average: 980,232 records/s, 9,804,137 compared records
+  10s interval: 1,291,480 records/s
+  15s average: 781,677 records/s, 11,726,688 compared records
+  max RSS before timeout: about 9.7 GiB
+
+scanner reference on the same root:
+  5s average:  4,396,420 records/s
+  10s average: 5,813,000 records/s
+  final after drain: 1,504,640 records/s over 56,824,570 files
+
+notes:
+  - Checker now runs source and target metadata readers as separate async jobs
+    and rendezvous flat-folder batches by folder path.
+  - This is scanner-class order of magnitude, but still below the scanner
+    target because it performs two NFS reads and a per-folder comparison.
+  - The next hot spot is comparison CPU/allocation in very large flat folders.
+```
+
+Nopo1 self-diff against
+`nfs://172.27.255.2-172.27.255.17/volumes/b7ec3b01-0aba-49cc-b3d2-6692504cf6c5/data`
+with the same summary-only command shape:
+
+```text
+observed:
+  5s average:  692,772 records/s, 3,464,003 compared records
+  10s average: 817,302 records/s, 8,173,386 compared records
+  10s interval: 941,831 records/s
+  max RSS before timeout: about 6.9 GiB
+
+notes:
+  - The run encountered many permission-denied folders and continued by
+    skipping those source folders.
+  - Timed-run target-only suppression kept self-diff counters stable:
+    `target_only=0`.
+```
