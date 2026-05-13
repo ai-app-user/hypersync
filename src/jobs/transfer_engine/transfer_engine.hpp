@@ -219,6 +219,9 @@ public:
                                                    const ScanIndex* source_scan = nullptr,
                                                    const ScanIndex* target_scan = nullptr,
                                                    bool recursive = true) const;
+    [[nodiscard]] TransferReport diff_scan_indexes(const ScanIndex& source_scan,
+                                                   const ScanIndex& target_scan,
+                                                   const std::string& compare_mode = "time") const;
     [[nodiscard]] ScanIndex build_scan_index(const std::filesystem::path& source_root,
                                              char scan_side = 'S',
                                              bool recursive = true) const;

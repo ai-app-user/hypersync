@@ -35,10 +35,13 @@ Current state:
   command/settings JSON when using the shared metadata record writer.
 - Periodic stats and graceful timer stop are implemented.
 - Direct libnfs scanning is implemented.
+- Partitioned scanner output can move flat-folder batches through
+  sender/receiver/writer jobs while storing the parent folder path once per
+  batch and child names per record.
 
 Remaining:
-- Apply partitioned Parquet writer throughput work to scanner output so
-  metadata output does not bottleneck high-speed metadata scans.
+- Continue optimizing partitioned Parquet writer throughput so metadata output
+  does not bottleneck high-speed metadata scans.
 - Define stable output schema versioning.
 - Add documentation for all scanner output columns.
 - Add resume/incremental scan behavior if required.
@@ -174,9 +177,14 @@ Requirements:
 Current state:
 - Local scan index and dry-run comparison behavior exist.
 - Basic scan CSV loading and comparison behavior exist.
+- A first-class `diff` command exists for comparing two scan CSV files using
+  `size`, `time`, or `content` comparison modes.
+- Diff output reports source-only/new, changed, equal, and target-only file
+  records in CSV form.
 
 Remaining:
-- Make NFS-to-NFS recursive diff a first-class command.
+- Make live NFS-to-NFS recursive diff a first-class command without requiring
+  prebuilt scan CSV inputs.
 - Add metadata-only and data-hash diff modes.
 - Add resumable diff for very large trees.
 - Add diff summaries by folder and change type.

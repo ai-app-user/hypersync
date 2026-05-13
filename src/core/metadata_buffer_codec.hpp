@@ -26,6 +26,19 @@ bool append_metadata_batch_file(MetadataBatchBuffer& buffer, const FileSpec& fil
 bool append_metadata_batch_folder(MetadataBatchBuffer& buffer, const MetadataFolderRecord& folder);
 bool append_metadata_batch_file(MetadataBatchBuffer& buffer, const GeneratedFileMetadataView& file);
 bool append_metadata_batch_folder(MetadataBatchBuffer& buffer, const GeneratedFolderMetadataView& folder);
+
+// Reset the batch as a compact flat-folder payload. The folder path is stored
+// once in the batch header; child records store only their basename. When
+// include_folder_record is true, decoding emits the folder record itself before
+// the child records.
+bool reset_folder_metadata_batch(MetadataBatchBuffer& buffer,
+                                 const MetadataFolderRecord& folder,
+                                 bool include_folder_record);
+bool append_folder_metadata_batch_file(MetadataBatchBuffer& buffer, const FileSpec& file);
+bool append_folder_metadata_batch_file(MetadataBatchBuffer& buffer, const GeneratedFileMetadataView& file);
+bool append_folder_metadata_batch_folder(MetadataBatchBuffer& buffer, const MetadataFolderRecord& folder);
+bool append_folder_metadata_batch_folder(MetadataBatchBuffer& buffer, const GeneratedFolderMetadataView& folder);
+
 void decode_metadata_batch(const MetadataBatchBuffer& buffer,
                            std::vector<FileSpec>& files,
                            std::vector<MetadataFolderRecord>& folders);

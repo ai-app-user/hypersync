@@ -130,6 +130,8 @@ std::string to_string(DiffKind diff) {
             return "new";
         case DiffKind::changed:
             return "changed";
+        case DiffKind::target_only:
+            return "target_only";
         case DiffKind::failed:
             return "failed";
     }

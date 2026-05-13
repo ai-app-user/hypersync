@@ -45,6 +45,11 @@ enabled, direct libnfs enabled, and uncompressed Parquet writer output. This is
 the current regression checkpoint before folder batching and diff/checker
 pipeline work.
 
+Note: after this baseline, scanner partitioned metadata output was changed to
+use folder-scoped metadata batches. The old baseline remains the pre-change
+comparison point; new job-performance runs should include both `pack-discard`
+and `folder-pack-discard` metadata writer modes.
+
 ### Raw Buffer Pipeline
 
 ```text

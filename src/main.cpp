@@ -62,13 +62,14 @@ void print_usage() {
         << "  hypersync status --socket <path>\n"
         << "  hypersync [--config <config.yaml>] send --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] diff --source-scan <scan.csv> --target-scan <scan.csv> [--compare size|time|content] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-metadata-writer --output <records.parquet|dataset-dir|csv|txt> [--output-format text|csv|parquet] [--file-count <n>] [--folder-count <n>] [--batch-size <n>] [--average-file-size <bytes>] [--duckdb-memory-limit <value>] [--duckdb-threads <n>] [--duckdb-checkpoint-threshold <value>] [--parquet-compression zstd|snappy|uncompressed] [--partitions <n>] [--partition-mode threads|processes|transport-processes|generate-discard|generate-hash-discard|pack-discard|transport-discard]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-metadata-writer --output <records.parquet|dataset-dir|csv|txt> [--output-format text|csv|parquet] [--file-count <n>] [--folder-count <n>] [--batch-size <n>] [--average-file-size <bytes>] [--duckdb-memory-limit <value>] [--duckdb-threads <n>] [--duckdb-checkpoint-threshold <value>] [--parquet-compression zstd|snappy|uncompressed] [--partitions <n>] [--partition-mode threads|processes|transport-processes|generate-discard|generate-hash-discard|pack-discard|folder-pack-discard|transport-discard]\n"
         << "  hypersync [--config <config.yaml>] hash --source <dir|nfs-url> --output <records.csv|txt|parquet> [--output-format text|csv|parquet] [--records all|files|folders] [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--hash-mode file|blocks] [--hash-block-size <bytes>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--hash-threads <n>] [--max-files-queued <n>] [--max-hash-chunks-queued <n>] [--max-duration-seconds <n>]\n"
         << '\n';
 }
@@ -365,6 +366,65 @@ int main(int argc, char** argv) {
             std::cout << "files_total=" << report.files_total
                       << " skipped=" << report.files_skipped
                       << " bytes_planned=" << report.bytes_planned << '\n';
+            if (output_path.empty()) {
+                std::cout << report.diff_csv;
+            }
+            return 0;
+        }
+
+        if (command == "diff") {
+            std::string source_scan_path;
+            std::string target_scan_path;
+            std::string output_path;
+            std::string compare_mode = "time";
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--source-scan") {
+                    source_scan_path = require_option(args, i, "--source-scan");
+                } else if (args[i] == "--target-scan") {
+                    target_scan_path = require_option(args, i, "--target-scan");
+                } else if (args[i] == "--output") {
+                    output_path = require_option(args, i, "--output");
+                } else if (args[i] == "--compare" || args[i] == "--mode") {
+                    compare_mode = require_option(args, i, args[i]);
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+
+            if (source_scan_path.empty()) {
+                throw std::runtime_error("--source-scan is required");
+            }
+            if (target_scan_path.empty()) {
+                throw std::runtime_error("--target-scan is required");
+            }
+
+            const auto source_scan = hypersync::TransferEngine::load_scan_csv(source_scan_path);
+            const auto target_scan = hypersync::TransferEngine::load_scan_csv(target_scan_path);
+            const auto report = engine.diff_scan_indexes(source_scan, target_scan, compare_mode);
+            if (!output_path.empty()) {
+                hypersync::TransferEngine::write_diff_csv(report, output_path);
+            }
+
+            std::size_t changed = 0;
+            std::size_t created = 0;
+            std::size_t target_only = 0;
+            for (const auto& [_, outcome] : report.files) {
+                if (outcome.diff == hypersync::DiffKind::changed) {
+                    ++changed;
+                } else if (outcome.diff == hypersync::DiffKind::new_file) {
+                    ++created;
+                } else if (outcome.diff == hypersync::DiffKind::target_only) {
+                    ++target_only;
+                }
+            }
+            std::cout << "diff_records=" << report.files_total
+                      << " same=" << report.files_skipped
+                      << " changed=" << changed
+                      << " new=" << created
+                      << " target_only=" << target_only
+                      << " bytes_planned=" << report.bytes_planned
+                      << " compare_mode=" << compare_mode << '\n';
             if (output_path.empty()) {
                 std::cout << report.diff_csv;
             }

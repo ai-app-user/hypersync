@@ -625,7 +625,17 @@ pool and one generated-buffer queue feeding all sender sockets.
 
 Purpose: compare two NFS trees.
 
-Desired command:
+Current scan-CSV command:
+
+```bash
+hypersync diff \
+  --source-scan source.csv \
+  --target-scan target.csv \
+  --compare time \
+  --output diff.csv
+```
+
+Live NFS desired command:
 
 ```bash
 wsync nfs diff \
@@ -637,6 +647,9 @@ wsync nfs diff \
 Common options:
 - `--source`
 - `--target`
+- `--source-scan`
+- `--target-scan`
+- `--compare size|time|content`
 - `--mode metadata|hash|full`
 - `--output`
 - `--format text|csv|parquet`

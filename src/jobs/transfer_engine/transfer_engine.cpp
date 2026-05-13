@@ -236,7 +236,14 @@ std::filesystem::path metadata_partition_output_path(const std::filesystem::path
 }
 
 std::filesystem::path metadata_partition_socket_path(const std::filesystem::path& output_path, std::size_t index) {
-    return output_path / ("part-" + metadata_part_suffix(index) + ".sock");
+    const std::filesystem::path candidate = output_path / ("part-" + metadata_part_suffix(index) + ".sock");
+    if (candidate.string().size() <= 90U) {
+        return candidate;
+    }
+    std::ostringstream name;
+    name << "hypersync-" << std::hex << hash64(output_path.string()) << '-'
+         << metadata_part_suffix(index) << ".sock";
+    return std::filesystem::path("/tmp") / name.str();
 }
 
 std::filesystem::path metadata_partition_report_path(const std::filesystem::path& output_path, std::size_t index) {
@@ -377,28 +384,31 @@ public:
     }
 
     void write_batch(const std::vector<FileSpec>& files, const MetadataFolderRecord& folder) {
-        if (writer_config_.write_folders) {
-            const std::size_t partition = metadata_partition_for_path(folder.spec.rel_path, partitions_);
-            std::lock_guard<std::mutex> lock(states_[partition]->mutex);
-            if (!append_metadata_batch_folder(acquire_batch(partition), folder)) {
-                flush_batch(partition);
-                if (!append_metadata_batch_folder(acquire_batch(partition), folder)) {
-                    throw std::runtime_error("metadata folder record does not fit metadata batch buffer");
-                }
-            }
+        if (!writer_config_.write_folders && (!writer_config_.write_files || files.empty())) {
+            return;
         }
+
+        const std::size_t partition = metadata_partition_for_path(folder.spec.rel_path, partitions_);
+        std::lock_guard<std::mutex> lock(states_[partition]->mutex);
+        bool include_folder_record = writer_config_.write_folders;
+        auto& batch = start_folder_batch(partition, folder, include_folder_record);
+        include_folder_record = false;
+
         if (writer_config_.write_files) {
             for (const auto& file : files) {
-                const std::size_t partition = metadata_partition_for_path(file.rel_path, partitions_);
-                std::lock_guard<std::mutex> lock(states_[partition]->mutex);
-                if (!append_metadata_batch_file(acquire_batch(partition), file)) {
+                if (!append_folder_metadata_batch_file(metadata_batch_buffer(states_[partition]->pool,
+                                                                            states_[partition]->open_batch),
+                                                       file)) {
                     flush_batch(partition);
-                    if (!append_metadata_batch_file(acquire_batch(partition), file)) {
-                        throw std::runtime_error("metadata file record does not fit metadata batch buffer");
+                    auto& continued_batch = start_folder_batch(partition, folder, include_folder_record);
+                    if (!append_folder_metadata_batch_file(continued_batch, file)) {
+                        throw std::runtime_error("metadata file record does not fit folder metadata batch buffer");
                     }
                 }
             }
         }
+        (void)batch;
+        flush_batch(partition);
     }
 
     void close() {
@@ -413,8 +423,15 @@ public:
         for (auto& state : states_) {
             state->queue.close();
         }
+        std::exception_ptr sender_error;
         for (auto& state : states_) {
-            state->sender.wait();
+            try {
+                state->sender.wait();
+            } catch (...) {
+                if (!sender_error) {
+                    sender_error = std::current_exception();
+                }
+            }
         }
 
         bool child_failed = false;
@@ -429,6 +446,9 @@ public:
         }
         if (child_failed) {
             throw std::runtime_error("one or more metadata writer partition processes failed");
+        }
+        if (sender_error) {
+            std::rethrow_exception(sender_error);
         }
         for (std::size_t index = 0; index < partitions_; ++index) {
             const auto [files, folders] = read_metadata_partition_report(
@@ -480,6 +500,25 @@ private:
             reset_metadata_batch(metadata_batch_buffer(state.pool, state.open_batch));
             state.has_open_batch = true;
         }
+        return metadata_batch_buffer(state.pool, state.open_batch);
+    }
+
+    MetadataBatchBuffer& start_folder_batch(std::size_t partition,
+                                            const MetadataFolderRecord& folder,
+                                            bool include_folder_record) {
+        PartitionSendState& state = *states_[partition];
+        if (state.has_open_batch) {
+            throw std::runtime_error("cannot start folder metadata batch while another batch is open");
+        }
+        state.open_batch = state.pool.acquire_spin();
+        if (!reset_folder_metadata_batch(metadata_batch_buffer(state.pool, state.open_batch),
+                                         folder,
+                                         include_folder_record)) {
+            state.pool.release(state.open_batch);
+            state.has_open_batch = false;
+            throw std::runtime_error("metadata folder path does not fit metadata batch buffer");
+        }
+        state.has_open_batch = true;
         return metadata_batch_buffer(state.pool, state.open_batch);
     }
 
@@ -3950,6 +3989,81 @@ TransferReport TransferEngine::dry_run_directory(const std::filesystem::path& so
     return dry_run_engine.run(files, effective_source_scan, target_scan);
 }
 
+TransferReport TransferEngine::diff_scan_indexes(const ScanIndex& source_scan,
+                                                 const ScanIndex& target_scan,
+                                                 const std::string& compare_mode) const {
+    if (compare_mode != "size" && compare_mode != "time" && compare_mode != "content") {
+        throw std::invalid_argument("diff compare mode must be size, time, or content");
+    }
+
+    const auto source_rows = source_scan.rows();
+    const auto target_rows = target_scan.rows();
+    std::map<std::string, FileSnapshot> target_by_path;
+    for (const auto& row : target_rows) {
+        target_by_path.emplace(row.rel_path, row);
+    }
+
+    const auto rows_match = [&](const FileSnapshot& source, const FileSnapshot& target) {
+        if (compare_mode == "size") {
+            return source.size == target.size;
+        }
+        if (compare_mode == "time") {
+            return source.size == target.size && source.mtime == target.mtime;
+        }
+        if (source.data_hash != 0U && target.data_hash != 0U) {
+            return source.size == target.size && source.data_hash == target.data_hash;
+        }
+        return source.size == target.size && source.mtime == target.mtime;
+    };
+
+    TransferReport report;
+    report.mode = Mode::dry_run;
+    report.source_scan_rows = source_rows;
+    report.target_scan_rows = target_rows;
+    report.diff_csv = "rel_path,decision,source_size,source_mtime,target_size,target_mtime\n";
+
+    for (const auto& source : source_rows) {
+        FileOutcome outcome;
+        outcome.rel_path = source.rel_path;
+        outcome.size = source.size;
+        outcome.data_hash = source.data_hash;
+        const auto target_it = target_by_path.find(source.rel_path);
+        if (target_it == target_by_path.end()) {
+            outcome.diff = DiffKind::new_file;
+            report.bytes_planned += source.size;
+        } else if (rows_match(source, target_it->second)) {
+            outcome.diff = DiffKind::skip;
+            ++report.files_skipped;
+        } else {
+            outcome.diff = DiffKind::changed;
+            report.bytes_planned += source.size;
+        }
+        const std::uint64_t target_size = target_it == target_by_path.end() ? 0U : target_it->second.size;
+        const std::uint64_t target_mtime = target_it == target_by_path.end() ? 0U : target_it->second.mtime;
+        report.diff_csv += source.rel_path + "," + to_string(outcome.diff) + "," +
+                           std::to_string(source.size) + "," + std::to_string(source.mtime) + "," +
+                           std::to_string(target_size) + "," + std::to_string(target_mtime) + "\n";
+        report.files[source.rel_path] = outcome;
+        if (target_it != target_by_path.end()) {
+            target_by_path.erase(target_it);
+        }
+    }
+
+    for (const auto& [path, target] : target_by_path) {
+        FileOutcome outcome;
+        outcome.rel_path = path;
+        outcome.diff = DiffKind::target_only;
+        outcome.size = target.size;
+        outcome.data_hash = target.data_hash;
+        report.diff_csv += path + "," + to_string(DiffKind::target_only) + ",0,0," +
+                           std::to_string(target.size) + "," + std::to_string(target.mtime) + "\n";
+        report.files[path] = outcome;
+    }
+
+    report.files_total = report.files.size();
+    return report;
+}
+
 ScanIndex TransferEngine::build_scan_index(const std::filesystem::path& source_root,
                                            char scan_side,
                                            bool recursive) const {
@@ -4455,8 +4569,9 @@ MetadataWriterBenchmarkReport TransferEngine::benchmark_metadata_writer(
         partition_mode != "generate-discard" &&
         partition_mode != "generate-hash-discard" &&
         partition_mode != "pack-discard" &&
+        partition_mode != "folder-pack-discard" &&
         partition_mode != "transport-discard") {
-        throw std::invalid_argument("metadata writer benchmark partition mode must be threads, processes, transport-processes, generate-discard, generate-hash-discard, pack-discard, or transport-discard");
+        throw std::invalid_argument("metadata writer benchmark partition mode must be threads, processes, transport-processes, generate-discard, generate-hash-discard, pack-discard, folder-pack-discard, or transport-discard");
     }
     partitions = std::max<std::size_t>(1U, partitions);
 
@@ -4821,6 +4936,79 @@ MetadataWriterBenchmarkReport TransferEngine::benchmark_metadata_writer(
         }
     };
 
+    const auto run_parent_folder_batch_producer = [&]() {
+        RawBufferPool send_pool(kMetadataBatchBufferPoolId,
+                                std::max<std::size_t>(64U, partitions * 4U),
+                                sizeof(MetadataBatchBuffer),
+                                alignof(MetadataBatchBuffer));
+        const auto make_folder_record = [](const GeneratedFolderMetadataView& view) {
+            MetadataFolderRecord folder;
+            folder.spec.rel_path.assign(view.rel_path);
+            folder.spec.mtime = view.mtime;
+            folder.spec.mode = view.mode;
+            folder.spec.uid = view.uid;
+            folder.spec.gid = view.gid;
+            folder.flat_file_count = static_cast<std::size_t>(view.flat_file_count);
+            folder.flat_logical_size_bytes = view.flat_logical_size_bytes;
+            return folder;
+        };
+
+        FileMetadataGenerator generator(FileMetadataGeneratorConfig(file_count,
+                                                                    folder_count,
+                                                                    effective_batch_size,
+                                                                    average_file_size,
+                                                                    0x9e3779b97f4a7c15ULL,
+                                                                    "generated"));
+        const std::uint64_t effective_folder_count = std::max<std::uint64_t>(1U, folder_count);
+        for (std::uint64_t folder_index = 0; folder_index < effective_folder_count; ++folder_index) {
+            MetadataFolderRecord folder_record;
+            generator.for_each_folder_view(folder_index, 1U, [&](const GeneratedFolderMetadataView& folder) {
+                folder_record = make_folder_record(folder);
+            });
+            const bool include_folder_record = folder_index < folder_count;
+            if (include_folder_record) {
+                ++transport_folders_generated;
+            }
+
+            BufferHandle batch_handle = send_pool.acquire_spin();
+            if (!reset_folder_metadata_batch(metadata_batch_buffer(send_pool, batch_handle),
+                                             folder_record,
+                                             include_folder_record)) {
+                send_pool.release(batch_handle);
+                throw std::runtime_error("metadata folder path does not fit metadata batch buffer");
+            }
+
+            for (std::uint64_t file_index = folder_index;
+                 file_index < file_count;
+                 file_index += effective_folder_count) {
+                bool appended = false;
+                generator.for_each_file_view(file_index, 1U, [&](const GeneratedFileMetadataView& file) {
+                    transport_logical_size_bytes += file.declared_size;
+                    ++transport_files_generated;
+                    appended = append_folder_metadata_batch_file(metadata_batch_buffer(send_pool, batch_handle),
+                                                                 file);
+                });
+                if (!appended) {
+                    send_pool.release(batch_handle);
+                    batch_handle = send_pool.acquire_spin();
+                    if (!reset_folder_metadata_batch(metadata_batch_buffer(send_pool, batch_handle),
+                                                     folder_record,
+                                                     false)) {
+                        send_pool.release(batch_handle);
+                        throw std::runtime_error("metadata folder path does not fit metadata batch buffer");
+                    }
+                    generator.for_each_file_view(file_index, 1U, [&](const GeneratedFileMetadataView& file) {
+                        if (!append_folder_metadata_batch_file(metadata_batch_buffer(send_pool, batch_handle),
+                                                               file)) {
+                            throw std::runtime_error("metadata file record does not fit folder metadata batch buffer");
+                        }
+                    });
+                }
+            }
+            send_pool.release(batch_handle);
+        }
+    };
+
     const auto started_at = std::chrono::steady_clock::now();
     if (partition_mode == "generate-discard") {
         run_parent_generator_probe(false);
@@ -4828,6 +5016,8 @@ MetadataWriterBenchmarkReport TransferEngine::benchmark_metadata_writer(
         run_parent_generator_probe(true);
     } else if (partition_mode == "pack-discard") {
         run_parent_batch_producer(false);
+    } else if (partition_mode == "folder-pack-discard") {
+        run_parent_folder_batch_producer();
     } else if (partitions == 1U) {
         partition_reports.front() = run_partition(0);
     } else if (partition_mode == "processes" || partition_mode == "transport-processes" || partition_mode == "transport-discard") {
@@ -4916,6 +5106,7 @@ MetadataWriterBenchmarkReport TransferEngine::benchmark_metadata_writer(
     if (partition_mode == "generate-discard" ||
         partition_mode == "generate-hash-discard" ||
         partition_mode == "pack-discard" ||
+        partition_mode == "folder-pack-discard" ||
         partition_mode == "transport-processes" ||
         partition_mode == "transport-discard") {
         report.files_generated = transport_files_generated;

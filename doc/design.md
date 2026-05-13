@@ -238,6 +238,21 @@ and releases each buffer. Therefore a Parquet writer process can be assembled as
 BufferReceiverJob -> MetadataRecordWriterJob(part-N.parquet)
 ```
 
+Metadata batches have two compatible payload shapes:
+
+- **Record batch:** each file or folder record stores its full relative path.
+  This is simple and remains useful for generic generated workloads.
+- **Folder batch:** a flat folder path and folder metadata are stored once in
+  the batch header, and child records store only their file or child-folder
+  name plus metadata. A large flat folder may be split into multiple folder
+  batches; only the first batch needs to emit the folder record itself.
+
+The folder batch shape is the preferred scanner and future diff transport
+format because it minimizes repeated path bytes on the wire and preserves the
+natural flat-folder unit used by the metadata reader, checker, and differ.
+Decoders reconstruct full relative paths for existing writers so the output
+schema remains unchanged.
+
 ### 3.1 Buffer Types
 
 | Type | Data | Metadata trailer | Total | Pool size | RAM | Purpose |

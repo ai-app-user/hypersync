@@ -62,6 +62,7 @@ enum class DiffKind {
     skip,
     new_file,
     changed,
+    target_only,
     failed,
 };
 

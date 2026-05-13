@@ -25,6 +25,12 @@ This document defines general development principles for the application. It sho
 - Move file payload buffers by ownership between jobs; do not copy data bytes into queue messages.
 - New hot-path pipeline jobs should consume and emit `BufferHandle` values through `BufQueue` and operate on `RawBufferPool` slots. Typed payload interpretation belongs at the element/view level only.
 - Preallocate payload buffers for high-volume data paths; do not allocate or free per-chunk payload memory during steady-state reads, writes, hashing, or transfer.
+- Do not create large payload buffers as stack temporaries. Reset or initialize
+  preallocated buffers by updating their small headers/counters and only clear
+  payload bytes when correctness requires it.
+- Treat buffer payloads as byte wire formats. Encode/decode multi-field
+  payload headers with structured copy helpers such as `memcpy`; do not rely on
+  reinterpreting byte arrays as aligned C++ structs.
 - Treat borrowed backend buffers as callback-lifetime data that must not cross job boundaries.
 - When a backend returns borrowed data, copy it at the backend boundary into an owned preallocated slot if another job must process it asynchronously.
 - Benchmark modes that intentionally skip copying payload bytes must be explicit, labeled as invalid for downstream consumers that inspect data, and limited to discard/performance isolation paths.

@@ -973,6 +973,82 @@ void test_buffer_transport_moves_raw_buffers_over_tcp_and_unix() {
     fs::remove(unix_socket_path, ignored);
 }
 
+void test_compact_folder_metadata_batch_round_trip() {
+    MetadataFolderRecord folder;
+    folder.spec.rel_path = "writer/nested";
+    folder.spec.mtime = 9000;
+    folder.spec.mode = 0755;
+    folder.spec.uid = 1000;
+    folder.spec.gid = 1001;
+    folder.flat_file_count = 16;
+    folder.flat_logical_size_bytes = 16 * 4096;
+
+    std::vector<FileSpec> input_files;
+    for (std::size_t index = 0; index < 16U; ++index) {
+        FileSpec file;
+        file.rel_path = "writer/nested/file_" + std::to_string(index) + ".dat";
+        file.declared_size = 4096 + index;
+        file.mtime = 10'000 + index;
+        file.mode = 0644;
+        file.uid = 2000 + static_cast<std::uint32_t>(index);
+        file.gid = 3000 + static_cast<std::uint32_t>(index);
+        input_files.push_back(std::move(file));
+    }
+
+    MetadataFolderRecord child_folder;
+    child_folder.spec.rel_path = "writer/nested/child";
+    child_folder.spec.mtime = 12'000;
+    child_folder.spec.mode = 0750;
+    child_folder.spec.uid = 4000;
+    child_folder.spec.gid = 5000;
+    child_folder.flat_file_count = 3;
+    child_folder.flat_logical_size_bytes = 12'345;
+
+    hypersync::MetadataBatchBuffer full_batch;
+    hypersync::reset_metadata_batch(full_batch);
+    EXPECT_TRUE(hypersync::append_metadata_batch_folder(full_batch, folder));
+    for (const auto& file : input_files) {
+        EXPECT_TRUE(hypersync::append_metadata_batch_file(full_batch, file));
+    }
+    EXPECT_TRUE(hypersync::append_metadata_batch_folder(full_batch, child_folder));
+
+    hypersync::MetadataBatchBuffer compact_batch;
+    EXPECT_TRUE(hypersync::reset_folder_metadata_batch(compact_batch, folder, true));
+    for (const auto& file : input_files) {
+        EXPECT_TRUE(hypersync::append_folder_metadata_batch_file(compact_batch, file));
+    }
+    EXPECT_TRUE(hypersync::append_folder_metadata_batch_folder(compact_batch, child_folder));
+    EXPECT_TRUE(compact_batch.bytes_used < full_batch.bytes_used);
+
+    std::vector<FileSpec> files;
+    std::vector<MetadataFolderRecord> folders;
+    hypersync::decode_metadata_batch(compact_batch, files, folders);
+    EXPECT_EQ(files.size(), input_files.size());
+    EXPECT_EQ(folders.size(), 2U);
+    EXPECT_EQ(folders.front().spec.rel_path, folder.spec.rel_path);
+    EXPECT_EQ(folders.front().flat_file_count, folder.flat_file_count);
+    EXPECT_EQ(folders.front().flat_logical_size_bytes, folder.flat_logical_size_bytes);
+    EXPECT_EQ(folders.back().spec.rel_path, child_folder.spec.rel_path);
+    EXPECT_EQ(folders.back().flat_file_count, child_folder.flat_file_count);
+    for (std::size_t index = 0; index < input_files.size(); ++index) {
+        EXPECT_EQ(files[index].rel_path, input_files[index].rel_path);
+        EXPECT_EQ(files[index].declared_size, input_files[index].declared_size);
+        EXPECT_EQ(files[index].mtime, input_files[index].mtime);
+        EXPECT_EQ(files[index].uid, input_files[index].uid);
+        EXPECT_EQ(files[index].gid, input_files[index].gid);
+    }
+
+    hypersync::MetadataBatchBuffer continuation_batch;
+    EXPECT_TRUE(hypersync::reset_folder_metadata_batch(continuation_batch, folder, false));
+    EXPECT_TRUE(hypersync::append_folder_metadata_batch_file(continuation_batch, input_files.front()));
+    files.clear();
+    folders.clear();
+    hypersync::decode_metadata_batch(continuation_batch, files, folders);
+    EXPECT_EQ(files.size(), 1U);
+    EXPECT_EQ(folders.size(), 0U);
+    EXPECT_EQ(files.front().rel_path, input_files.front().rel_path);
+}
+
 void test_buffer_transport_feeds_metadata_writer_job() {
     TempDir output("hypersync_transport_metadata_writer");
     const fs::path socket_path =
@@ -1309,6 +1385,7 @@ void test_state_machines_accept_valid_paths_and_reject_invalid_ones() {
     EXPECT_EQ(hypersync::to_string(DiffKind::skip), "skip");
     EXPECT_EQ(hypersync::to_string(DiffKind::new_file), "new");
     EXPECT_EQ(hypersync::to_string(DiffKind::changed), "changed");
+    EXPECT_EQ(hypersync::to_string(DiffKind::target_only), "target_only");
     EXPECT_EQ(hypersync::to_string(DiffKind::failed), "failed");
     EXPECT_EQ(hypersync::to_string(static_cast<DiffKind>(99)), "unknown");
 
@@ -2688,6 +2765,29 @@ void test_main_cli_scan_and_dry_run_smoke() {
     EXPECT_TRUE(fs::exists(diff_csv));
     EXPECT_TRUE(hypersync::read_file_contents(diff_csv).find("skip") != std::string::npos);
 
+    ScanIndex source_diff_scan;
+    source_diff_scan.add(hypersync::make_snapshot(FileSpec{"same.txt", "same", 10}, hypersync::hash64("same"), 'S'));
+    source_diff_scan.add(hypersync::make_snapshot(FileSpec{"changed.txt", "fresh", 20}, hypersync::hash64("fresh"), 'S'));
+    source_diff_scan.add(hypersync::make_snapshot(FileSpec{"new.txt", "new", 30}, hypersync::hash64("new"), 'S'));
+    ScanIndex target_diff_scan;
+    target_diff_scan.add(hypersync::make_snapshot(FileSpec{"same.txt", "same", 10}, hypersync::hash64("same"), 'T'));
+    target_diff_scan.add(hypersync::make_snapshot(FileSpec{"changed.txt", "stale", 20}, hypersync::hash64("stale"), 'T'));
+    target_diff_scan.add(hypersync::make_snapshot(FileSpec{"extra.txt", "extra", 40}, hypersync::hash64("extra"), 'T'));
+    const fs::path source_diff_scan_path = output.path / "source_diff_scan.csv";
+    const fs::path target_diff_scan_path = output.path / "target_diff_scan.csv";
+    const fs::path first_class_diff_csv = output.path / "first_class_diff.csv";
+    hypersync::TransferEngine::write_scan_csv(source_diff_scan, source_diff_scan_path);
+    hypersync::TransferEngine::write_scan_csv(target_diff_scan, target_diff_scan_path);
+    EXPECT_TRUE(command_succeeds(app + " diff --source-scan " + source_diff_scan_path.string() +
+                                 " --target-scan " + target_diff_scan_path.string() +
+                                 " --compare content --output " + first_class_diff_csv.string() +
+                                 " >/dev/null 2>&1"));
+    const std::string first_class_diff = hypersync::read_file_contents(first_class_diff_csv);
+    EXPECT_TRUE(first_class_diff.find("same.txt,skip") != std::string::npos);
+    EXPECT_TRUE(first_class_diff.find("changed.txt,changed") != std::string::npos);
+    EXPECT_TRUE(first_class_diff.find("new.txt,new") != std::string::npos);
+    EXPECT_TRUE(first_class_diff.find("extra.txt,target_only") != std::string::npos);
+
     EXPECT_FALSE(command_succeeds(app + " receive >/dev/null 2>&1"));
 }
 
@@ -2729,6 +2829,22 @@ void test_main_cli_benchmark_meta_smoke() {
     EXPECT_TRUE(metadata_csv.find("file,nested/beta.bin,6,") != std::string::npos);
     EXPECT_TRUE(metadata_csv.find("folder,nested,,") != std::string::npos);
     EXPECT_TRUE(metadata_csv.find(",1,6") != std::string::npos);
+
+    const fs::path partitioned_metadata_dir = output.path / "partitioned_metadata";
+    EXPECT_TRUE(command_succeeds(app + " benchmark-meta --source " + source.path.string() +
+                                 " --metadata-output " + partitioned_metadata_dir.string() +
+                                 " --metadata-output-format csv --metadata-records all" +
+                                 " --metadata-output-partitions 2 --metadata-output-partition-mode processes" +
+                                 " --max-duration-seconds 10 > " +
+                                 (output.path / "metadata_partitioned_stdout.txt").string() + " 2>&1"));
+    EXPECT_TRUE(fs::exists(partitioned_metadata_dir / "part-00000.csv"));
+    EXPECT_TRUE(fs::exists(partitioned_metadata_dir / "part-00001.csv"));
+    const std::string part0 = hypersync::read_file_contents(partitioned_metadata_dir / "part-00000.csv");
+    const std::string part1 = hypersync::read_file_contents(partitioned_metadata_dir / "part-00001.csv");
+    const std::string combined_partitions = part0 + part1;
+    EXPECT_TRUE(combined_partitions.find("file,alpha.txt,5,") != std::string::npos);
+    EXPECT_TRUE(combined_partitions.find("file,nested/beta.bin,6,") != std::string::npos);
+    EXPECT_TRUE(combined_partitions.find("folder,nested,,") != std::string::npos);
 }
 
 void test_main_cli_benchmark_data_smoke() {
@@ -3240,6 +3356,38 @@ void test_dry_run_uses_scans_and_metadata() {
     EXPECT_TRUE(report.diff_csv.find("dir/new.txt,new") != std::string::npos);
 }
 
+void test_diff_scan_indexes_reports_changes_and_target_only() {
+    const FileSpec same{"dir/same.txt", "same", 10};
+    const FileSpec changed_source{"dir/changed.txt", "fresh", 20};
+    const FileSpec changed_target{"dir/changed.txt", "stale", 20};
+    const FileSpec created{"dir/new.txt", "new", 30};
+    const FileSpec extra{"dir/extra.txt", "extra", 40};
+
+    ScanIndex source_scan;
+    source_scan.add(hypersync::make_snapshot(same, hypersync::hash64(same.content), 'S'));
+    source_scan.add(hypersync::make_snapshot(changed_source, hypersync::hash64(changed_source.content), 'S'));
+    source_scan.add(hypersync::make_snapshot(created, hypersync::hash64(created.content), 'S'));
+
+    ScanIndex target_scan;
+    target_scan.add(hypersync::make_snapshot(same, hypersync::hash64(same.content), 'T'));
+    target_scan.add(hypersync::make_snapshot(changed_target, hypersync::hash64(changed_target.content), 'T'));
+    target_scan.add(hypersync::make_snapshot(extra, hypersync::hash64(extra.content), 'T'));
+
+    EngineConfig config;
+    config.mode = Mode::dry_run;
+    const TransferEngine engine(config);
+    const auto report = engine.diff_scan_indexes(source_scan, target_scan, "content");
+
+    EXPECT_EQ(report.files_total, 4U);
+    EXPECT_EQ(report.files_skipped, 1U);
+    EXPECT_EQ(report.files.at("dir/same.txt").diff, DiffKind::skip);
+    EXPECT_EQ(report.files.at("dir/changed.txt").diff, DiffKind::changed);
+    EXPECT_EQ(report.files.at("dir/new.txt").diff, DiffKind::new_file);
+    EXPECT_EQ(report.files.at("dir/extra.txt").diff, DiffKind::target_only);
+    EXPECT_TRUE(report.diff_csv.find("dir/extra.txt,target_only,0,0,") != std::string::npos);
+    EXPECT_TRUE(report.diff_csv.find("dir/changed.txt,changed,") != std::string::npos);
+}
+
 void test_scan_mode_builds_source_scan_rows() {
     EngineConfig config;
     config.mode = Mode::scan;
@@ -3424,6 +3572,9 @@ int main(int argc, char** argv) {
         {"buffer_transport_moves_raw_buffers_over_tcp_and_unix",
          TestSuite::unit,
          test_buffer_transport_moves_raw_buffers_over_tcp_and_unix},
+        {"compact_folder_metadata_batch_round_trip",
+         TestSuite::unit,
+         test_compact_folder_metadata_batch_round_trip},
         {"buffer_transport_feeds_metadata_writer_job",
          TestSuite::unit,
          test_buffer_transport_feeds_metadata_writer_job},
@@ -3516,6 +3667,9 @@ int main(int argc, char** argv) {
          TestSuite::unit,
          test_transfer_mode_skip_verify_ignores_forced_failures},
         {"dry_run_uses_scans_and_metadata", TestSuite::unit, test_dry_run_uses_scans_and_metadata},
+        {"diff_scan_indexes_reports_changes_and_target_only",
+         TestSuite::unit,
+         test_diff_scan_indexes_reports_changes_and_target_only},
         {"scan_mode_builds_source_scan_rows", TestSuite::unit, test_scan_mode_builds_source_scan_rows},
         {"main_cli_scan_and_dry_run_smoke", TestSuite::integration, test_main_cli_scan_and_dry_run_smoke},
         {"main_cli_benchmark_meta_smoke", TestSuite::integration, test_main_cli_benchmark_meta_smoke},
