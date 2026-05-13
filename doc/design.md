@@ -305,6 +305,12 @@ hash, and sends one normal file ACK per original file id. This reduces wire
 frames and per-buffer queue traffic for many tiny files while preserving the
 same priority-channel metadata and per-file completion semantics.
 
+The runtime implementation must not wait for a WAN round trip per file.
+File records are pushed ahead of data, receiver decisions are collected as a
+decision stream, and data ACKs are matched by `file_id` as they arrive. The
+sender may have many files in flight; receiver slot exhaustion is flow control,
+not an error.
+
 ### 3.3 RecBuf Layout
 
 ```cpp
@@ -445,7 +451,10 @@ All network communication uses two independent TCP connection pools. This is the
 
 ### 5.1 Priority Channel
 
-1–2 persistent TCP connections. Carries all control traffic. Messages are small, sent immediately, never queued behind bulk data.
+1–2 persistent TCP connections. Carries all control traffic. Messages are
+small, sent immediately, never queued behind bulk data. The sender must batch
+or pipeline metadata decisions and ACK collection; any implementation that
+does a blocking request/response per file is not acceptable on WAN links.
 
 | Message | Direction | Size | Purpose |
 |---|---|---|---|

@@ -1,6 +1,6 @@
 engine:
   mode: transfer
-  small_file_threshold: 4096
+  small_file_threshold: 131072
   large_chunk_bytes: 1048576
   small_pool_slots: 8
   large_pool_slots: 8
@@ -71,7 +71,7 @@ jobs:
     data_reader_worker_count: 2
     outstanding_requests: 256
     large_file_parallelism: 8
-    small_file_threshold: 4096
+    small_file_threshold: 131072
     large_chunk_bytes: 1048576
     pause_large_pool_percent: 85.0
     resume_large_pool_percent: 70.0

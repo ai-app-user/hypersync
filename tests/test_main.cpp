@@ -1343,6 +1343,19 @@ void test_scan_index_round_trip_and_folder_hashes() {
     EXPECT_TRUE(beta_row.has_value());
     EXPECT_EQ(beta_row->scan_side, 'S');
     EXPECT_EQ(reloaded.rows().size(), 2U);
+
+    const std::string rich_csv =
+        "record_type,rel_path,size,mtime,mode,uid,gid,flat_file_count,flat_logical_size_bytes,hash_algorithm,"
+        "content_hash,hash_block_size,hash_block_count,block_hash_algorithm,block_hashes,scan_run_id,"
+        "run_started_at_utc,run_started_unix_ns,source_root,run_settings\n"
+        "folder,root,0,1,493,1,2,1,5,\"\",\"\",0,0,\"\",\"\",99,2026-05-13T00:00:00Z,123,/tmp/src,\"{}\"\n"
+        "file,root/alpha.txt,5,10,420,1,2,,,\"\",\"\",0,0,\"\",\"\",99,2026-05-13T00:00:00Z,123,/tmp/src,\"{}\"\n";
+    const ScanIndex rich_reloaded = ScanIndex::from_csv(rich_csv);
+    const auto rich_alpha = rich_reloaded.find("root/alpha.txt");
+    EXPECT_TRUE(rich_alpha.has_value());
+    EXPECT_EQ(rich_alpha->size, 5ULL);
+    EXPECT_EQ(rich_alpha->mtime, 10ULL);
+    EXPECT_EQ(rich_reloaded.rows().size(), 1U);
 }
 
 void test_scan_index_rejects_bad_csv() {

@@ -50,6 +50,42 @@ use folder-scoped metadata batches. The old baseline remains the pre-change
 comparison point; new job-performance runs should include both `pack-discard`
 and `folder-pack-discard` metadata writer modes.
 
+## Transfer1 To Nopo1 Runtime Checks
+
+Recorded on `2026-05-13` with transfer1 `216.86.174.100` and nopo1
+`160.211.77.39`, using local NVMe on both hosts unless noted.
+
+Raw network baseline with `iperf3 -P 16`:
+
+| Direction | Sender Gbit/s | Receiver Gbit/s |
+|---|---:|---:|
+| transfer1 -> nopo1 | 196 | 179 |
+| nopo1 -> transfer1 | 177 | 160 |
+
+Hypersync runtime sync after batched metadata decisions, pipelined ACK
+collection, 128KiB small-file packing, and blocking receiver slot acquire:
+
+| Workload | Runtime Shape | Files | Bytes | Elapsed | Gbit/s | Notes |
+|---|---|---:|---:|---:|---:|---|
+| 128KiB files | single sync | 50,000 | 6.55GB | 6.03s | 8.70 | one sender/receiver pair |
+| 128KiB files | 50 sharded flat-folder syncs | 50,000 | 6.55GB | 1.30s | 40.25 | parallel process lanes |
+| 128KiB files | 50 sharded flat-folder syncs | 200,000 | 26.21GB | 6.48s | 32.35 | target file creation dominates |
+| 1MiB files | single sync | 16,000 | 16.78GB | 17.38s | 7.72 | one sender/receiver pair |
+| 1MiB files | 50 sharded flat-folder syncs | 16,000 | 16.78GB | 2.09s | 64.12 | exceeds 50Gbit/s target |
+
+Real NFS source check from transfer1 to nopo1 local NVMe:
+
+```text
+source=nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/HaWoR/video/path/0/175593000
+files_total=506 transferred=506 failed=0 bytes=9564146 chunks_sent=501 elapsed=2.91s
+scan-to-scan diff after sync: same=506 changed=0 new=0 target_only=0
+```
+
+Conclusion: cross-site transport is not the current limiter. The single runtime
+sync path still needs internal multi-lane readers/writers to reach 50Gbit/s on
+small-file-heavy trees. External sharding by flat folder already proves the
+jobs and network can exceed 50Gbit/s for 1MiB-class small files.
+
 ### Raw Buffer Pipeline
 
 ```text

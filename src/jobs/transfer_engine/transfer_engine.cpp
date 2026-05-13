@@ -159,6 +159,12 @@ struct PendingTransferFile {
     FileRecordMessage record;
 };
 
+struct AwaitingAckTransfer {
+    PreparedTransfer prepared;
+    std::uint64_t data_hash = 0;
+    std::size_t chunk_count = 0;
+};
+
 struct PreparedTransferQueue {
     std::mutex mutex;
     std::condition_variable cv_not_empty;
@@ -927,7 +933,7 @@ bool read_data_slot(int fd, DataSlotPool& pool, DataSlotHandle& handle) {
     const std::uint32_t path_length = read_u32(header_view, offset);
 
     const DataSlotClass slot_class = (flags & kFlagSmallFile) != 0U ? DataSlotClass::small : DataSlotClass::large;
-    handle = pool.acquire_or_throw(slot_class, static_cast<std::size_t>(data_len));
+    handle = pool.acquire_wait_or_throw(slot_class, static_cast<std::size_t>(data_len));
     DataBufTrailer& trailer = pool.trailer(handle);
     trailer.file_id = file_id;
     trailer.folder_hash = folder_hash;
@@ -3917,10 +3923,6 @@ void send_content_file_slots(int data_fd,
     (void)stream_content_slots(slot_pool, file, config, [&](const DataSlotHandle& handle) {
         drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
         wait_for_sender_resume(priority_fd, paused, pending_acks);
-        if (!pending_acks.empty()) {
-            slot_pool.release(handle);
-            throw std::runtime_error("received file ack before file completed sending");
-        }
         send_data_slot(data_fd, slot_pool, handle);
         ++report.chunks_sent;
         slot_pool.release(handle);
@@ -3939,10 +3941,6 @@ std::uint64_t send_local_file_slots(int data_fd,
     return stream_local_file_slots(slot_pool, absolute_path, file, config, [&](const DataSlotHandle& handle) {
                drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
                wait_for_sender_resume(priority_fd, paused, pending_acks);
-               if (!pending_acks.empty()) {
-                   slot_pool.release(handle);
-                   throw std::runtime_error("received file ack before file completed sending");
-               }
                send_data_slot(data_fd, slot_pool, handle);
                ++report.chunks_sent;
                slot_pool.release(handle);
@@ -4052,9 +4050,6 @@ std::vector<std::uint64_t> send_packed_small_file_batch(int data_fd,
 
         drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
         wait_for_sender_resume(priority_fd, paused, pending_acks);
-        if (!pending_acks.empty()) {
-            throw std::runtime_error("received file ack before packed small file batch completed sending");
-        }
         send_data_slot(data_fd, slot_pool, handle);
         ++report.chunks_sent;
     } catch (...) {
@@ -4097,6 +4092,31 @@ void record_completed_prepared_transfer(const PreparedTransfer& prepared,
         report.target_scan_rows.push_back(target_snapshot);
     }
     report.files[prepared.file.rel_path] = outcome;
+}
+
+void record_sender_ack(const FileAckMessage& ack,
+                       std::unordered_map<std::uint64_t, AwaitingAckTransfer>& awaiting_acks,
+                       TransferReport& report) {
+    const auto it = awaiting_acks.find(ack.file_id);
+    if (it == awaiting_acks.end()) {
+        throw std::runtime_error("received ack for unknown file_id: " + std::to_string(ack.file_id));
+    }
+    record_completed_prepared_transfer(it->second.prepared,
+                                       it->second.data_hash,
+                                       it->second.chunk_count,
+                                       ack,
+                                       report);
+    awaiting_acks.erase(it);
+}
+
+void consume_sender_acks(std::deque<FileAckMessage>& pending_acks,
+                         std::unordered_map<std::uint64_t, AwaitingAckTransfer>& awaiting_acks,
+                         TransferReport& report) {
+    while (!pending_acks.empty()) {
+        const FileAckMessage ack = pending_acks.front();
+        pending_acks.pop_front();
+        record_sender_ack(ack, awaiting_acks, report);
+    }
 }
 
 PreparedTransfer prepare_transfer_file(const PendingTransferFile& pending,
@@ -6348,13 +6368,18 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
     DataSlotPool cache_slots(config_.small_pool_slots, config_.large_pool_slots);
     bool paused = false;
     std::deque<FileAckMessage> pending_acks;
+    std::vector<PendingTransferFile> decision_files;
+    decision_files.reserve(files.size());
     std::vector<PendingTransferFile> pending_files;
     pending_files.reserve(files.size());
 
     for (const auto& file : files) {
         const FileRecordMessage record = make_file_record_message(file);
         send_file_record(priority_fd.get(), record);
+        decision_files.push_back(PendingTransferFile{file, record});
+    }
 
+    for (const auto& pending : decision_files) {
         PriorityMessageType decision_type = PriorityMessageType::session_end;
         std::string decision_payload;
         if (!read_priority_payload(priority_fd.get(), decision_type, decision_payload) ||
@@ -6363,17 +6388,17 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
         }
 
         const FileDecisionMessage decision = decode_file_decision(decision_payload);
-        if (decision.file_id != record.file_id) {
+        if (decision.file_id != pending.record.file_id) {
             throw std::runtime_error("receiver decision file_id mismatch");
         }
 
         FileOutcome outcome;
-        outcome.rel_path = file.rel_path;
-        outcome.size = file.declared_size;
+        outcome.rel_path = pending.file.rel_path;
+        outcome.size = pending.file.declared_size;
         outcome.sender_state = FileState::checking;
         outcome.receiver_state = FileState::pending;
 
-        FolderRecord& folder = report.folders[parent_path(file.rel_path)];
+        FolderRecord& folder = report.folders[parent_path(pending.file.rel_path)];
         if (decision.skip) {
             outcome.diff = DiffKind::skip;
             outcome.sender_state = FileState::done;
@@ -6383,10 +6408,10 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
             ++folder.files_skipped;
             ++folder.files_completed;
             ++folder.files_received;
-            report.files[file.rel_path] = outcome;
+            report.files[pending.file.rel_path] = outcome;
             continue;
         }
-        pending_files.push_back(PendingTransferFile{file, record});
+        pending_files.push_back(pending);
     }
 
     PreparedTransferQueue prepared_queue;
@@ -6403,6 +6428,9 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                                std::cref(config_),
                                runtime.cache_file_threshold_bytes,
                                enable_cache);
+
+    std::unordered_map<std::uint64_t, AwaitingAckTransfer> awaiting_acks;
+    awaiting_acks.reserve(pending_files.size());
 
     try {
         PreparedTransfer prepared;
@@ -6443,24 +6471,11 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                                                  pending_acks,
                                                  report);
                 for (std::size_t index = 0; index < batch.size(); ++index) {
-                    const FileAckMessage ack = wait_for_sender_ack(priority_fd.get(), paused, pending_acks);
-                    if (ack.file_id != batch[index].record.file_id) {
-                        std::string actual_path = "<outside-batch>";
-                        for (const auto& candidate : batch) {
-                            if (candidate.record.file_id == ack.file_id) {
-                                actual_path = candidate.file.rel_path;
-                                break;
-                            }
-                        }
-                        throw std::runtime_error("receiver ack file_id mismatch for packed small file batch: expected " +
-                                                 std::to_string(batch[index].record.file_id) +
-                                                 " (" + batch[index].file.rel_path + ")" +
-                                                 " got " + std::to_string(ack.file_id) +
-                                                 " (" + actual_path + ")" +
-                                                 " at batch index " + std::to_string(index));
-                    }
-                    record_completed_prepared_transfer(batch[index], hashes[index], 1U, ack, report);
+                    const std::uint64_t file_id = batch[index].record.file_id;
+                    awaiting_acks.emplace(file_id,
+                                          AwaitingAckTransfer{std::move(batch[index]), hashes[index], 1U});
                 }
+                consume_sender_acks(pending_acks, awaiting_acks, report);
                 continue;
             }
 
@@ -6468,9 +6483,6 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                 for (const std::uint64_t entry_id : prepared.cached_entry_ids) {
                     drain_sender_priority_events(priority_fd.get(), 0, paused, pending_acks);
                     wait_for_sender_resume(priority_fd.get(), paused, pending_acks);
-                    if (!pending_acks.empty()) {
-                        throw std::runtime_error("received file ack before cached file completed sending");
-                    }
 
                     const DataSlotHandle handle = cacher.take_slot(entry_id, sender_slots);
                     send_data_slot(data_fd.get(), sender_slots, handle);
@@ -6498,11 +6510,18 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                                                            report);
             }
 
+            const std::uint64_t file_id = prepared.record.file_id;
+            const std::uint64_t data_hash = prepared.data_hash;
+            const std::size_t chunk_count = prepared.chunk_count;
+            awaiting_acks.emplace(file_id,
+                                  AwaitingAckTransfer{std::move(prepared), data_hash, chunk_count});
+            consume_sender_acks(pending_acks, awaiting_acks, report);
+        }
+
+        while (!awaiting_acks.empty()) {
             const FileAckMessage ack = wait_for_sender_ack(priority_fd.get(), paused, pending_acks);
-            if (ack.file_id != prepared.record.file_id) {
-                throw std::runtime_error("receiver ack file_id mismatch");
-            }
-            record_completed_prepared_transfer(prepared, prepared.data_hash, prepared.chunk_count, ack, report);
+            record_sender_ack(ack, awaiting_acks, report);
+            consume_sender_acks(pending_acks, awaiting_acks, report);
         }
     } catch (...) {
         {

@@ -167,6 +167,7 @@ ScanIndex ScanIndex::from_csv(std::string_view csv) {
     std::istringstream input{std::string(csv)};
     std::string line;
     bool saw_header = false;
+    bool rich_scan_csv = false;
     ScanIndex index;
     while (std::getline(input, line)) {
         if (!line.empty() && line.back() == '\r') {
@@ -176,13 +177,38 @@ ScanIndex ScanIndex::from_csv(std::string_view csv) {
             continue;
         }
         if (!saw_header) {
-            if (line != "folder_hash,file_hash,rel_path,size,mtime,mode,uid,gid,data_hash,hash_ts,scan_side") {
+            if (line == "folder_hash,file_hash,rel_path,size,mtime,mode,uid,gid,data_hash,hash_ts,scan_side") {
+                rich_scan_csv = false;
+            } else if (line == "record_type,rel_path,size,mtime,mode,uid,gid,flat_file_count,flat_logical_size_bytes,hash_algorithm,content_hash,hash_block_size,hash_block_count,block_hash_algorithm,block_hashes,scan_run_id,run_started_at_utc,run_started_unix_ns,source_root,run_settings") {
+                rich_scan_csv = true;
+            } else {
                 throw std::invalid_argument("unexpected CSV header");
             }
             saw_header = true;
             continue;
         }
         const auto fields = split_csv_line(line);
+        if (rich_scan_csv) {
+            if (fields.size() != 20) {
+                throw std::invalid_argument("unexpected CSV field count");
+            }
+            if (fields[0] != "file") {
+                continue;
+            }
+
+            FileSnapshot snapshot;
+            snapshot.rel_path = normalize_path(fields[1]);
+            snapshot.folder_hash = folder_hash_for_path(parent_path(snapshot.rel_path));
+            snapshot.file_hash = path_hash(base_name(snapshot.rel_path), snapshot.folder_hash);
+            snapshot.size = parse_integral<std::uint64_t>(fields[2], "size");
+            snapshot.mtime = parse_integral<std::uint64_t>(fields[3], "mtime");
+            snapshot.mode = parse_integral<std::uint32_t>(fields[4], "mode");
+            snapshot.uid = parse_integral<std::uint32_t>(fields[5], "uid");
+            snapshot.gid = parse_integral<std::uint32_t>(fields[6], "gid");
+            snapshot.hash_ts = fields[17].empty() ? 0U : parse_integral<std::uint64_t>(fields[17], "run_started_unix_ns");
+            index.add(std::move(snapshot));
+            continue;
+        }
         if (fields.size() != 11) {
             throw std::invalid_argument("unexpected CSV field count");
         }

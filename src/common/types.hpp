@@ -15,7 +15,7 @@ namespace hypersync {
 
 class ConfigStore;
 
-constexpr std::size_t kSmallFileThreshold = 4096;
+constexpr std::size_t kSmallFileThreshold = 128 * 1024;
 constexpr std::size_t kLargeChunkBytes = 1024 * 1024;
 constexpr std::uint32_t kSlotValid = 0xDEADBEEFU;
 constexpr std::uint32_t kFlagLastChunk = 1U << 0;
