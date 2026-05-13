@@ -1425,6 +1425,10 @@ void record_live_diff_batch(bool recursive,
             child_work.push_back(directory);
         }
     }
+    if (flat_metadata_scan_should_stop(queue)) {
+        finish_flat_folder_work(queue);
+        return;
+    }
 
     std::vector<FileSpec> target_files;
     std::vector<FileSpec> target_directories;
