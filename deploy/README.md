@@ -29,6 +29,7 @@ Run the deployed tool with one command from the bundle folder:
 ```bash
 ./hypersync --version
 ./hypersync scan --source nfs://server/export/path --output scan.parquet --output-format parquet
+./hypersync diff --source nfs://source/export/path --target nfs://target/export/path --compare size --output diff.csv
 ```
 
 ## New Server UX
@@ -63,6 +64,21 @@ After install, users run:
 $HOME/hypersync/hypersync --version
 $HOME/hypersync/hypersync scan --source /tmp --output /tmp/hypersync-smoke.csv --output-format csv --max-duration-seconds 5
 ```
+
+To copy or sync data, start a receiver on the target server and run `sync` from
+the source server:
+
+```bash
+# target server
+$HOME/hypersync/hypersync receive --target /mnt/target-data --bind-host 0.0.0.0
+
+# source server
+$HOME/hypersync/hypersync sync --source nfs://source-server/export/path --host target-server
+```
+
+`send`, `sync`, and `copy` are aliases for the sender side of the same runtime
+pipeline. The receiver target can be a local folder or an `nfs://...` URL when
+the target export is writable.
 
 For servers without outbound internet, copy the same `.tar.gz` and checksum
 with `scp`, `rsync`, or an internal artifact system. Then unpack into one

@@ -215,7 +215,8 @@ Requirements:
 - Eventually support running across many source and target servers in parallel.
 
 Current state:
-- Send and receive commands exist.
+- `send`, `sync`, and `copy` sender commands exist; they connect to a running
+  `receive` command on the target server.
 - NFS data reading exists.
 - Target writing exists for local and NFS paths.
 - Basic transfer, retry, skip, and verification behavior exist in tests.
@@ -225,8 +226,8 @@ Current state:
 
 Remaining:
 - Define final copy vs sync semantics.
-- Add first-class NFS-to-NFS copy command.
-- Add first-class NFS-to-NFS sync command.
+- Add one-command orchestrated NFS-to-NFS copy command.
+- Add one-command orchestrated NFS-to-NFS sync command.
 - Add delete handling policy for sync.
 - Add resume manifest.
 - Add multi-host orchestration.

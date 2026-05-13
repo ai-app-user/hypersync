@@ -129,6 +129,7 @@ struct ReceiverSharedState {
     std::size_t small_pool_slots = 0;
     std::size_t large_pool_slots = 0;
     int priority_fd = -1;
+    int data_fd = -1;
     std::mutex metadata_mutex;
     std::condition_variable metadata_cv;
     std::mutex priority_write_mutex;
@@ -3299,6 +3300,15 @@ bool receiver_queue_should_resume(std::uint64_t queued_bytes, std::uint64_t capa
     return !receiver_queue_should_pause(queued_bytes, capacity_bytes);
 }
 
+void shutdown_receiver_sockets(const ReceiverSharedState& state) {
+    if (state.priority_fd >= 0) {
+        ::shutdown(state.priority_fd, SHUT_RDWR);
+    }
+    if (state.data_fd >= 0) {
+        ::shutdown(state.data_fd, SHUT_RDWR);
+    }
+}
+
 std::vector<FileSpec> scan_directories_for_transfer(const std::filesystem::path& source_root, bool recursive) {
     if (is_nfs_url(source_root.string())) {
         auto backend = make_nfs_backend(source_root.string());
@@ -3382,6 +3392,20 @@ bool receiver_has_all_pending_records(const ReceiverSharedState& state, const st
     });
 }
 
+void send_receiver_file_ack(ReceiverSharedState& state,
+                            const FileRecordMessage& record,
+                            bool verified,
+                            std::uint64_t bytes_written) {
+    {
+        std::lock_guard<std::mutex> write_lock(state.priority_write_mutex);
+        send_file_ack(state.priority_fd, FileAckMessage{record.file_id, verified, bytes_written});
+    }
+    {
+        std::lock_guard<std::mutex> lock(state.metadata_mutex);
+        state.pending_records.erase(record.file_id);
+    }
+}
+
 void process_packed_small_file_slot(ReceiverSharedState& state,
                                     TargetWriterBackend& target_writer,
                                     DataSlotPool& slot_pool,
@@ -3409,26 +3433,21 @@ void process_packed_small_file_slot(ReceiverSharedState& state,
         spec.gid = record.gid;
         spec.declared_size = record.size;
 
+        bool verified = false;
         try {
             target_writer.write_chunk(spec, entry.data, 0);
             target_writer.finish_file(spec);
+            verified =
+                state.skip_verify ||
+                target_writer.file_hash(record.rel_path) == entry.data_hash;
         } catch (...) {
             target_writer.abort_file(record.rel_path);
-            throw;
         }
 
-        const bool verified =
-            state.skip_verify ||
-            target_writer.file_hash(record.rel_path) == entry.data_hash;
-        {
-            std::lock_guard<std::mutex> write_lock(state.priority_write_mutex);
-            send_file_ack(state.priority_fd,
-                          FileAckMessage{record.file_id, verified, static_cast<std::uint64_t>(entry.data.size())});
-        }
-        {
-            std::lock_guard<std::mutex> lock(state.metadata_mutex);
-            state.pending_records.erase(record.file_id);
-        }
+        send_receiver_file_ack(state,
+                               record,
+                               verified,
+                               verified ? static_cast<std::uint64_t>(entry.data.size()) : 0U);
     }
 }
 
@@ -3510,8 +3529,10 @@ void receiver_data_loop(ReceiverSharedState& state, int data_fd) {
                                                slot_pool.trailer(work.handle).data_offset);
                 } catch (...) {
                     target_writer->abort_file(work.record.rel_path);
+                    send_receiver_file_ack(state, work.record, false, 0);
+                    contexts.erase(slot_pool.trailer(work.handle).file_id);
                     slot_pool.release(work.handle);
-                    throw;
+                    continue;
                 }
                 context.bytes_written += slot_pool.trailer(work.handle).data_len;
 
@@ -3524,29 +3545,26 @@ void receiver_data_loop(ReceiverSharedState& state, int data_fd) {
                     target_writer->finish_file(spec);
                 } catch (...) {
                     target_writer->abort_file(work.record.rel_path);
+                    send_receiver_file_ack(state, work.record, false, 0);
+                    contexts.erase(slot_pool.trailer(work.handle).file_id);
                     slot_pool.release(work.handle);
-                    throw;
+                    continue;
                 }
                 const bool verified =
                     state.skip_verify ||
                     target_writer->file_hash(work.record.rel_path) == slot_pool.trailer(work.handle).data_hash;
-                {
-                    std::lock_guard<std::mutex> write_lock(state.priority_write_mutex);
-                    send_file_ack(state.priority_fd,
-                                  FileAckMessage{work.record.file_id, verified, context.bytes_written});
-                }
-                {
-                    std::lock_guard<std::mutex> lock(state.metadata_mutex);
-                    state.pending_records.erase(work.record.file_id);
-                }
+                send_receiver_file_ack(state, work.record, verified, verified ? context.bytes_written : 0U);
                 contexts.erase(slot_pool.trailer(work.handle).file_id);
                 slot_pool.release(work.handle);
             }
         } catch (...) {
-            std::lock_guard<std::mutex> lock(queue.mutex);
-            queue.worker_error = std::current_exception();
-            queue.cv_not_full.notify_all();
-            queue.cv_not_empty.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                queue.worker_error = std::current_exception();
+                queue.cv_not_full.notify_all();
+                queue.cv_not_empty.notify_all();
+            }
+            shutdown_receiver_sockets(state);
         }
     });
 
@@ -6521,6 +6539,7 @@ void TransferEngine::run_receiver(const ReceiverRuntimeConfig& runtime) const {
     state.small_pool_slots = config_.small_pool_slots;
     state.large_pool_slots = config_.large_pool_slots;
     state.priority_fd = priority_fd.get();
+    state.data_fd = data_fd.get();
 
     std::exception_ptr priority_error;
     std::exception_ptr data_error;
@@ -6530,6 +6549,7 @@ void TransferEngine::run_receiver(const ReceiverRuntimeConfig& runtime) const {
             receiver_priority_loop(state);
         } catch (...) {
             priority_error = std::current_exception();
+            shutdown_receiver_sockets(state);
         }
     });
 
@@ -6538,6 +6558,7 @@ void TransferEngine::run_receiver(const ReceiverRuntimeConfig& runtime) const {
             receiver_data_loop(state, data_fd.get());
         } catch (...) {
             data_error = std::current_exception();
+            shutdown_receiver_sockets(state);
         }
     });
 

@@ -47,6 +47,10 @@ class StepFailure(RuntimeError):
     pass
 
 
+class SkipScenario(RuntimeError):
+    pass
+
+
 class ScopedNfsExport:
     def __init__(self, export_path: pathlib.Path) -> None:
         self.export_path = export_path
@@ -56,6 +60,12 @@ class ScopedNfsExport:
         self.stop_nfs_server_on_teardown = False
 
     def __enter__(self) -> "ScopedNfsExport":
+        missing = [tool for tool in ("systemctl", "sudo", "exportfs", "showmount") if shutil.which(tool) is None]
+        if missing:
+            raise SkipScenario(f"loopback NFS export tools are unavailable: {', '.join(missing)}")
+        if not command_succeeds(["sudo", "-n", "true"], check=False):
+            raise SkipScenario("passwordless sudo is unavailable for loopback NFS export")
+
         self.stop_rpcbind_on_teardown = not command_succeeds(
             ["systemctl", "-q", "is-active", "rpcbind"], check=False
         )
@@ -132,6 +142,7 @@ class ScenarioWorld:
         self.target_export: ScopedNfsExport | None = None
         self.results: list[CommandResult] = []
         self.last_scan_csv: pathlib.Path | None = None
+        self.last_diff_csv: pathlib.Path | None = None
         self.last_hash_csv: pathlib.Path | None = None
         self.receiver_use_sudo = False
 
@@ -205,7 +216,7 @@ class ScenarioWorld:
         log_file.close()
         return process, log_path
 
-    def run_transfer(self, cache_threshold: int | None = None) -> CommandResult:
+    def run_transfer(self, cache_threshold: int | None = None, command: str = "send") -> CommandResult:
         if self.source_dir is None:
             raise StepFailure("source tree is not configured before transfer")
         priority_port = pick_unused_port()
@@ -213,7 +224,7 @@ class ScenarioWorld:
         receiver, receiver_log = self.launch_receiver(priority_port, data_port)
         args = [
             str(self.app),
-            "send",
+            command,
             "--source",
             str(self.source_dir),
             "--host",
@@ -249,6 +260,29 @@ class ScenarioWorld:
             "scan",
             [str(self.app), "scan", "--source", str(self.source_dir), "--output", str(self.last_scan_csv)],
             env=self.gcov_env(f"scan_{len(self.results)}"),
+        )
+
+    def run_diff(self, compare_mode: str = "size") -> CommandResult:
+        if self.source_dir is None:
+            raise StepFailure("source tree is not configured before diff")
+        if self.target_arg is None:
+            raise StepFailure("target is not configured before diff")
+        self.last_diff_csv = self.temp_root / f"diff_{len(self.results)}.csv"
+        return self.run_command(
+            "diff",
+            [
+                str(self.app),
+                "diff",
+                "--source",
+                str(self.source_dir),
+                "--target",
+                self.target_arg,
+                "--compare",
+                compare_mode,
+                "--output",
+                str(self.last_diff_csv),
+            ],
+            env=self.gcov_env(f"diff_{len(self.results)}"),
         )
 
     def run_hash(self, algorithm: str, mode: str = "file", block_size: int | None = None) -> CommandResult:
@@ -355,7 +389,12 @@ def step(pattern: str) -> typing.Callable[[StepHandler], StepHandler]:
 
 
 def command_succeeds(args: list[str], check: bool = True) -> bool:
-    completed = subprocess.run(args, capture_output=True, text=True)
+    try:
+        completed = subprocess.run(args, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        if check:
+            raise StepFailure(f"command not found: {args[0]}") from exc
+        return False
     if check and completed.returncode != 0:
         raise StepFailure(f"command failed: {' '.join(args)}\n{completed.stdout}{completed.stderr}")
     return completed.returncode == 0
@@ -573,6 +612,12 @@ def when_transfer_once(world: ScenarioWorld, step_data: Step, match: re.Match[st
     world.run_transfer()
 
 
+@step(r"^I sync the source tree via the CLI$")
+def when_sync_once(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
+    del step_data, match
+    world.run_transfer(command="sync")
+
+
 @step(r"^I transfer the source tree via the CLI twice$")
 def when_transfer_twice(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
     del step_data, match
@@ -590,6 +635,12 @@ def when_transfer_with_cache(world: ScenarioWorld, step_data: Step, match: re.Ma
 def when_scan(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
     del step_data, match
     world.run_scan()
+
+
+@step(r"^I diff the source and target via the CLI$")
+def when_diff(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
+    del step_data, match
+    world.run_diff()
 
 
 @step(r"^I hash the source tree as CSV with ([a-zA-Z0-9_-]+)$")
@@ -677,6 +728,27 @@ def then_transfer_report_contains(world: ScenarioWorld, step_data: Step, match: 
         raise StepFailure(f"expected '{fragment}' in transfer output: {result.stdout}")
 
 
+@step(r"^the latest command should report \"([^\"]+)\"$")
+def then_latest_report_contains(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
+    del step_data
+    result = last_result(world)
+    fragment = match.group(1)
+    if fragment not in result.stdout:
+        raise StepFailure(f"expected '{fragment}' in command output: {result.stdout}")
+
+
+@step(r"^the latest transfer should send fewer chunks than files$")
+def then_transfer_packs_chunks(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
+    del step_data, match
+    result = last_result(world)
+    chunks_sent = int(result.report_fields.get("chunks_sent", "0"))
+    files_total = int(result.report_fields.get("files_total", "0"))
+    if files_total <= 0:
+        raise StepFailure(f"transfer did not report files_total: {result.stdout}")
+    if chunks_sent >= files_total:
+        raise StepFailure(f"expected chunks_sent < files_total, saw {chunks_sent} >= {files_total}: {result.stdout}")
+
+
 @step(r"^the (latest|first|second) command should finish within ([0-9.]+) seconds$")
 def then_command_finishes_quickly(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
     del step_data
@@ -697,6 +769,18 @@ def then_scan_row_count(world: ScenarioWorld, step_data: Step, match: re.Match[s
     expected = int(match.group(1))
     if rows != expected:
         raise StepFailure(f"expected {expected} scan rows but saw {rows}")
+
+
+@step(r"^the diff output should contain (\d+) rows$")
+def then_diff_row_count(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
+    del step_data
+    if world.last_diff_csv is None or not world.last_diff_csv.exists():
+        raise StepFailure("diff output file was not created")
+    line_count = len(world.last_diff_csv.read_text(encoding="utf-8").splitlines())
+    rows = max(line_count - 1, 0)
+    expected = int(match.group(1))
+    if rows != expected:
+        raise StepFailure(f"expected {expected} diff rows but saw {rows}")
 
 
 @step(r"^the hash output should match sha256 for:$")
@@ -888,16 +972,20 @@ def main(argv: list[str]) -> int:
         return 1
 
     passed = 0
+    skipped = 0
     for scenario in scenarios:
         try:
             run_scenario(scenario)
             passed += 1
             print(f"[PASS] {scenario.feature_name} :: {scenario.name}")
+        except SkipScenario as exc:
+            skipped += 1
+            print(f"[SKIP] {scenario.feature_name} :: {scenario.name}: {exc}")
         except Exception as exc:  # noqa: BLE001
             print(f"[FAIL] {scenario.feature_name} :: {scenario.name}: {exc}", file=sys.stderr)
             return 1
 
-    print(f"{passed}/{len(scenarios)} gherkin scenarios passed")
+    print(f"{passed}/{len(scenarios)} gherkin scenarios passed, {skipped} skipped")
     return 0
 
 

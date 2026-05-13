@@ -694,8 +694,13 @@ Current related commands:
 
 ```bash
 hypersync receive --target nfs://target-server/export/path
-hypersync send --source nfs://source-server/export/path --host receiver-host
+hypersync sync --source nfs://source-server/export/path --host receiver-host
 ```
+
+`send`, `sync`, and `copy` are current aliases for the sender side of the same
+runtime pipeline. Operators should use `sync` in normal runbooks, while `send`
+remains useful when describing the pipeline internals. The receiver can write to
+a local folder or a writable `nfs://...` target.
 
 The runtime send/receive path packs eligible tiny files into larger data
 buffers automatically. Users still get per-file results and per-file
