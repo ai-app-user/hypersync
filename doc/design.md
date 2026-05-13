@@ -295,6 +295,16 @@ struct DataBufTrailer {
 
 `rel_path` is relative to the configured source root. The receiver rebases onto its own NFS target root. No separate path-mapping protocol needed. The `file_size` field lets the receiver know when the last chunk has arrived without requiring in-order delivery.
 
+For small-file-heavy transfers, a large DataBuf may carry a packed-small-file
+payload instead of one file chunk. The trailer sets `kFlagPackedSmallFiles`,
+and the payload starts with a record count followed by repeated entries:
+`file_id`, data length, logical file size, data hash, mtime, mode, uid, gid,
+relative path length, relative path bytes, and file data bytes. The receiver
+unpacks the large buffer, writes each file independently, verifies each file
+hash, and sends one normal file ACK per original file id. This reduces wire
+frames and per-buffer queue traffic for many tiny files while preserving the
+same priority-channel metadata and per-file completion semantics.
+
 ### 3.3 RecBuf Layout
 
 ```cpp

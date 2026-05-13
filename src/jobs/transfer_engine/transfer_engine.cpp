@@ -679,6 +679,26 @@ void append_bool(std::string& out, bool value) {
     out.push_back(value ? '\x01' : '\x00');
 }
 
+void write_u32_be(char* out, std::size_t& offset, std::uint32_t value) {
+    out[offset++] = static_cast<char>((value >> 24U) & 0xFFU);
+    out[offset++] = static_cast<char>((value >> 16U) & 0xFFU);
+    out[offset++] = static_cast<char>((value >> 8U) & 0xFFU);
+    out[offset++] = static_cast<char>(value & 0xFFU);
+}
+
+void write_u64_be(char* out, std::size_t& offset, std::uint64_t value) {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out[offset++] = static_cast<char>((value >> static_cast<unsigned>(shift)) & 0xFFU);
+    }
+}
+
+void write_u32_be_at(char* out, std::size_t offset, std::uint32_t value) {
+    out[offset++] = static_cast<char>((value >> 24U) & 0xFFU);
+    out[offset++] = static_cast<char>((value >> 16U) & 0xFFU);
+    out[offset++] = static_cast<char>((value >> 8U) & 0xFFU);
+    out[offset] = static_cast<char>(value & 0xFFU);
+}
+
 void append_string(std::string& out, std::string_view value) {
     append_u32(out, static_cast<std::uint32_t>(value.size()));
     out.append(value);
@@ -933,6 +953,98 @@ bool read_data_slot(int fd, DataSlotPool& pool, DataSlotHandle& handle) {
         throw std::runtime_error("unexpected EOF while reading chunk payload");
     }
     return true;
+}
+
+struct PackedSmallFileEntry {
+    FileRecordMessage record;
+    std::uint64_t data_hash = 0;
+    std::string_view data;
+};
+
+constexpr std::size_t kPackedSmallFileCountBytes = 4;
+constexpr std::size_t kPackedSmallFileEntryFixedBytes =
+    8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4;
+
+bool is_packed_small_file_slot(const DataSlotPool& pool, const DataSlotHandle& handle) {
+    return (pool.trailer(handle).flags & kFlagPackedSmallFiles) != 0U;
+}
+
+std::size_t packed_small_file_entry_bytes(const PreparedTransfer& prepared) {
+    return kPackedSmallFileEntryFixedBytes +
+           prepared.record.rel_path.size() +
+           static_cast<std::size_t>(prepared.record.size);
+}
+
+bool can_pack_small_file(const PreparedTransfer& prepared, const EngineConfig& config) {
+    return !prepared.cached &&
+           prepared.record.size <= config.small_file_threshold &&
+           packed_small_file_entry_bytes(prepared) + kPackedSmallFileCountBytes <= config.large_chunk_bytes;
+}
+
+std::vector<std::uint64_t> packed_small_file_ids(const DataSlotPool& pool, const DataSlotHandle& handle) {
+    const DataBufTrailer& trailer = pool.trailer(handle);
+    std::string_view payload(pool.data(handle), static_cast<std::size_t>(trailer.data_len));
+    std::size_t offset = 0;
+    const std::uint32_t count = read_u32(payload, offset);
+    std::vector<std::uint64_t> ids;
+    ids.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const std::uint64_t file_id = read_u64(payload, offset);
+        const std::uint64_t data_len = read_u64(payload, offset);
+        (void)read_u64(payload, offset);
+        (void)read_u64(payload, offset);
+        (void)read_u64(payload, offset);
+        (void)read_u32(payload, offset);
+        (void)read_u32(payload, offset);
+        (void)read_u32(payload, offset);
+        const std::uint32_t path_len = read_u32(payload, offset);
+        if (offset + path_len + data_len > payload.size()) {
+            throw std::runtime_error("packed small file payload is truncated");
+        }
+        offset += path_len + static_cast<std::size_t>(data_len);
+        ids.push_back(file_id);
+    }
+    if (offset != payload.size()) {
+        throw std::runtime_error("packed small file payload has trailing bytes");
+    }
+    return ids;
+}
+
+std::vector<PackedSmallFileEntry> decode_packed_small_file_entries(const DataSlotPool& pool,
+                                                                   const DataSlotHandle& handle) {
+    const DataBufTrailer& trailer = pool.trailer(handle);
+    std::string_view payload(pool.data(handle), static_cast<std::size_t>(trailer.data_len));
+    std::size_t offset = 0;
+    const std::uint32_t count = read_u32(payload, offset);
+    std::vector<PackedSmallFileEntry> entries;
+    entries.reserve(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        PackedSmallFileEntry entry;
+        entry.record.file_id = read_u64(payload, offset);
+        const std::uint64_t data_len = read_u64(payload, offset);
+        entry.record.size = read_u64(payload, offset);
+        entry.data_hash = read_u64(payload, offset);
+        entry.record.mtime = read_u64(payload, offset);
+        entry.record.mode = read_u32(payload, offset);
+        entry.record.uid = read_u32(payload, offset);
+        entry.record.gid = read_u32(payload, offset);
+        const std::uint32_t path_len = read_u32(payload, offset);
+        if (path_len > entry.record.rel_path.capacity()) {
+            throw std::runtime_error("packed small file path exceeds protocol capacity");
+        }
+        if (offset + path_len + data_len > payload.size()) {
+            throw std::runtime_error("packed small file payload is truncated");
+        }
+        entry.record.rel_path.assign(payload.substr(offset, path_len));
+        offset += path_len;
+        entry.data = payload.substr(offset, static_cast<std::size_t>(data_len));
+        offset += static_cast<std::size_t>(data_len);
+        entries.push_back(entry);
+    }
+    if (offset != payload.size()) {
+        throw std::runtime_error("packed small file payload has trailing bytes");
+    }
+    return entries;
 }
 
 std::size_t path_depth(std::string_view rel_path) {
@@ -3264,6 +3376,62 @@ void receiver_priority_loop(ReceiverSharedState& state) {
     }
 }
 
+bool receiver_has_all_pending_records(const ReceiverSharedState& state, const std::vector<std::uint64_t>& file_ids) {
+    return std::all_of(file_ids.begin(), file_ids.end(), [&state](std::uint64_t file_id) {
+        return state.pending_records.find(file_id) != state.pending_records.end();
+    });
+}
+
+void process_packed_small_file_slot(ReceiverSharedState& state,
+                                    TargetWriterBackend& target_writer,
+                                    DataSlotPool& slot_pool,
+                                    const DataSlotHandle& handle) {
+    const auto entries = decode_packed_small_file_entries(slot_pool, handle);
+    for (const auto& entry : entries) {
+        FileRecordMessage record;
+        {
+            std::lock_guard<std::mutex> lock(state.metadata_mutex);
+            const auto it = state.pending_records.find(entry.record.file_id);
+            if (it == state.pending_records.end()) {
+                throw std::runtime_error("packed small file arrived without matching file record");
+            }
+            record = it->second;
+        }
+        if (entry.data.size() != record.size) {
+            throw std::runtime_error("packed small file size does not match file record");
+        }
+
+        FileSpec spec;
+        spec.rel_path = record.rel_path;
+        spec.mtime = record.mtime;
+        spec.mode = record.mode;
+        spec.uid = record.uid;
+        spec.gid = record.gid;
+        spec.declared_size = record.size;
+
+        try {
+            target_writer.write_chunk(spec, entry.data, 0);
+            target_writer.finish_file(spec);
+        } catch (...) {
+            target_writer.abort_file(record.rel_path);
+            throw;
+        }
+
+        const bool verified =
+            state.skip_verify ||
+            target_writer.file_hash(record.rel_path) == entry.data_hash;
+        {
+            std::lock_guard<std::mutex> write_lock(state.priority_write_mutex);
+            send_file_ack(state.priority_fd,
+                          FileAckMessage{record.file_id, verified, static_cast<std::uint64_t>(entry.data.size())});
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.metadata_mutex);
+            state.pending_records.erase(record.file_id);
+        }
+    }
+}
+
 void receiver_data_loop(ReceiverSharedState& state, int data_fd) {
     ReceiverChunkQueue queue;
     queue.capacity_bytes = receiver_queue_capacity_bytes(state);
@@ -3310,6 +3478,17 @@ void receiver_data_loop(ReceiverSharedState& state, int data_fd) {
                 }
                 if (should_exit) {
                     return;
+                }
+
+                if (is_packed_small_file_slot(slot_pool, work.handle)) {
+                    try {
+                        process_packed_small_file_slot(state, *target_writer, slot_pool, work.handle);
+                    } catch (...) {
+                        slot_pool.release(work.handle);
+                        throw;
+                    }
+                    slot_pool.release(work.handle);
+                    continue;
                 }
 
                 auto& context = contexts[slot_pool.trailer(work.handle).file_id];
@@ -3381,16 +3560,28 @@ void receiver_data_loop(ReceiverSharedState& state, int data_fd) {
             FileRecordMessage record;
             {
                 std::unique_lock<std::mutex> lock(state.metadata_mutex);
-                state.metadata_cv.wait(lock, [&state, &slot_pool, &handle] {
-                    return state.session_done ||
-                           state.pending_records.find(slot_pool.trailer(handle).file_id) != state.pending_records.end();
-                });
-                const auto it = state.pending_records.find(slot_pool.trailer(handle).file_id);
-                if (it == state.pending_records.end()) {
-                    slot_pool.release(handle);
-                    throw std::runtime_error("received data chunk without matching file record");
+                if (is_packed_small_file_slot(slot_pool, handle)) {
+                    const auto packed_ids = packed_small_file_ids(slot_pool, handle);
+                    state.metadata_cv.wait(lock, [&state, &packed_ids] {
+                        return state.session_done || receiver_has_all_pending_records(state, packed_ids);
+                    });
+                    if (!receiver_has_all_pending_records(state, packed_ids)) {
+                        slot_pool.release(handle);
+                        throw std::runtime_error("received packed data without matching file records");
+                    }
+                } else {
+                    state.metadata_cv.wait(lock, [&state, &slot_pool, &handle] {
+                        return state.session_done ||
+                               state.pending_records.find(slot_pool.trailer(handle).file_id) !=
+                                   state.pending_records.end();
+                    });
+                    const auto it = state.pending_records.find(slot_pool.trailer(handle).file_id);
+                    if (it == state.pending_records.end()) {
+                        slot_pool.release(handle);
+                        throw std::runtime_error("received data chunk without matching file record");
+                    }
+                    record = it->second;
                 }
-                record = it->second;
             }
 
             const std::uint64_t chunk_bytes = slot_pool.trailer(handle).data_len;
@@ -3463,7 +3654,7 @@ bool poll_priority_message(int fd, int timeout_ms, PriorityMessageType& type, st
 void consume_sender_priority_message(PriorityMessageType type,
                                      std::string_view payload,
                                      bool& paused,
-                                     std::optional<FileAckMessage>& pending_ack) {
+                                     std::deque<FileAckMessage>& pending_acks) {
     switch (type) {
         case PriorityMessageType::pause:
             paused = true;
@@ -3472,7 +3663,7 @@ void consume_sender_priority_message(PriorityMessageType type,
             paused = false;
             return;
         case PriorityMessageType::file_ack:
-            pending_ack = decode_file_ack(payload);
+            pending_acks.push_back(decode_file_ack(payload));
             paused = false;
             return;
         default:
@@ -3483,35 +3674,35 @@ void consume_sender_priority_message(PriorityMessageType type,
 void drain_sender_priority_events(int fd,
                                   int initial_timeout_ms,
                                   bool& paused,
-                                  std::optional<FileAckMessage>& pending_ack) {
+                                  std::deque<FileAckMessage>& pending_acks) {
     PriorityMessageType type = PriorityMessageType::session_end;
     std::string payload;
     if (!poll_priority_message(fd, initial_timeout_ms, type, payload)) {
         return;
     }
-    consume_sender_priority_message(type, payload, paused, pending_ack);
+    consume_sender_priority_message(type, payload, paused, pending_acks);
     while (poll_priority_message(fd, 0, type, payload)) {
-        consume_sender_priority_message(type, payload, paused, pending_ack);
+        consume_sender_priority_message(type, payload, paused, pending_acks);
     }
 }
 
-void wait_for_sender_resume(int fd, bool& paused, std::optional<FileAckMessage>& pending_ack) {
-    while (paused && !pending_ack.has_value()) {
-        drain_sender_priority_events(fd, -1, paused, pending_ack);
+void wait_for_sender_resume(int fd, bool& paused, std::deque<FileAckMessage>& pending_acks) {
+    while (paused && pending_acks.empty()) {
+        drain_sender_priority_events(fd, -1, paused, pending_acks);
     }
 }
 
-FileAckMessage wait_for_sender_ack(int fd, bool& paused, std::optional<FileAckMessage>& pending_ack) {
-    if (pending_ack.has_value()) {
-        const FileAckMessage ack = *pending_ack;
-        pending_ack.reset();
+FileAckMessage wait_for_sender_ack(int fd, bool& paused, std::deque<FileAckMessage>& pending_acks) {
+    if (!pending_acks.empty()) {
+        const FileAckMessage ack = pending_acks.front();
+        pending_acks.pop_front();
         return ack;
     }
     for (;;) {
-        drain_sender_priority_events(fd, -1, paused, pending_ack);
-        if (pending_ack.has_value()) {
-            const FileAckMessage ack = *pending_ack;
-            pending_ack.reset();
+        drain_sender_priority_events(fd, -1, paused, pending_acks);
+        if (!pending_acks.empty()) {
+            const FileAckMessage ack = pending_acks.front();
+            pending_acks.pop_front();
             return ack;
         }
     }
@@ -3703,12 +3894,12 @@ void send_content_file_slots(int data_fd,
                              const EngineConfig& config,
                              int priority_fd,
                              bool& paused,
-                             std::optional<FileAckMessage>& pending_ack,
+                             std::deque<FileAckMessage>& pending_acks,
                              TransferReport& report) {
     (void)stream_content_slots(slot_pool, file, config, [&](const DataSlotHandle& handle) {
-        drain_sender_priority_events(priority_fd, 0, paused, pending_ack);
-        wait_for_sender_resume(priority_fd, paused, pending_ack);
-        if (pending_ack.has_value()) {
+        drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
+        wait_for_sender_resume(priority_fd, paused, pending_acks);
+        if (!pending_acks.empty()) {
             slot_pool.release(handle);
             throw std::runtime_error("received file ack before file completed sending");
         }
@@ -3725,12 +3916,12 @@ std::uint64_t send_local_file_slots(int data_fd,
                                     const EngineConfig& config,
                                     int priority_fd,
                                     bool& paused,
-                                    std::optional<FileAckMessage>& pending_ack,
+                                    std::deque<FileAckMessage>& pending_acks,
                                     TransferReport& report) {
     return stream_local_file_slots(slot_pool, absolute_path, file, config, [&](const DataSlotHandle& handle) {
-               drain_sender_priority_events(priority_fd, 0, paused, pending_ack);
-               wait_for_sender_resume(priority_fd, paused, pending_ack);
-               if (pending_ack.has_value()) {
+               drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
+               wait_for_sender_resume(priority_fd, paused, pending_acks);
+               if (!pending_acks.empty()) {
                    slot_pool.release(handle);
                    throw std::runtime_error("received file ack before file completed sending");
                }
@@ -3739,6 +3930,155 @@ std::uint64_t send_local_file_slots(int data_fd,
                slot_pool.release(handle);
            })
         .data_hash;
+}
+
+std::uint64_t write_packed_small_file_entry(char* payload,
+                                            std::size_t& offset,
+                                            const PreparedTransfer& prepared) {
+    const std::uint64_t data_len = prepared.record.size;
+    const std::uint32_t path_len = static_cast<std::uint32_t>(prepared.record.rel_path.size());
+    const std::size_t entry_start = offset;
+    const std::size_t data_start = entry_start + kPackedSmallFileEntryFixedBytes + path_len;
+    char* const data_begin = payload + data_start;
+
+    if (data_len != 0U) {
+        if (prepared.content_loaded) {
+            if (prepared.file.content.size() != data_len) {
+                throw std::runtime_error("prepared small file content size mismatch");
+            }
+            std::memcpy(data_begin, prepared.file.content.data(), static_cast<std::size_t>(data_len));
+        } else {
+            std::ifstream input(prepared.source_path, std::ios::binary);
+            if (!input) {
+                throw std::runtime_error("failed to open source file: " + prepared.source_path.string());
+            }
+            input.read(data_begin, static_cast<std::streamsize>(data_len));
+            if (input.gcount() != static_cast<std::streamsize>(data_len)) {
+                throw std::runtime_error("failed to read complete source file: " + prepared.source_path.string());
+            }
+        }
+    }
+
+    const std::string_view data_view(data_begin, static_cast<std::size_t>(data_len));
+    const std::uint64_t data_hash = hash64(data_view);
+
+    std::size_t header = entry_start;
+    write_u64_be(payload, header, prepared.record.file_id);
+    write_u64_be(payload, header, data_len);
+    write_u64_be(payload, header, prepared.record.size);
+    write_u64_be(payload, header, data_hash);
+    write_u64_be(payload, header, prepared.record.mtime);
+    write_u32_be(payload, header, prepared.record.mode);
+    write_u32_be(payload, header, prepared.record.uid);
+    write_u32_be(payload, header, prepared.record.gid);
+    write_u32_be(payload, header, path_len);
+    if (path_len != 0U) {
+        std::memcpy(payload + header, prepared.record.rel_path.data(), path_len);
+        header += path_len;
+    }
+    if (header != data_start) {
+        throw std::runtime_error("packed small file header size mismatch");
+    }
+    offset = data_start + static_cast<std::size_t>(data_len);
+    return data_hash;
+}
+
+std::vector<std::uint64_t> send_packed_small_file_batch(int data_fd,
+                                                       DataSlotPool& slot_pool,
+                                                       std::vector<PreparedTransfer>& batch,
+                                                       const EngineConfig& config,
+                                                       int priority_fd,
+                                                       bool& paused,
+                                                       std::deque<FileAckMessage>& pending_acks,
+                                                       TransferReport& report) {
+    if (batch.empty()) {
+        return {};
+    }
+    std::size_t payload_bytes = kPackedSmallFileCountBytes;
+    for (const auto& prepared : batch) {
+        payload_bytes += packed_small_file_entry_bytes(prepared);
+    }
+    if (payload_bytes > config.large_chunk_bytes) {
+        throw std::runtime_error("packed small file batch exceeds large buffer capacity");
+    }
+
+    DataSlotHandle handle = slot_pool.acquire_or_throw(DataSlotClass::large, payload_bytes);
+    std::vector<std::uint64_t> hashes;
+    hashes.reserve(batch.size());
+    try {
+        char* payload = slot_pool.data(handle);
+        std::size_t offset = kPackedSmallFileCountBytes;
+        for (const auto& prepared : batch) {
+            hashes.push_back(write_packed_small_file_entry(payload, offset, prepared));
+        }
+        if (offset != payload_bytes) {
+            throw std::runtime_error("packed small file batch size mismatch");
+        }
+        write_u32_be_at(payload, 0, static_cast<std::uint32_t>(batch.size()));
+
+        DataBufTrailer& trailer = slot_pool.trailer(handle);
+        trailer.file_id = 0;
+        trailer.folder_hash = 0;
+        trailer.data_offset = 0;
+        trailer.data_len = payload_bytes;
+        trailer.file_size = payload_bytes;
+        trailer.data_hash = 0;
+        trailer.mtime = 0;
+        trailer.mode = 0;
+        trailer.uid = 0;
+        trailer.gid = 0;
+        trailer.chunk_hash = chunk_hash32(std::string_view(payload, payload_bytes));
+        trailer.flags = kFlagPackedSmallFiles | kFlagLastChunk;
+        trailer.rel_path.clear();
+        trailer.slot_valid = kSlotValid;
+
+        drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
+        wait_for_sender_resume(priority_fd, paused, pending_acks);
+        if (!pending_acks.empty()) {
+            throw std::runtime_error("received file ack before packed small file batch completed sending");
+        }
+        send_data_slot(data_fd, slot_pool, handle);
+        ++report.chunks_sent;
+    } catch (...) {
+        slot_pool.release(handle);
+        throw;
+    }
+    slot_pool.release(handle);
+    return hashes;
+}
+
+void record_completed_prepared_transfer(const PreparedTransfer& prepared,
+                                        std::uint64_t data_hash,
+                                        std::size_t chunk_count,
+                                        const FileAckMessage& ack,
+                                        TransferReport& report) {
+    FileOutcome outcome;
+    outcome.rel_path = prepared.file.rel_path;
+    outcome.size = prepared.file.declared_size;
+    outcome.sender_state = ack.hash_verified ? FileState::done : FileState::failed;
+    outcome.receiver_state = ack.hash_verified ? FileState::done : FileState::failed;
+    outcome.chunk_count = chunk_count;
+    outcome.hash_verified = ack.hash_verified;
+    outcome.data_hash = data_hash;
+
+    FolderRecord& folder = report.folders[parent_path(prepared.file.rel_path)];
+    if (!ack.hash_verified) {
+        outcome.diff = DiffKind::failed;
+        ++report.files_failed;
+    } else {
+        outcome.diff = DiffKind::new_file;
+        ++report.files_transferred;
+        report.bytes_transferred += ack.bytes_written;
+        folder.bytes_transferred += ack.bytes_written;
+        ++folder.files_completed;
+        ++folder.files_received;
+        ++folder.files_written;
+        const auto source_snapshot = make_snapshot(prepared.file, outcome.data_hash, 'S');
+        const auto target_snapshot = make_snapshot(prepared.file, outcome.data_hash, 'T');
+        report.source_scan_rows.push_back(source_snapshot);
+        report.target_scan_rows.push_back(target_snapshot);
+    }
+    report.files[prepared.file.rel_path] = outcome;
 }
 
 PreparedTransfer prepare_transfer_file(const PendingTransferFile& pending,
@@ -3849,6 +4189,20 @@ bool pop_prepared_transfer(PreparedTransferQueue& queue, PreparedTransfer& prepa
     }
 
     prepared = queue.queue.pop();
+    queue.cv_not_full.notify_one();
+    return true;
+}
+
+bool try_pop_prepared_transfer(PreparedTransferQueue& queue, PreparedTransfer& prepared) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    if (queue.producer_error != nullptr) {
+        std::rethrow_exception(queue.producer_error);
+    }
+    if (queue.queue.empty()) {
+        return false;
+    }
+    prepared = queue.queue.pop();
+    lock.unlock();
     queue.cv_not_full.notify_one();
     return true;
 }
@@ -5975,7 +6329,7 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
     DataSlotPool sender_slots(config_.small_pool_slots, config_.large_pool_slots);
     DataSlotPool cache_slots(config_.small_pool_slots, config_.large_pool_slots);
     bool paused = false;
-    std::optional<FileAckMessage> pending_ack;
+    std::deque<FileAckMessage> pending_acks;
     std::vector<PendingTransferFile> pending_files;
     pending_files.reserve(files.size());
 
@@ -6034,19 +6388,69 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
 
     try {
         PreparedTransfer prepared;
-        while (pop_prepared_transfer(prepared_queue, prepared)) {
-            FileOutcome outcome;
-            outcome.rel_path = prepared.file.rel_path;
-            outcome.size = prepared.file.declared_size;
-            outcome.sender_state = FileState::reading;
-            outcome.receiver_state = FileState::pending;
-            outcome.chunk_count = prepared.chunk_count;
+        std::optional<PreparedTransfer> carried_prepared;
+        while (carried_prepared.has_value() || pop_prepared_transfer(prepared_queue, prepared)) {
+            if (carried_prepared.has_value()) {
+                prepared = std::move(*carried_prepared);
+                carried_prepared.reset();
+            }
+
+            if (can_pack_small_file(prepared, config_)) {
+                std::vector<PreparedTransfer> batch;
+                batch.push_back(std::move(prepared));
+                std::size_t packed_bytes = kPackedSmallFileCountBytes + packed_small_file_entry_bytes(batch.back());
+
+                PreparedTransfer next;
+                while (try_pop_prepared_transfer(prepared_queue, next)) {
+                    if (!can_pack_small_file(next, config_)) {
+                        carried_prepared = std::move(next);
+                        break;
+                    }
+                    const std::size_t next_bytes = packed_small_file_entry_bytes(next);
+                    if (packed_bytes + next_bytes > config_.large_chunk_bytes) {
+                        carried_prepared = std::move(next);
+                        break;
+                    }
+                    packed_bytes += next_bytes;
+                    batch.push_back(std::move(next));
+                }
+
+                const std::vector<std::uint64_t> hashes =
+                    send_packed_small_file_batch(data_fd.get(),
+                                                 sender_slots,
+                                                 batch,
+                                                 config_,
+                                                 priority_fd.get(),
+                                                 paused,
+                                                 pending_acks,
+                                                 report);
+                for (std::size_t index = 0; index < batch.size(); ++index) {
+                    const FileAckMessage ack = wait_for_sender_ack(priority_fd.get(), paused, pending_acks);
+                    if (ack.file_id != batch[index].record.file_id) {
+                        std::string actual_path = "<outside-batch>";
+                        for (const auto& candidate : batch) {
+                            if (candidate.record.file_id == ack.file_id) {
+                                actual_path = candidate.file.rel_path;
+                                break;
+                            }
+                        }
+                        throw std::runtime_error("receiver ack file_id mismatch for packed small file batch: expected " +
+                                                 std::to_string(batch[index].record.file_id) +
+                                                 " (" + batch[index].file.rel_path + ")" +
+                                                 " got " + std::to_string(ack.file_id) +
+                                                 " (" + actual_path + ")" +
+                                                 " at batch index " + std::to_string(index));
+                    }
+                    record_completed_prepared_transfer(batch[index], hashes[index], 1U, ack, report);
+                }
+                continue;
+            }
 
             if (prepared.cached) {
                 for (const std::uint64_t entry_id : prepared.cached_entry_ids) {
-                    drain_sender_priority_events(priority_fd.get(), 0, paused, pending_ack);
-                    wait_for_sender_resume(priority_fd.get(), paused, pending_ack);
-                    if (pending_ack.has_value()) {
+                    drain_sender_priority_events(priority_fd.get(), 0, paused, pending_acks);
+                    wait_for_sender_resume(priority_fd.get(), paused, pending_acks);
+                    if (!pending_acks.empty()) {
                         throw std::runtime_error("received file ack before cached file completed sending");
                     }
 
@@ -6062,7 +6466,7 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                                         config_,
                                         priority_fd.get(),
                                         paused,
-                                        pending_ack,
+                                        pending_acks,
                                         report);
             } else {
                 prepared.data_hash = send_local_file_slots(data_fd.get(),
@@ -6072,37 +6476,15 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                                                            config_,
                                                            priority_fd.get(),
                                                            paused,
-                                                           pending_ack,
+                                                           pending_acks,
                                                            report);
             }
 
-            const FileAckMessage ack = wait_for_sender_ack(priority_fd.get(), paused, pending_ack);
+            const FileAckMessage ack = wait_for_sender_ack(priority_fd.get(), paused, pending_acks);
             if (ack.file_id != prepared.record.file_id) {
                 throw std::runtime_error("receiver ack file_id mismatch");
             }
-
-            FolderRecord& folder = report.folders[parent_path(prepared.file.rel_path)];
-            outcome.sender_state = ack.hash_verified ? FileState::done : FileState::failed;
-            outcome.receiver_state = ack.hash_verified ? FileState::done : FileState::failed;
-            outcome.hash_verified = ack.hash_verified;
-            outcome.data_hash = prepared.data_hash;
-            if (!ack.hash_verified) {
-                outcome.diff = DiffKind::failed;
-                ++report.files_failed;
-            } else {
-                outcome.diff = DiffKind::new_file;
-                ++report.files_transferred;
-                report.bytes_transferred += ack.bytes_written;
-                folder.bytes_transferred += ack.bytes_written;
-                ++folder.files_completed;
-                ++folder.files_received;
-                ++folder.files_written;
-                const auto source_snapshot = make_snapshot(prepared.file, outcome.data_hash, 'S');
-                const auto target_snapshot = make_snapshot(prepared.file, outcome.data_hash, 'T');
-                report.source_scan_rows.push_back(source_snapshot);
-                report.target_scan_rows.push_back(target_snapshot);
-            }
-            report.files[prepared.file.rel_path] = outcome;
+            record_completed_prepared_transfer(prepared, prepared.data_hash, prepared.chunk_count, ack, report);
         }
     } catch (...) {
         {

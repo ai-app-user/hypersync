@@ -697,6 +697,11 @@ hypersync receive --target nfs://target-server/export/path
 hypersync send --source nfs://source-server/export/path --host receiver-host
 ```
 
+The runtime send/receive path packs eligible tiny files into larger data
+buffers automatically. Users still get per-file results and per-file
+verification; packing is an internal transport optimization for
+small-file-heavy trees.
+
 ### Sync
 
 Purpose: make target match source.

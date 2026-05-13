@@ -197,7 +197,8 @@ int main(int argc, char** argv) {
                       << " transferred=" << report.files_transferred
                       << " skipped=" << report.files_skipped
                       << " failed=" << report.files_failed
-                      << " bytes=" << report.bytes_transferred << '\n';
+                      << " bytes=" << report.bytes_transferred
+                      << " chunks_sent=" << report.chunks_sent << '\n';
             return report.files_failed == 0 ? 0 : 2;
         }
 

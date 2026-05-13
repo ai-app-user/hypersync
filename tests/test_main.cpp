@@ -2337,6 +2337,64 @@ void test_phase1_runtime_transfers_directory_over_tcp() {
     EXPECT_EQ(hypersync::read_file_contents(target.path / "nested" / "beta.bin"), "0123456789abcdef");
 }
 
+void test_runtime_packs_small_files_over_tcp() {
+    TempDir source("hypersync_small_pack_source");
+    TempDir target("hypersync_small_pack_target");
+
+    for (std::size_t index = 0; index < 64; ++index) {
+        write_file(source.path / "small" / ("file_" + std::to_string(index) + ".txt"), "abc");
+    }
+
+    std::uint16_t priority_port = pick_unused_port();
+    std::uint16_t data_port = pick_unused_port();
+    while (data_port == priority_port) {
+        data_port = pick_unused_port();
+    }
+
+    EngineConfig config;
+    config.small_file_threshold = 4;
+    config.large_chunk_bytes = 4096;
+    config.small_pool_slots = 8;
+    config.large_pool_slots = 8;
+
+    TransferEngine receiver_engine(config);
+    hypersync::ReceiverRuntimeConfig receiver_runtime;
+    receiver_runtime.target_root = target.path;
+    receiver_runtime.bind_host = "127.0.0.1";
+    receiver_runtime.priority_port = priority_port;
+    receiver_runtime.data_port = data_port;
+
+    std::exception_ptr receiver_error;
+    std::thread receiver([&] {
+        try {
+            receiver_engine.run_receiver(receiver_runtime);
+        } catch (...) {
+            receiver_error = std::current_exception();
+        }
+    });
+
+    TransferEngine sender_engine(config);
+    hypersync::SenderRuntimeConfig sender_runtime;
+    sender_runtime.source_root = source.path;
+    sender_runtime.remote_host = "127.0.0.1";
+    sender_runtime.priority_port = priority_port;
+    sender_runtime.data_port = data_port;
+    sender_runtime.recursive = true;
+
+    const auto report = sender_engine.transfer_directory(sender_runtime);
+    receiver.join();
+    if (receiver_error != nullptr) {
+        std::rethrow_exception(receiver_error);
+    }
+
+    EXPECT_EQ(report.files_total, 64U);
+    EXPECT_EQ(report.files_transferred, 64U);
+    EXPECT_EQ(report.files_failed, 0U);
+    EXPECT_TRUE(report.chunks_sent < report.files_transferred);
+    EXPECT_EQ(hypersync::read_file_contents(target.path / "small" / "file_0.txt"), "abc");
+    EXPECT_EQ(hypersync::read_file_contents(target.path / "small" / "file_63.txt"), "abc");
+}
+
 void test_phase2_runtime_spills_to_cache_and_honors_backpressure() {
     TempDir source("hypersync_phase2_source");
     TempDir target("hypersync_phase2_target");
@@ -3690,6 +3748,7 @@ int main(int argc, char** argv) {
          TestSuite::integration,
          test_non_root_receiver_can_restore_nfs_ownership_via_remote_credentials},
         {"phase1_runtime_transfers_directory_over_tcp", TestSuite::integration, test_phase1_runtime_transfers_directory_over_tcp},
+        {"runtime_packs_small_files_over_tcp", TestSuite::integration, test_runtime_packs_small_files_over_tcp},
         {"phase2_runtime_spills_to_cache_and_honors_backpressure",
          TestSuite::integration,
          test_phase2_runtime_spills_to_cache_and_honors_backpressure},

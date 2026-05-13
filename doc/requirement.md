@@ -219,6 +219,9 @@ Current state:
 - NFS data reading exists.
 - Target writing exists for local and NFS paths.
 - Basic transfer, retry, skip, and verification behavior exist in tests.
+- Runtime data transfer can pack multiple small files into one large data
+  buffer while preserving per-file metadata, per-file hash verification, and
+  per-file acknowledgements.
 
 Remaining:
 - Define final copy vs sync semantics.

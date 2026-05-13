@@ -21,6 +21,7 @@ constexpr std::uint32_t kSlotValid = 0xDEADBEEFU;
 constexpr std::uint32_t kFlagLastChunk = 1U << 0;
 constexpr std::uint32_t kFlagSmallFile = 1U << 1;
 constexpr std::uint32_t kFlagHashValid = 1U << 2;
+constexpr std::uint32_t kFlagPackedSmallFiles = 1U << 3;
 constexpr std::size_t kRecBufNameBytes = 128;
 constexpr std::size_t kRecBufRelPathBytes = 256;
 constexpr std::size_t kDataBufRelPathBytes = 3552;
