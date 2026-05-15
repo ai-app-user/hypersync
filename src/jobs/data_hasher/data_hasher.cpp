@@ -8,6 +8,7 @@
 
 #include "common/config.hpp"
 #include "common/hash_utils.hpp"
+#include "core/data_buffer_codec.hpp"
 #include "core/pipeline_buffers.hpp"
 
 namespace hypersync {
@@ -138,6 +139,27 @@ DataHasherStats DataHasherJob::stats() const {
 }
 
 std::uint64_t DataHasherJob::process_buffer(const BufferHandle& handle, RawBufferPool& pool) {
+    if (handle.pool_id == kDataBufferPoolId) {
+        DataBuffer& buffer = data_buffer(pool, handle);
+        if (is_packed_small_file_buffer(buffer)) {
+            std::uint64_t marker = 0;
+            std::uint64_t bytes_hashed = 0;
+            const bool ok = visit_packed_small_files(buffer, [&](const PackedSmallFileView& file) {
+                const std::uint64_t file_marker = hash_payload(config_.algorithm, file.data, config_.work_factor);
+                marker = mix_hash_marker(marker, file_marker ^ file.file_id);
+                bytes_hashed += file.data.size();
+            });
+            if (!ok) {
+                throw std::runtime_error("malformed packed small-file data buffer");
+            }
+
+            digest_marker_.fetch_xor(marker, std::memory_order_relaxed);
+            buffer.trailer.chunk_hash = static_cast<std::uint32_t>(marker ^ (marker >> 32U));
+            buffer.trailer.flags |= kFlagHashValid;
+            return bytes_hashed;
+        }
+    }
+
     PayloadView payload = payload_view(pool, handle);
     const std::string_view data(payload.data, payload.size);
     const std::uint64_t marker = hash_payload(config_.algorithm, data, config_.work_factor);

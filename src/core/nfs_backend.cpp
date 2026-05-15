@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
@@ -39,7 +40,9 @@ extern "C" ssize_t write(int, const void*, size_t);
 #include "common/filesystem_utils.hpp"
 #include "common/hash_utils.hpp"
 #include "common/path_utils.hpp"
+#include "common/records.hpp"
 #include "common/socket_utils.hpp"
+#include "core/data_buffer_codec.hpp"
 #include "core/pipeline_buffers.hpp"
 
 #ifndef HYPERSYNC_HAS_LIBNFS
@@ -50,15 +53,222 @@ extern "C" ssize_t write(int, const void*, size_t);
 #if defined(__has_include)
 #if __has_include(<nfsc/libnfs.h>)
 #include <nfsc/libnfs.h>
+#include <nfsc/libnfs-raw.h>
+#include <nfsc/libnfs-raw-nfs.h>
 #else
 #include <libnfs.h>
+#include <libnfs-raw.h>
+#include <libnfs-raw-nfs.h>
 #endif
 #else
 #include <nfsc/libnfs.h>
+#include <nfsc/libnfs-raw.h>
+#include <nfsc/libnfs-raw-nfs.h>
 #endif
 #endif
 
 namespace hypersync {
+
+namespace {
+
+struct NfsAsyncReadLatencyMetrics {
+    std::atomic<std::uint64_t> queued {0};
+    std::atomic<std::uint64_t> completed {0};
+    std::atomic<std::uint64_t> failed {0};
+    std::atomic<std::uint64_t> zero_reads {0};
+    std::atomic<std::uint64_t> short_reads {0};
+    std::atomic<std::uint64_t> bytes_requested {0};
+    std::atomic<std::uint64_t> bytes_completed {0};
+    std::atomic<std::uint64_t> latency_ns {0};
+    std::atomic<std::uint64_t> max_latency_ns {0};
+    std::array<std::atomic<std::uint64_t>, 8> latency_buckets {};
+};
+
+struct NfsAsyncCommandLatencyMetrics {
+    std::atomic<std::uint64_t> open_completed {0};
+    std::atomic<std::uint64_t> open_failed {0};
+    std::atomic<std::uint64_t> open_latency_ns {0};
+    std::atomic<std::uint64_t> open_max_latency_ns {0};
+    std::atomic<std::uint64_t> close_completed {0};
+    std::atomic<std::uint64_t> close_failed {0};
+    std::atomic<std::uint64_t> close_latency_ns {0};
+    std::atomic<std::uint64_t> close_max_latency_ns {0};
+};
+
+enum class NfsAsyncCommandKind {
+    other,
+    open,
+    close,
+};
+
+NfsAsyncReadLatencyMetrics& nfs_async_read_latency_metrics() {
+    static NfsAsyncReadLatencyMetrics metrics;
+    return metrics;
+}
+
+NfsAsyncCommandLatencyMetrics& nfs_async_command_latency_metrics() {
+    static NfsAsyncCommandLatencyMetrics metrics;
+    return metrics;
+}
+
+void reset_atomic_max(std::atomic<std::uint64_t>& value) {
+    value.store(0, std::memory_order_relaxed);
+}
+
+void update_atomic_max(std::atomic<std::uint64_t>& target, std::uint64_t value) {
+    std::uint64_t current = target.load(std::memory_order_relaxed);
+    while (current < value &&
+           !target.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
+
+std::size_t latency_bucket_index(std::uint64_t latency_ns) {
+    if (latency_ns < 100'000ULL) {
+        return 0;
+    }
+    if (latency_ns < 500'000ULL) {
+        return 1;
+    }
+    if (latency_ns < 1'000'000ULL) {
+        return 2;
+    }
+    if (latency_ns < 5'000'000ULL) {
+        return 3;
+    }
+    if (latency_ns < 10'000'000ULL) {
+        return 4;
+    }
+    if (latency_ns < 50'000'000ULL) {
+        return 5;
+    }
+    if (latency_ns < 100'000'000ULL) {
+        return 6;
+    }
+    return 7;
+}
+
+std::uint64_t steady_latency_ns(std::chrono::steady_clock::time_point start,
+                                std::chrono::steady_clock::time_point end) {
+    if (start == std::chrono::steady_clock::time_point{} || end <= start) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+[[maybe_unused]] void record_async_read_queued(std::size_t requested) {
+    NfsAsyncReadLatencyMetrics& metrics = nfs_async_read_latency_metrics();
+    metrics.queued.fetch_add(1, std::memory_order_relaxed);
+    metrics.bytes_requested.fetch_add(requested, std::memory_order_relaxed);
+}
+
+[[maybe_unused]] void record_async_read_completed(const std::chrono::steady_clock::time_point& queued_at,
+                                                  std::size_t requested,
+                                                  int status) {
+    NfsAsyncReadLatencyMetrics& metrics = nfs_async_read_latency_metrics();
+    const auto completed_at = std::chrono::steady_clock::now();
+    const std::uint64_t latency = steady_latency_ns(queued_at, completed_at);
+    metrics.completed.fetch_add(1, std::memory_order_relaxed);
+    metrics.latency_ns.fetch_add(latency, std::memory_order_relaxed);
+    update_atomic_max(metrics.max_latency_ns, latency);
+    metrics.latency_buckets[latency_bucket_index(latency)].fetch_add(1, std::memory_order_relaxed);
+
+    if (status < 0) {
+        metrics.failed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (status == 0) {
+        metrics.zero_reads.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    const auto bytes = static_cast<std::size_t>(status);
+    metrics.bytes_completed.fetch_add(bytes, std::memory_order_relaxed);
+    if (bytes < requested) {
+        metrics.short_reads.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+[[maybe_unused]] void record_async_command_completed(NfsAsyncCommandKind kind,
+                                                     const std::chrono::steady_clock::time_point& queued_at,
+                                                     int status) {
+    if (kind == NfsAsyncCommandKind::other) {
+        return;
+    }
+
+    NfsAsyncCommandLatencyMetrics& metrics = nfs_async_command_latency_metrics();
+    const std::uint64_t latency = steady_latency_ns(queued_at, std::chrono::steady_clock::now());
+    auto& completed = kind == NfsAsyncCommandKind::open ? metrics.open_completed : metrics.close_completed;
+    auto& failed = kind == NfsAsyncCommandKind::open ? metrics.open_failed : metrics.close_failed;
+    auto& latency_ns = kind == NfsAsyncCommandKind::open ? metrics.open_latency_ns : metrics.close_latency_ns;
+    auto& max_latency_ns = kind == NfsAsyncCommandKind::open ? metrics.open_max_latency_ns : metrics.close_max_latency_ns;
+    completed.fetch_add(1, std::memory_order_relaxed);
+    latency_ns.fetch_add(latency, std::memory_order_relaxed);
+    update_atomic_max(max_latency_ns, latency);
+    if (status < 0) {
+        failed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+}  // namespace
+
+void reset_nfs_async_read_latency_metrics() {
+    NfsAsyncReadLatencyMetrics& metrics = nfs_async_read_latency_metrics();
+    metrics.queued.store(0, std::memory_order_relaxed);
+    metrics.completed.store(0, std::memory_order_relaxed);
+    metrics.failed.store(0, std::memory_order_relaxed);
+    metrics.zero_reads.store(0, std::memory_order_relaxed);
+    metrics.short_reads.store(0, std::memory_order_relaxed);
+    metrics.bytes_requested.store(0, std::memory_order_relaxed);
+    metrics.bytes_completed.store(0, std::memory_order_relaxed);
+    metrics.latency_ns.store(0, std::memory_order_relaxed);
+    reset_atomic_max(metrics.max_latency_ns);
+    for (auto& bucket : metrics.latency_buckets) {
+        bucket.store(0, std::memory_order_relaxed);
+    }
+
+    NfsAsyncCommandLatencyMetrics& command_metrics = nfs_async_command_latency_metrics();
+    command_metrics.open_completed.store(0, std::memory_order_relaxed);
+    command_metrics.open_failed.store(0, std::memory_order_relaxed);
+    command_metrics.open_latency_ns.store(0, std::memory_order_relaxed);
+    reset_atomic_max(command_metrics.open_max_latency_ns);
+    command_metrics.close_completed.store(0, std::memory_order_relaxed);
+    command_metrics.close_failed.store(0, std::memory_order_relaxed);
+    command_metrics.close_latency_ns.store(0, std::memory_order_relaxed);
+    reset_atomic_max(command_metrics.close_max_latency_ns);
+}
+
+NfsAsyncReadLatencySnapshot snapshot_nfs_async_read_latency_metrics() {
+    NfsAsyncReadLatencyMetrics& metrics = nfs_async_read_latency_metrics();
+    NfsAsyncReadLatencySnapshot snapshot;
+    snapshot.queued = metrics.queued.load(std::memory_order_relaxed);
+    snapshot.completed = metrics.completed.load(std::memory_order_relaxed);
+    snapshot.failed = metrics.failed.load(std::memory_order_relaxed);
+    snapshot.zero_reads = metrics.zero_reads.load(std::memory_order_relaxed);
+    snapshot.short_reads = metrics.short_reads.load(std::memory_order_relaxed);
+    snapshot.bytes_requested = metrics.bytes_requested.load(std::memory_order_relaxed);
+    snapshot.bytes_completed = metrics.bytes_completed.load(std::memory_order_relaxed);
+    snapshot.latency_ns = metrics.latency_ns.load(std::memory_order_relaxed);
+    snapshot.max_latency_ns = metrics.max_latency_ns.load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < snapshot.latency_buckets.size(); ++index) {
+        snapshot.latency_buckets[index] = metrics.latency_buckets[index].load(std::memory_order_relaxed);
+    }
+    return snapshot;
+}
+
+NfsAsyncCommandLatencySnapshot snapshot_nfs_async_command_latency_metrics() {
+    NfsAsyncCommandLatencyMetrics& metrics = nfs_async_command_latency_metrics();
+    NfsAsyncCommandLatencySnapshot snapshot;
+    snapshot.open_completed = metrics.open_completed.load(std::memory_order_relaxed);
+    snapshot.open_failed = metrics.open_failed.load(std::memory_order_relaxed);
+    snapshot.open_latency_ns = metrics.open_latency_ns.load(std::memory_order_relaxed);
+    snapshot.open_max_latency_ns = metrics.open_max_latency_ns.load(std::memory_order_relaxed);
+    snapshot.close_completed = metrics.close_completed.load(std::memory_order_relaxed);
+    snapshot.close_failed = metrics.close_failed.load(std::memory_order_relaxed);
+    snapshot.close_latency_ns = metrics.close_latency_ns.load(std::memory_order_relaxed);
+    snapshot.close_max_latency_ns = metrics.close_max_latency_ns.load(std::memory_order_relaxed);
+    return snapshot;
+}
 
 namespace {
 
@@ -247,8 +457,12 @@ std::string choose_random_string(const std::vector<std::string>& values) {
     return values[distribution(rng)];
 }
 
-[[maybe_unused]] std::string choose_nfs_connection_url(std::string_view root_url) {
+[[maybe_unused]] std::string choose_nfs_connection_url(std::string_view root_url,
+                                                       std::size_t endpoint_index = kNfsEndpointAny) {
     std::vector<std::string> candidates = expand_nfs_url_server_candidates(root_url);
+    if (endpoint_index != kNfsEndpointAny && !candidates.empty()) {
+        return candidates[endpoint_index % candidates.size()];
+    }
     return choose_random_string(candidates);
 }
 
@@ -409,6 +623,35 @@ public:
         }
         if (!input.eof()) {
             throw std::runtime_error("failed while reading file: " + absolute_path.string());
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t read_file_into(std::string_view rel_path,
+                                               std::uint64_t declared_size,
+                                               std::byte* destination,
+                                               std::size_t destination_bytes) const override {
+        (void)declared_size;
+        const std::filesystem::path absolute_path = std::filesystem::path(root_) / normalize_path(rel_path);
+        std::ifstream input(absolute_path, std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("failed to open file for reading: " + absolute_path.string());
+        }
+
+        std::uint64_t total = 0;
+        while (input && total < destination_bytes) {
+            const std::size_t remaining = destination_bytes - static_cast<std::size_t>(total);
+            input.read(reinterpret_cast<char*>(destination + total), static_cast<std::streamsize>(remaining));
+            const std::streamsize bytes = input.gcount();
+            if (bytes > 0) {
+                total += static_cast<std::uint64_t>(bytes);
+            }
+        }
+        if (total == destination_bytes) {
+            return total;
+        }
+        if (!input.eof()) {
+            throw std::runtime_error("destination buffer is too small while reading file: " + absolute_path.string());
         }
         return total;
     }
@@ -692,6 +935,8 @@ struct AsyncCommandState {
     int status = 0;
     void* data = nullptr;
     std::string error;
+    NfsAsyncCommandKind kind = NfsAsyncCommandKind::other;
+    std::chrono::steady_clock::time_point queued_at {};
 };
 
 struct AsyncStat64State {
@@ -732,6 +977,75 @@ struct AsyncRawPooledReadState {
     std::string error;
     std::uint64_t offset = 0;
     std::size_t requested = 0;
+    std::chrono::steady_clock::time_point queued_at {};
+    RawBufferPool* pool = nullptr;
+    BufferHandle handle;
+    bool copy_payload_to_buffer = true;
+};
+
+struct AsyncReadIntoState {
+    bool done = false;
+    int status = 0;
+    std::string error;
+    std::byte* destination = nullptr;
+    std::size_t destination_bytes = 0;
+    std::chrono::steady_clock::time_point queued_at {};
+};
+
+// libnfs does not expose nfsdir's directory file handle in the public API.
+// The first field has been stable in libnfs 5.x and is needed to run raw
+// READDIRPLUS so downstream jobs can reuse NFS handles without per-file open().
+struct LibNfsPrivateHandle {
+    int len = 0;
+    char* val = nullptr;
+};
+
+struct LibNfsPrivateAttr {
+    uint32_t type = 0;
+    uint32_t mode = 0;
+    uint32_t nlink = 0;
+    uint32_t uid = 0;
+    uint32_t gid = 0;
+    uint64_t size = 0;
+    uint64_t used = 0;
+    struct timeval atime {};
+    struct timeval mtime {};
+    struct timeval ctime {};
+    uint64_t nfsid = 0;
+    uint64_t fileid = 0;
+};
+
+struct LibNfsPrivateDir {
+    LibNfsPrivateHandle fh;
+    LibNfsPrivateAttr attr;
+};
+
+struct AsyncRawRpcState {
+    bool done = false;
+    int status = 0;
+    void* data = nullptr;
+    std::string error;
+};
+
+struct RawReaddirplusState {
+    bool done = false;
+    int status = 0;
+    std::string error;
+    std::uint64_t cookie = 0;
+    bool eof = false;
+    char cookie_verifier[NFS3_COOKIEVERFSIZE] {};
+    FlatFolderScanBatch* batch = nullptr;
+    std::string rel_prefix;
+};
+
+struct AsyncRawHandleReadState {
+    bool done = false;
+    int status = 0;
+    std::string error;
+    std::uint64_t offset = 0;
+    std::size_t buffer_offset = 0;
+    std::size_t requested = 0;
+    std::chrono::steady_clock::time_point queued_at {};
     RawBufferPool* pool = nullptr;
     BufferHandle handle;
     bool copy_payload_to_buffer = true;
@@ -759,6 +1073,61 @@ struct PendingRawPooledRead {
     bool in_use = false;
 };
 
+struct PendingRawHandleRead {
+    AsyncRawHandleReadState state;
+    bool in_use = false;
+};
+
+struct PendingPackedSmallFileRead {
+    enum class Phase {
+        empty,
+        opening,
+        reading,
+        closing,
+    };
+
+    Phase phase = Phase::empty;
+    FileSpec file;
+    std::string remote_path;
+    PackedSmallFileAppend append;
+    AsyncCommandState open_state;
+    AsyncReadIntoState read_state;
+    AsyncRawHandleReadState raw_read_state;
+    AsyncCommandState close_state;
+    struct nfsfh* handle = nullptr;
+    std::vector<std::uint8_t> nfs_handle_storage;
+    nfs_fh3 raw_nfs_handle {};
+    std::uint64_t logical_size = 0;
+    std::uint64_t bytes_read = 0;
+    bool failed = false;
+    bool uses_raw_handle = false;
+};
+
+struct PendingRawSmallFileRead {
+    enum class Phase {
+        empty,
+        opening,
+        reading,
+        closing,
+    };
+
+    Phase phase = Phase::empty;
+    FileSpec file;
+    std::string remote_path;
+    BufferHandle handle;
+    AsyncCommandState open_state;
+    AsyncReadIntoState read_state;
+    AsyncRawHandleReadState raw_read_state;
+    AsyncCommandState close_state;
+    struct nfsfh* nfs_handle = nullptr;
+    std::vector<std::uint8_t> nfs_handle_storage;
+    nfs_fh3 raw_nfs_handle {};
+    std::uint64_t logical_size = 0;
+    std::uint64_t bytes_read = 0;
+    bool failed = false;
+    bool uses_raw_handle = false;
+};
+
 struct PendingDirectoryOpen {
     AsyncCommandState state;
     FileSpec folder;
@@ -774,14 +1143,91 @@ struct RetriedDirectoryOpen {
     std::size_t retry_attempts = 0;
 };
 
+std::uint64_t mtime_from_nfs_fattr3(const fattr3& attr);
+std::vector<std::uint8_t> copy_nfs_handle(const nfs_fh3& handle);
+
 void generic_nfs_callback(int status, struct nfs_context* nfs, void* data, void* private_data) {
     (void)nfs;
     auto* state = static_cast<AsyncCommandState*>(private_data);
     state->done = true;
     state->status = status;
     state->data = data;
+    record_async_command_completed(state->kind, state->queued_at, status);
     if (status < 0 && data != nullptr) {
         state->error = static_cast<const char*>(data);
+    }
+}
+
+void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
+    (void)rpc;
+    auto* state = static_cast<RawReaddirplusState*>(private_data);
+    state->done = true;
+    state->status = status;
+    if (status != RPC_STATUS_SUCCESS) {
+        if (data != nullptr) {
+            state->error = static_cast<const char*>(data);
+        }
+        return;
+    }
+
+    auto* result = static_cast<READDIRPLUS3res*>(data);
+    if (result == nullptr || result->status != NFS3_OK) {
+        state->status = -EIO;
+        state->error = result == nullptr ? "NFS READDIRPLUS returned no result"
+                                         : "NFS READDIRPLUS failed with status " + std::to_string(result->status);
+        return;
+    }
+    if (state->batch == nullptr) {
+        state->status = -EIO;
+        state->error = "NFS READDIRPLUS callback missing output batch";
+        return;
+    }
+
+    auto& ok = result->READDIRPLUS3res_u.resok;
+    std::memcpy(state->cookie_verifier, ok.cookieverf, NFS3_COOKIEVERFSIZE);
+    state->eof = ok.reply.eof != 0;
+    for (entryplus3* entry = ok.reply.entries; entry != nullptr; entry = entry->nextentry) {
+        state->cookie = entry->cookie;
+        const std::string_view entry_name(entry->name != nullptr ? entry->name : "");
+        if (entry_name.empty() || entry_name == "." || entry_name == "..") {
+            continue;
+        }
+        if (!entry->name_attributes.attributes_follow) {
+            continue;
+        }
+
+        const fattr3& attr = entry->name_attributes.post_op_attr_u.attributes;
+        const std::string rel_path = state->rel_prefix.empty()
+                                         ? normalize_path(entry_name)
+                                         : normalize_path(state->rel_prefix + "/" + std::string(entry_name));
+        if (attr.type == NF3DIR) {
+            FileSpec spec;
+            spec.rel_path = rel_path;
+            spec.mtime = mtime_from_nfs_fattr3(attr);
+            spec.mode = static_cast<std::uint32_t>(attr.mode & 0777U);
+            spec.uid = static_cast<std::uint32_t>(attr.uid);
+            spec.gid = static_cast<std::uint32_t>(attr.gid);
+            if (entry->name_handle.handle_follows) {
+                spec.nfs_handle = copy_nfs_handle(entry->name_handle.post_op_fh3_u.handle);
+            }
+            state->batch->directories.push_back(std::move(spec));
+            continue;
+        }
+        if (attr.type != NF3REG) {
+            continue;
+        }
+
+        FileSpec spec;
+        spec.rel_path = rel_path;
+        spec.declared_size = attr.size;
+        spec.mtime = mtime_from_nfs_fattr3(attr);
+        spec.mode = static_cast<std::uint32_t>(attr.mode & 0777U);
+        spec.uid = static_cast<std::uint32_t>(attr.uid);
+        spec.gid = static_cast<std::uint32_t>(attr.gid);
+        if (entry->name_handle.handle_follows) {
+            spec.nfs_handle = copy_nfs_handle(entry->name_handle.post_op_fh3_u.handle);
+        }
+        state->batch->files.push_back(std::move(spec));
     }
 }
 
@@ -799,6 +1245,57 @@ void stat64_nfs_callback(int status, struct nfs_context* nfs, void* data, void* 
     if (data != nullptr) {
         state->stat = *static_cast<const struct nfs_stat_64*>(data);
     }
+}
+
+void raw_handle_read_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
+    (void)rpc;
+    auto* state = static_cast<AsyncRawHandleReadState*>(private_data);
+    if (status != RPC_STATUS_SUCCESS) {
+        state->done = true;
+        state->status = -EIO;
+        if (data != nullptr) {
+            state->error = static_cast<const char*>(data);
+        }
+        record_async_read_completed(state->queued_at, state->requested, state->status);
+        return;
+    }
+
+    auto* result = static_cast<READ3res*>(data);
+    if (result == nullptr || result->status != NFS3_OK) {
+        state->done = true;
+        state->status = -EIO;
+        state->error = result == nullptr ? "NFS raw READ returned no result"
+                                         : "NFS raw READ failed with status " + std::to_string(result->status);
+        record_async_read_completed(state->queued_at, state->requested, state->status);
+        return;
+    }
+
+    const auto bytes_read = static_cast<std::size_t>(result->READ3res_u.resok.count);
+    state->status = static_cast<int>(bytes_read);
+    record_async_read_completed(state->queued_at, state->requested, state->status);
+    if (bytes_read != 0U) {
+        if (state->pool == nullptr) {
+            state->error = "raw handle read callback missing buffer pool";
+            state->status = -EIO;
+        } else {
+            const char* payload = result->READ3res_u.resok.data.data_val;
+            if (state->copy_payload_to_buffer && payload == nullptr) {
+                state->error = "raw handle read callback missing payload";
+                state->status = -EIO;
+            } else {
+                DataBuffer& buffer = data_buffer(*state->pool, state->handle);
+                if (state->copy_payload_to_buffer) {
+                    std::memcpy(buffer.bytes.data() + static_cast<std::ptrdiff_t>(state->buffer_offset),
+                                payload,
+                                bytes_read);
+                }
+                buffer.trailer = {};
+                buffer.trailer.data_offset = state->offset;
+                buffer.trailer.data_len = bytes_read;
+            }
+        }
+    }
+    state->done = true;
 }
 
 void discard_read_nfs_callback(int status, struct nfs_context* nfs, void* data, void* private_data) {
@@ -863,6 +1360,7 @@ void raw_pooled_read_nfs_callback(int status, struct nfs_context* nfs, void* dat
     auto* state = static_cast<AsyncRawPooledReadState*>(private_data);
     state->done = true;
     state->status = status;
+    record_async_read_completed(state->queued_at, state->requested, status);
     if (status < 0) {
         if (data != nullptr) {
             state->error = static_cast<const char*>(data);
@@ -888,6 +1386,34 @@ void raw_pooled_read_nfs_callback(int status, struct nfs_context* nfs, void* dat
         buffer.trailer = {};
         buffer.trailer.data_offset = state->offset;
         buffer.trailer.data_len = bytes_read;
+    }
+}
+
+void read_into_nfs_callback(int status, struct nfs_context* nfs, void* data, void* private_data) {
+    (void)nfs;
+    auto* state = static_cast<AsyncReadIntoState*>(private_data);
+    state->done = true;
+    state->status = status;
+    record_async_read_completed(state->queued_at, state->destination_bytes, status);
+    if (status < 0) {
+        if (data != nullptr) {
+            state->error = static_cast<const char*>(data);
+        }
+        return;
+    }
+    if (status > 0) {
+        if (data == nullptr || state->destination == nullptr) {
+            state->error = "read-into callback missing data";
+            state->status = -EIO;
+            return;
+        }
+        const auto bytes_read = static_cast<std::size_t>(status);
+        if (bytes_read > state->destination_bytes) {
+            state->error = "read-into callback exceeded destination buffer";
+            state->status = -EIO;
+            return;
+        }
+        std::memcpy(state->destination, data, bytes_read);
     }
 }
 
@@ -961,31 +1487,49 @@ void pump_nfs_until_done(struct nfs_context* nfs, AsyncStat64State& state) {
 }
 
 void service_nfs_context(struct nfs_context* nfs, int timeout_ms) {
-    const int fd = nfs_get_fd(nfs);
-    const int events = nfs_which_events(nfs);
+    constexpr int kMaxImmediateDrainPasses = 64;
 
-    struct pollfd descriptor {
-        fd, static_cast<short>(events), 0
-    };
+    for (int pass = 0; pass < kMaxImmediateDrainPasses; ++pass) {
+        const int fd = nfs_get_fd(nfs);
+        const int events = nfs_which_events(nfs);
 
-    const int poll_result = fd >= 0 ? ::poll(&descriptor, 1, timeout_ms) : 0;
-    if (poll_result < 0) {
-        throw std::system_error(errno, std::generic_category(), "poll failed for libnfs context");
-    }
+        struct pollfd descriptor {
+            fd, static_cast<short>(events), 0
+        };
 
-    const int revents = poll_result > 0 ? descriptor.revents : 0;
-    if (nfs_service(nfs, revents) < 0) {
-        const char* error = nfs_get_error(nfs);
-        std::ostringstream message;
-        message << "libnfs service failed: " << ((error != nullptr && *error != '\0') ? error : "unknown error")
-                << " (fd=" << fd << ", events=" << events << ", revents=" << revents << ")";
-        throw std::runtime_error(message.str());
+        const int poll_timeout = pass == 0 ? timeout_ms : 0;
+        const int poll_result = fd >= 0 ? ::poll(&descriptor, 1, poll_timeout) : 0;
+        if (poll_result < 0) {
+            throw std::system_error(errno, std::generic_category(), "poll failed for libnfs context");
+        }
+        if (poll_result == 0 && pass != 0) {
+            break;
+        }
+
+        const int revents = poll_result > 0 ? descriptor.revents : 0;
+        if (nfs_service(nfs, revents) < 0) {
+            const char* error = nfs_get_error(nfs);
+            std::ostringstream message;
+            message << "libnfs service failed: " << ((error != nullptr && *error != '\0') ? error : "unknown error")
+                    << " (fd=" << fd << ", events=" << events << ", revents=" << revents << ")";
+            throw std::runtime_error(message.str());
+        }
+
+        if (poll_result == 0) {
+            break;
+        }
     }
 }
 
 template <typename StartFn>
 AsyncCommandState run_async_command(struct nfs_context* nfs, StartFn&& start_fn, std::string_view operation) {
     AsyncCommandState state;
+    if (operation == "nfs_open_async") {
+        state.kind = NfsAsyncCommandKind::open;
+    } else if (operation == "nfs_close_async") {
+        state.kind = NfsAsyncCommandKind::close;
+    }
+    state.queued_at = std::chrono::steady_clock::now();
     const int queue_result = start_fn(&state);
     if (queue_result != 0) {
         throw std::runtime_error(std::string(operation) + " queue failed: " + std::string(nfs_get_error(nfs)));
@@ -1033,11 +1577,32 @@ std::uint64_t mtime_from_nfs_dirent(const struct nfsdirent& entry) {
     return static_cast<std::uint64_t>(entry.mtime.tv_sec) * 1'000'000'000ULL + entry.mtime_nsec;
 }
 
+std::uint64_t mtime_from_nfs_fattr3(const fattr3& attr) {
+    return static_cast<std::uint64_t>(attr.mtime.seconds) * 1'000'000'000ULL + attr.mtime.nseconds;
+}
+
 std::string join_remote_path(std::string_view base, std::string_view name) {
     if (base.empty() || base == "/") {
         return "/" + std::string(name);
     }
     return std::string(base) + "/" + std::string(name);
+}
+
+std::vector<std::uint8_t> copy_nfs_handle(const nfs_fh3& handle) {
+    const char* data = handle.data.data_val;
+    const auto length = static_cast<std::size_t>(handle.data.data_len);
+    if (data == nullptr || length == 0U) {
+        return {};
+    }
+    return std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data),
+                                     reinterpret_cast<const std::uint8_t*>(data) + length);
+}
+
+nfs_fh3 make_raw_nfs_handle(std::vector<std::uint8_t>& handle_storage) {
+    nfs_fh3 handle {};
+    handle.data.data_len = static_cast<u_int>(handle_storage.size());
+    handle.data.data_val = reinterpret_cast<char*>(handle_storage.data());
+    return handle;
 }
 
 std::optional<struct nfs_stat_64> try_stat64(struct nfs_context* nfs, std::string_view remote_path) {
@@ -1115,9 +1680,9 @@ std::uint64_t nfs_stream_hash(struct nfs_context* nfs, const std::string& remote
 
 class LibNfsSession {
 public:
-    explicit LibNfsSession(const std::string& root_url)
+    explicit LibNfsSession(const std::string& root_url, std::size_t endpoint_index = kNfsEndpointAny)
         : root_url_(root_url),
-          connection_url_(choose_nfs_connection_url(root_url)),
+          connection_url_(choose_nfs_connection_url(root_url, endpoint_index)),
           nfs_(nfs_init_context()) {
         if (nfs_ == nullptr) {
             throw std::runtime_error("failed to initialize libnfs context");
@@ -1189,7 +1754,12 @@ private:
 
 class LibNfsBackend final : public NfsBackend {
 public:
-    explicit LibNfsBackend(std::string root_url) : root_url_(std::move(root_url)) {}
+    explicit LibNfsBackend(std::string root_url,
+                           std::size_t endpoint_index = kNfsEndpointAny,
+                           std::size_t readdirplus_page_bytes = 0)
+        : root_url_(std::move(root_url)),
+          endpoint_index_(endpoint_index),
+          readdirplus_page_bytes_(readdirplus_page_bytes != 0U ? readdirplus_page_bytes : 256U * 1024U) {}
 
     [[nodiscard]] std::vector<FileSpec> list_files(bool recursive) const override {
         std::vector<FileSpec> files;
@@ -1429,6 +1999,757 @@ public:
                 data_visitor(chunk.data);
             }
         });
+    }
+
+    [[nodiscard]] std::uint64_t read_file_into(std::string_view rel_path,
+                                               std::uint64_t declared_size,
+                                               std::byte* destination,
+                                               std::size_t destination_bytes) const override {
+        const std::string normalized_path = normalize_path(rel_path);
+        if (normalized_path.empty()) {
+            throw std::runtime_error("relative path must not be empty");
+        }
+        if (declared_size > destination_bytes) {
+            throw std::runtime_error("destination buffer is too small for NFS file: " + normalized_path);
+        }
+        if (declared_size == 0) {
+            return 0;
+        }
+
+        const std::string remote_path = "/" + normalized_path;
+        LibNfsSession& active_session = session();
+        const AsyncCommandState open_state = run_async_command(
+            active_session.context(),
+            [&](AsyncCommandState* state) {
+                return nfs_open_async(active_session.context(), remote_path.c_str(), O_RDONLY, generic_nfs_callback, state);
+            },
+            "nfs_open_async");
+
+        auto* handle = static_cast<struct nfsfh*>(open_state.data);
+        std::uint64_t total_read = 0;
+        try {
+            while (total_read < declared_size) {
+                const std::uint64_t remaining = declared_size - total_read;
+                const std::size_t requested =
+                    static_cast<std::size_t>(std::min<std::uint64_t>(remaining, 1024U * 1024U));
+                AsyncReadIntoState read_state;
+                read_state.destination = destination + total_read;
+                read_state.destination_bytes = requested;
+                read_state.queued_at = std::chrono::steady_clock::now();
+                const int queue_result = nfs_pread_async(active_session.context(),
+                                                         handle,
+                                                         total_read,
+                                                         requested,
+                                                         read_into_nfs_callback,
+                                                         &read_state);
+                if (queue_result != 0) {
+                    throw std::runtime_error("nfs_pread_async queue failed: " +
+                                             std::string(nfs_get_error(active_session.context())));
+                }
+                record_async_read_queued(requested);
+                while (!read_state.done) {
+                    service_nfs_context(active_session.context(), 100);
+                }
+                if (read_state.status < 0) {
+                    throw std::runtime_error("nfs_pread_async failed: " + read_state.error);
+                }
+                if (read_state.status == 0) {
+                    throw std::runtime_error("unexpected EOF while reading NFS file: " + normalized_path);
+                }
+                total_read += static_cast<std::uint64_t>(read_state.status);
+            }
+
+            run_async_command(
+                active_session.context(),
+                [&](AsyncCommandState* state) {
+                    return nfs_close_async(active_session.context(), handle, generic_nfs_callback, state);
+                },
+                "nfs_close_async");
+        } catch (...) {
+            try {
+                run_async_command(
+                    active_session.context(),
+                    [&](AsyncCommandState* state) {
+                        return nfs_close_async(active_session.context(), handle, generic_nfs_callback, state);
+                    },
+                    "nfs_close_async");
+            } catch (...) {
+            }
+            throw;
+        }
+        return total_read;
+    }
+
+    void open_close_file(std::string_view rel_path) const override {
+        const std::string normalized_path = normalize_path(rel_path);
+        if (normalized_path.empty()) {
+            throw std::runtime_error("relative path must not be empty");
+        }
+
+        const std::string remote_path = "/" + normalized_path;
+        LibNfsSession& active_session = session();
+        const AsyncCommandState open_state = run_async_command(
+            active_session.context(),
+            [&](AsyncCommandState* state) {
+                return nfs_open_async(active_session.context(), remote_path.c_str(), O_RDONLY, generic_nfs_callback, state);
+            },
+            "nfs_open_async");
+
+        auto* handle = static_cast<struct nfsfh*>(open_state.data);
+        run_async_command(
+            active_session.context(),
+            [&](AsyncCommandState* state) {
+                return nfs_close_async(active_session.context(), handle, generic_nfs_callback, state);
+            },
+            "nfs_close_async");
+    }
+
+    [[nodiscard]] PackedSmallFilesReadStats read_small_files_packed(
+        const std::function<std::optional<FileSpec>()>& file_provider,
+        RawBufferPool& pool,
+        std::size_t max_in_flight_files,
+        const std::function<void(BufferHandle, std::uint64_t, std::uint64_t)>& buffer_visitor,
+        const std::function<bool()>& should_stop) const override {
+        if (pool.pool_id() != kDataBufferPoolId) {
+            throw std::runtime_error("packed small-file reader requires the data buffer pool");
+        }
+
+        PackedSmallFilesReadStats stats;
+        LibNfsSession& active_session = session();
+        struct nfs_context* nfs = active_session.context();
+        const std::size_t window = std::max<std::size_t>(1, max_in_flight_files);
+        std::vector<PendingPackedSmallFileRead> pending(window);
+        std::optional<FileSpec> carry_file;
+        bool input_done = false;
+
+        const auto logical_size_of = [](const FileSpec& file) {
+            return file.declared_size != 0U ? file.declared_size : file.content.size();
+        };
+
+        const auto prepare_meta = [&](const FileSpec& file) {
+            const RecBuf record = make_recbuf(file);
+            PackedSmallFileMeta meta;
+            meta.file_id = record.own_hash;
+            meta.folder_hash = record.folder_hash;
+            meta.file_size = logical_size_of(file);
+            meta.mtime = record.mtime;
+            meta.mode = record.mode;
+            meta.uid = record.uid;
+            meta.gid = record.gid;
+            meta.rel_path = record.rel_path.view();
+            return meta;
+        };
+
+        while (!(should_stop && should_stop()) && (!input_done || carry_file.has_value())) {
+            BufferHandle batch_handle = pool.acquire_spin();
+            DataBuffer& batch_buffer = data_buffer(pool, batch_handle);
+            reset_packed_small_file_buffer(batch_buffer);
+
+            std::uint64_t reserved_files = 0;
+            std::uint64_t completed_files = 0;
+            std::uint64_t completed_bytes = 0;
+            std::uint64_t failed_files = 0;
+            std::size_t in_flight = 0;
+            bool batch_full = false;
+
+            const auto close_handle_after_failure = [&](PendingPackedSmallFileRead& read) {
+                read.failed = true;
+                if (read.uses_raw_handle || read.handle == nullptr) {
+                    read.phase = PendingPackedSmallFileRead::Phase::empty;
+                    ++failed_files;
+                    --in_flight;
+                    return;
+                }
+                read.close_state = {};
+                read.close_state.kind = NfsAsyncCommandKind::close;
+                read.close_state.queued_at = std::chrono::steady_clock::now();
+                const int close_result = nfs_close_async(nfs, read.handle, generic_nfs_callback, &read.close_state);
+                read.handle = nullptr;
+                if (close_result != 0) {
+                    read.phase = PendingPackedSmallFileRead::Phase::empty;
+                    ++failed_files;
+                    --in_flight;
+                    return;
+                }
+                read.phase = PendingPackedSmallFileRead::Phase::closing;
+            };
+
+            const auto queue_next_opened_read = [&](PendingPackedSmallFileRead& read) {
+                const std::uint64_t remaining = read.logical_size - read.bytes_read;
+                const std::size_t requested =
+                    static_cast<std::size_t>(std::min<std::uint64_t>(remaining, 1024U * 1024U));
+                read.read_state = {};
+                read.read_state.destination = read.append.data + read.bytes_read;
+                read.read_state.destination_bytes = requested;
+                read.read_state.queued_at = std::chrono::steady_clock::now();
+                const int queue_result = nfs_pread_async(nfs,
+                                                         read.handle,
+                                                         read.bytes_read,
+                                                         requested,
+                                                         read_into_nfs_callback,
+                                                         &read.read_state);
+                if (queue_result != 0) {
+                    read.read_state.error = nfs_get_error(nfs) != nullptr ? nfs_get_error(nfs) : "unknown error";
+                    read.read_state.status = -EIO;
+                    read.read_state.done = true;
+                } else {
+                    record_async_read_queued(requested);
+                }
+                read.phase = PendingPackedSmallFileRead::Phase::reading;
+            };
+
+            const auto queue_next_raw_handle_read = [&](PendingPackedSmallFileRead& read) {
+                const std::uint64_t remaining = read.logical_size - read.bytes_read;
+                const std::size_t requested =
+                    static_cast<std::size_t>(std::min<std::uint64_t>(remaining, 1024U * 1024U));
+                read.raw_read_state = {};
+                read.raw_read_state.offset = read.bytes_read;
+                read.raw_read_state.buffer_offset =
+                    static_cast<std::size_t>(read.append.data - batch_buffer.bytes.data()) +
+                    static_cast<std::size_t>(read.bytes_read);
+                read.raw_read_state.requested = requested;
+                read.raw_read_state.pool = &pool;
+                read.raw_read_state.handle = batch_handle;
+                read.raw_read_state.copy_payload_to_buffer = true;
+                read.raw_read_state.queued_at = std::chrono::steady_clock::now();
+                struct rpc_context* rpc = nfs_get_rpc_context(nfs);
+                const int queue_result = rpc_nfs_read_async(rpc,
+                                                            raw_handle_read_callback,
+                                                            &read.raw_nfs_handle,
+                                                            read.bytes_read,
+                                                            requested,
+                                                            &read.raw_read_state);
+                if (queue_result != 0) {
+                    read.raw_read_state.error = rpc_get_error(rpc) != nullptr ? rpc_get_error(rpc) : "unknown error";
+                    read.raw_read_state.status = -EIO;
+                    read.raw_read_state.done = true;
+                } else {
+                    record_async_read_queued(requested);
+                }
+                read.phase = PendingPackedSmallFileRead::Phase::reading;
+            };
+
+            const auto try_schedule = [&]() {
+                while (in_flight < window && !batch_full && !(should_stop && should_stop())) {
+                    auto slot = std::find_if(pending.begin(), pending.end(), [](const PendingPackedSmallFileRead& read) {
+                        return read.phase == PendingPackedSmallFileRead::Phase::empty;
+                    });
+                    if (slot == pending.end()) {
+                        return;
+                    }
+
+                    std::optional<FileSpec> next_file;
+                    if (carry_file.has_value()) {
+                        next_file = std::move(carry_file);
+                        carry_file.reset();
+                    } else if (file_provider) {
+                        next_file = file_provider();
+                    }
+                    if (!next_file.has_value()) {
+                        input_done = true;
+                        return;
+                    }
+
+                    const std::uint64_t logical_size = logical_size_of(*next_file);
+                    PackedSmallFileAppend append;
+                    if (!prepare_packed_small_file_append(batch_buffer,
+                                                          prepare_meta(*next_file),
+                                                          static_cast<std::size_t>(logical_size),
+                                                          append)) {
+                        if (reserved_files == 0U) {
+                            ++stats.files_failed;
+                            continue;
+                        }
+                        carry_file = std::move(*next_file);
+                        batch_full = true;
+                        return;
+                    }
+
+                    commit_packed_small_file_append(batch_buffer, append);
+                    ++reserved_files;
+
+                    PendingPackedSmallFileRead& read = *slot;
+                    read = {};
+                    read.file = std::move(*next_file);
+                    read.logical_size = logical_size;
+                    read.append = append;
+                    if (logical_size == 0U) {
+                        ++completed_files;
+                        continue;
+                    }
+
+                    if (!read.file.nfs_handle.empty()) {
+                        read.uses_raw_handle = true;
+                        read.nfs_handle_storage = read.file.nfs_handle;
+                        read.raw_nfs_handle = make_raw_nfs_handle(read.nfs_handle_storage);
+                        queue_next_raw_handle_read(read);
+                        ++in_flight;
+                        continue;
+                    }
+
+                    const std::string normalized_path = normalize_path(read.file.rel_path);
+                    if (normalized_path.empty()) {
+                        ++failed_files;
+                        continue;
+                    }
+                    read.remote_path = "/" + normalized_path;
+                    read.open_state = {};
+                    read.open_state.kind = NfsAsyncCommandKind::open;
+                    read.open_state.queued_at = std::chrono::steady_clock::now();
+                    const int open_result =
+                        nfs_open_async(nfs,
+                                       read.remote_path.c_str(),
+                                       O_RDONLY,
+                                       generic_nfs_callback,
+                                       &read.open_state);
+                    if (open_result != 0) {
+                        ++failed_files;
+                        continue;
+                    }
+                    read.phase = PendingPackedSmallFileRead::Phase::opening;
+                    ++in_flight;
+                }
+            };
+
+            try_schedule();
+            while (in_flight != 0U) {
+                service_nfs_context(nfs, 100);
+
+                for (PendingPackedSmallFileRead& read : pending) {
+                    if (read.phase == PendingPackedSmallFileRead::Phase::opening && read.open_state.done) {
+                        if (read.open_state.status < 0) {
+                            ++failed_files;
+                            read.phase = PendingPackedSmallFileRead::Phase::empty;
+                            --in_flight;
+                            continue;
+                        }
+                        read.handle = static_cast<struct nfsfh*>(read.open_state.data);
+                        queue_next_opened_read(read);
+                        continue;
+                    }
+
+                    if (read.phase == PendingPackedSmallFileRead::Phase::reading &&
+                        ((read.uses_raw_handle && read.raw_read_state.done) ||
+                         (!read.uses_raw_handle && read.read_state.done))) {
+                        const int read_status = read.uses_raw_handle
+                                                    ? read.raw_read_state.status
+                                                    : read.read_state.status;
+                        if (read_status < 0) {
+                            close_handle_after_failure(read);
+                            continue;
+                        }
+                        if (read_status == 0) {
+                            close_handle_after_failure(read);
+                            continue;
+                        }
+
+                        read.bytes_read += static_cast<std::uint64_t>(read_status);
+                        if (read.bytes_read < read.logical_size) {
+                            if (read.uses_raw_handle) {
+                                queue_next_raw_handle_read(read);
+                            } else {
+                                queue_next_opened_read(read);
+                            }
+                            continue;
+                        }
+
+                        if (read.uses_raw_handle) {
+                            ++completed_files;
+                            completed_bytes += read.bytes_read;
+                            read = {};
+                            --in_flight;
+                            continue;
+                        }
+
+                        read.close_state = {};
+                        read.close_state.kind = NfsAsyncCommandKind::close;
+                        read.close_state.queued_at = std::chrono::steady_clock::now();
+                        const int close_result = nfs_close_async(nfs,
+                                                                 read.handle,
+                                                                 generic_nfs_callback,
+                                                                 &read.close_state);
+                        read.handle = nullptr;
+                        if (close_result != 0) {
+                            ++failed_files;
+                            read.phase = PendingPackedSmallFileRead::Phase::empty;
+                            --in_flight;
+                            continue;
+                        }
+                        read.phase = PendingPackedSmallFileRead::Phase::closing;
+                        continue;
+                    }
+
+                    if (read.phase == PendingPackedSmallFileRead::Phase::closing && read.close_state.done) {
+                        if (read.failed || read.close_state.status < 0) {
+                            ++failed_files;
+                        } else {
+                            ++completed_files;
+                            completed_bytes += read.bytes_read;
+                        }
+                        read.phase = PendingPackedSmallFileRead::Phase::empty;
+                        --in_flight;
+                    }
+                }
+                try_schedule();
+            }
+
+            if (reserved_files == 0U) {
+                pool.release(batch_handle);
+                if (input_done && !carry_file.has_value()) {
+                    break;
+                }
+                continue;
+            }
+
+            if (failed_files != 0U || completed_files != reserved_files) {
+                pool.release(batch_handle);
+                stats.files_failed += reserved_files;
+            } else {
+                if (buffer_visitor) {
+                    buffer_visitor(batch_handle, completed_files, completed_bytes);
+                } else {
+                    pool.release(batch_handle);
+                }
+                ++stats.buffers_published;
+                stats.files_read += completed_files;
+                stats.bytes_read += completed_bytes;
+            }
+
+            if (input_done && !carry_file.has_value()) {
+                break;
+            }
+        }
+
+        return stats;
+    }
+
+    [[nodiscard]] PackedSmallFilesReadStats read_small_files_raw_window(
+        const std::function<std::optional<FileSpec>()>& file_provider,
+        RawBufferPool& pool,
+        std::size_t max_in_flight_files,
+        const std::function<void(RawSmallFileRead&&)>& file_visitor,
+        const std::function<bool()>& should_stop) const override {
+        if (pool.pool_id() != kDataBufferPoolId) {
+            throw std::runtime_error("raw small-file reader requires the data buffer pool");
+        }
+
+        PackedSmallFilesReadStats stats;
+        LibNfsSession& active_session = session();
+        struct nfs_context* nfs = active_session.context();
+        const std::size_t window = std::max<std::size_t>(1, max_in_flight_files);
+        std::vector<PendingRawSmallFileRead> pending(window);
+        bool input_done = false;
+        std::size_t in_flight = 0;
+
+        const auto logical_size_of = [](const FileSpec& file) {
+            return file.declared_size != 0U ? file.declared_size : file.content.size();
+        };
+
+        const auto release_pending = [&](PendingRawSmallFileRead& read) noexcept {
+            if (read.handle.pool_id != 0U) {
+                try {
+                    pool.release(read.handle);
+                } catch (...) {
+                }
+            }
+            if (read.nfs_handle != nullptr) {
+                try {
+                    read.close_state = {};
+                    read.close_state.kind = NfsAsyncCommandKind::close;
+                    read.close_state.queued_at = std::chrono::steady_clock::now();
+                    if (nfs_close_async(nfs, read.nfs_handle, generic_nfs_callback, &read.close_state) == 0) {
+                        while (!read.close_state.done) {
+                            service_nfs_context(nfs, 100);
+                        }
+                    }
+                } catch (...) {
+                }
+            }
+            read = {};
+        };
+
+        const auto close_after_failure = [&](PendingRawSmallFileRead& read) {
+            read.failed = true;
+            if (read.uses_raw_handle || read.nfs_handle == nullptr) {
+                pool.release(read.handle);
+                read = {};
+                --in_flight;
+                ++stats.files_failed;
+                return;
+            }
+            read.close_state = {};
+            read.close_state.kind = NfsAsyncCommandKind::close;
+            read.close_state.queued_at = std::chrono::steady_clock::now();
+            const int close_result = nfs_close_async(nfs, read.nfs_handle, generic_nfs_callback, &read.close_state);
+            read.nfs_handle = nullptr;
+            if (close_result != 0) {
+                pool.release(read.handle);
+                read = {};
+                --in_flight;
+                ++stats.files_failed;
+                return;
+            }
+            read.phase = PendingRawSmallFileRead::Phase::closing;
+        };
+
+        const auto queue_next_opened_read = [&](PendingRawSmallFileRead& read) {
+            const std::uint64_t remaining = read.logical_size - read.bytes_read;
+            const std::size_t requested =
+                static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kLargeChunkBytes - read.bytes_read));
+            DataBuffer& buffer = data_buffer(pool, read.handle);
+            read.read_state = {};
+            read.read_state.destination = buffer.bytes.data() + static_cast<std::ptrdiff_t>(read.bytes_read);
+            read.read_state.destination_bytes = requested;
+            read.read_state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result = nfs_pread_async(nfs,
+                                                     read.nfs_handle,
+                                                     read.bytes_read,
+                                                     requested,
+                                                     read_into_nfs_callback,
+                                                     &read.read_state);
+            if (queue_result != 0) {
+                read.read_state.error = nfs_get_error(nfs) != nullptr ? nfs_get_error(nfs) : "unknown error";
+                read.read_state.status = -EIO;
+                read.read_state.done = true;
+            } else {
+                record_async_read_queued(requested);
+            }
+            read.phase = PendingRawSmallFileRead::Phase::reading;
+        };
+
+        const auto queue_next_raw_handle_read = [&](PendingRawSmallFileRead& read) {
+            const std::uint64_t remaining = read.logical_size - read.bytes_read;
+            const std::size_t requested =
+                static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kLargeChunkBytes - read.bytes_read));
+            read.raw_read_state = {};
+            read.raw_read_state.offset = read.bytes_read;
+            read.raw_read_state.buffer_offset = static_cast<std::size_t>(read.bytes_read);
+            read.raw_read_state.requested = requested;
+            read.raw_read_state.pool = &pool;
+            read.raw_read_state.handle = read.handle;
+            read.raw_read_state.copy_payload_to_buffer = true;
+            read.raw_read_state.queued_at = std::chrono::steady_clock::now();
+            struct rpc_context* rpc = nfs_get_rpc_context(nfs);
+            const int queue_result = rpc_nfs_read_async(rpc,
+                                                        raw_handle_read_callback,
+                                                        &read.raw_nfs_handle,
+                                                        read.bytes_read,
+                                                        requested,
+                                                        &read.raw_read_state);
+            if (queue_result != 0) {
+                read.raw_read_state.error = rpc_get_error(rpc) != nullptr ? rpc_get_error(rpc) : "unknown error";
+                read.raw_read_state.status = -EIO;
+                read.raw_read_state.done = true;
+            } else {
+                record_async_read_queued(requested);
+            }
+            read.phase = PendingRawSmallFileRead::Phase::reading;
+        };
+
+        const auto try_schedule = [&]() {
+            while (in_flight < window && !input_done && !(should_stop && should_stop())) {
+                auto slot = std::find_if(pending.begin(), pending.end(), [](const PendingRawSmallFileRead& read) {
+                    return read.phase == PendingRawSmallFileRead::Phase::empty;
+                });
+                if (slot == pending.end()) {
+                    return;
+                }
+
+                std::optional<FileSpec> next_file = file_provider ? file_provider() : std::nullopt;
+                if (!next_file.has_value()) {
+                    input_done = true;
+                    return;
+                }
+
+                const std::uint64_t logical_size = logical_size_of(*next_file);
+                if (logical_size == 0U) {
+                    ++stats.files_read;
+                    continue;
+                }
+                if (logical_size > kLargeChunkBytes) {
+                    ++stats.files_failed;
+                    continue;
+                }
+
+                BufferHandle handle = pool.acquire_spin();
+                DataBuffer& buffer = data_buffer(pool, handle);
+                buffer.trailer = {};
+
+                PendingRawSmallFileRead& read = *slot;
+                read = {};
+                read.file = std::move(*next_file);
+                read.logical_size = logical_size;
+                read.handle = handle;
+
+                if (!read.file.nfs_handle.empty()) {
+                    read.uses_raw_handle = true;
+                    read.nfs_handle_storage = read.file.nfs_handle;
+                    read.raw_nfs_handle = make_raw_nfs_handle(read.nfs_handle_storage);
+                    queue_next_raw_handle_read(read);
+                    ++in_flight;
+                    continue;
+                }
+
+                const std::string normalized_path = normalize_path(read.file.rel_path);
+                if (normalized_path.empty()) {
+                    pool.release(read.handle);
+                    read = {};
+                    ++stats.files_failed;
+                    continue;
+                }
+                read.remote_path = "/" + normalized_path;
+                read.open_state = {};
+                read.open_state.kind = NfsAsyncCommandKind::open;
+                read.open_state.queued_at = std::chrono::steady_clock::now();
+                const int open_result =
+                    nfs_open_async(nfs,
+                                   read.remote_path.c_str(),
+                                   O_RDONLY,
+                                   generic_nfs_callback,
+                                   &read.open_state);
+                if (open_result != 0) {
+                    pool.release(read.handle);
+                    read = {};
+                    ++stats.files_failed;
+                    continue;
+                }
+                read.phase = PendingRawSmallFileRead::Phase::opening;
+                ++in_flight;
+            }
+        };
+
+        try {
+            try_schedule();
+            while (in_flight != 0U || (!input_done && !(should_stop && should_stop()))) {
+                service_nfs_context(nfs, in_flight == 0U ? 0 : 100);
+
+                for (PendingRawSmallFileRead& read : pending) {
+                    if (read.phase == PendingRawSmallFileRead::Phase::opening && read.open_state.done) {
+                        if (read.open_state.status < 0) {
+                            pool.release(read.handle);
+                            read = {};
+                            --in_flight;
+                            ++stats.files_failed;
+                            continue;
+                        }
+                        read.nfs_handle = static_cast<struct nfsfh*>(read.open_state.data);
+                        queue_next_opened_read(read);
+                        continue;
+                    }
+
+                    if (read.phase == PendingRawSmallFileRead::Phase::reading &&
+                        ((read.uses_raw_handle && read.raw_read_state.done) ||
+                         (!read.uses_raw_handle && read.read_state.done))) {
+                        const int read_status = read.uses_raw_handle
+                                                    ? read.raw_read_state.status
+                                                    : read.read_state.status;
+                        if (read_status < 0 || read_status == 0) {
+                            close_after_failure(read);
+                            continue;
+                        }
+
+                        read.bytes_read += static_cast<std::uint64_t>(read_status);
+                        if (read.bytes_read < read.logical_size) {
+                            if (read.uses_raw_handle) {
+                                queue_next_raw_handle_read(read);
+                            } else {
+                                queue_next_opened_read(read);
+                            }
+                            continue;
+                        }
+
+                        if (read.uses_raw_handle) {
+                            const BufferHandle completed_handle = read.handle;
+                            const std::uint64_t completed_bytes = read.bytes_read;
+                            FileSpec completed_file = std::move(read.file);
+                            read = {};
+                            --in_flight;
+
+                            DataBuffer& buffer = data_buffer(pool, completed_handle);
+                            buffer.trailer = {};
+                            buffer.trailer.data_offset = 0;
+                            buffer.trailer.data_len = static_cast<std::size_t>(completed_bytes);
+
+                            if (file_visitor) {
+                                RawSmallFileRead completed;
+                                completed.file = std::move(completed_file);
+                                completed.handle = completed_handle;
+                                completed.bytes_read = completed_bytes;
+                                file_visitor(std::move(completed));
+                            } else {
+                                pool.release(completed_handle);
+                            }
+                            ++stats.files_read;
+                            ++stats.buffers_published;
+                            stats.bytes_read += completed_bytes;
+                            continue;
+                        }
+
+                        read.close_state = {};
+                        read.close_state.kind = NfsAsyncCommandKind::close;
+                        read.close_state.queued_at = std::chrono::steady_clock::now();
+                        const int close_result = nfs_close_async(nfs,
+                                                                 read.nfs_handle,
+                                                                 generic_nfs_callback,
+                                                                 &read.close_state);
+                        read.nfs_handle = nullptr;
+                        if (close_result != 0) {
+                            pool.release(read.handle);
+                            read = {};
+                            --in_flight;
+                            ++stats.files_failed;
+                            continue;
+                        }
+                        read.phase = PendingRawSmallFileRead::Phase::closing;
+                        continue;
+                    }
+
+                    if (read.phase == PendingRawSmallFileRead::Phase::closing && read.close_state.done) {
+                        const BufferHandle completed_handle = read.handle;
+                        const std::uint64_t completed_bytes = read.bytes_read;
+                        FileSpec completed_file = std::move(read.file);
+                        const bool failed = read.failed || read.close_state.status < 0;
+                        read = {};
+                        --in_flight;
+
+                        if (failed) {
+                            pool.release(completed_handle);
+                            ++stats.files_failed;
+                            continue;
+                        }
+
+                        DataBuffer& buffer = data_buffer(pool, completed_handle);
+                        buffer.trailer = {};
+                        buffer.trailer.data_offset = 0;
+                        buffer.trailer.data_len = static_cast<std::size_t>(completed_bytes);
+
+                        if (file_visitor) {
+                            RawSmallFileRead completed;
+                            completed.file = std::move(completed_file);
+                            completed.handle = completed_handle;
+                            completed.bytes_read = completed_bytes;
+                            file_visitor(std::move(completed));
+                        } else {
+                            pool.release(completed_handle);
+                        }
+                        ++stats.files_read;
+                        ++stats.buffers_published;
+                        stats.bytes_read += completed_bytes;
+                    }
+                }
+
+                try_schedule();
+            }
+        } catch (...) {
+            for (PendingRawSmallFileRead& read : pending) {
+                if (read.phase != PendingRawSmallFileRead::Phase::empty) {
+                    release_pending(read);
+                }
+            }
+            throw;
+        }
+
+        return stats;
     }
 
     [[nodiscard]] std::uint64_t read_file_owned_chunks(
@@ -1744,6 +3065,7 @@ public:
                 read.state.pool = &pool;
                 read.state.handle = slot;
                 read.state.copy_payload_to_buffer = copy_payload_to_buffer;
+                read.state.queued_at = std::chrono::steady_clock::now();
                 const int queue_result = nfs_pread_async(active_session.context(),
                                                          handle,
                                                          offset,
@@ -1755,6 +3077,7 @@ public:
                     throw std::runtime_error("nfs_pread_async queue failed: " +
                                              std::string(nfs_get_error(active_session.context())));
                 }
+                record_async_read_queued(requested);
                 read.in_use = true;
             };
 
@@ -1850,6 +3173,174 @@ public:
                     "nfs_close_async");
             } catch (...) {
             }
+            throw;
+        }
+        return total_read;
+    }
+
+    [[nodiscard]] std::uint64_t read_file_raw_chunks_by_handle(
+        const FileSpec& file,
+        std::size_t outstanding_requests,
+        RawBufferPool& pool,
+        const std::function<void(RawFileChunk&&)>& data_visitor,
+        const std::function<bool()>& should_stop,
+        bool copy_payload_to_buffer) const override {
+        if (file.nfs_handle.empty()) {
+            return read_file_raw_chunks(file.rel_path,
+                                        file.declared_size,
+                                        outstanding_requests,
+                                        pool,
+                                        data_visitor,
+                                        should_stop,
+                                        copy_payload_to_buffer);
+        }
+        if (pool.pool_id() != kDataBufferPoolId) {
+            throw std::runtime_error("raw NFS handle reader requires the data buffer pool");
+        }
+        if (file.declared_size == 0U) {
+            return 0;
+        }
+
+        LibNfsSession& active_session = session();
+        struct nfs_context* nfs = active_session.context();
+        struct rpc_context* rpc = nfs_get_rpc_context(nfs);
+        std::vector<std::uint8_t> handle_storage = file.nfs_handle;
+        nfs_fh3 raw_handle = make_raw_nfs_handle(handle_storage);
+        std::uint64_t total_read = 0;
+        const std::size_t max_in_flight = std::max<std::size_t>(1, outstanding_requests);
+        std::vector<PendingRawHandleRead> pending(max_in_flight);
+        std::size_t in_flight = 0;
+
+        const auto drain_pending_reads = [&]() noexcept {
+            while (in_flight != 0U) {
+                try {
+                    service_nfs_context(nfs, 100);
+                } catch (...) {
+                    return;
+                }
+                for (auto& read : pending) {
+                    if (!read.in_use || !read.state.done) {
+                        continue;
+                    }
+                    try {
+                        pool.release(read.state.handle);
+                    } catch (...) {
+                    }
+                    read.in_use = false;
+                    --in_flight;
+                }
+            }
+        };
+
+        try {
+            std::uint64_t next_offset = 0;
+            std::uint64_t next_emit_offset = 0;
+
+            const auto queue_read = [&](PendingRawHandleRead& read,
+                                        std::uint64_t offset,
+                                        std::size_t requested) {
+                BufferHandle slot = pool.acquire_spin();
+                DataBuffer& buffer = data_buffer(pool, slot);
+                buffer.trailer = {};
+                read.state = {};
+                read.state.offset = offset;
+                read.state.requested = requested;
+                read.state.pool = &pool;
+                read.state.handle = slot;
+                read.state.copy_payload_to_buffer = copy_payload_to_buffer;
+                read.state.queued_at = std::chrono::steady_clock::now();
+                const int queue_result = rpc_nfs_read_async(rpc,
+                                                            raw_handle_read_callback,
+                                                            &raw_handle,
+                                                            offset,
+                                                            requested,
+                                                            &read.state);
+                if (queue_result != 0) {
+                    pool.release(slot);
+                    const char* error = rpc_get_error(rpc);
+                    throw std::runtime_error("rpc_nfs_read_async queue failed: " +
+                                             std::string(error != nullptr ? error : "unknown error"));
+                }
+                record_async_read_queued(requested);
+                read.in_use = true;
+            };
+
+            while ((next_offset < file.declared_size && !(should_stop && should_stop())) || in_flight != 0) {
+                for (auto& read : pending) {
+                    if (next_offset >= file.declared_size ||
+                        in_flight >= max_in_flight ||
+                        (should_stop && should_stop())) {
+                        break;
+                    }
+                    if (read.in_use) {
+                        continue;
+                    }
+                    const std::uint64_t remaining = file.declared_size - next_offset;
+                    const std::size_t requested =
+                        static_cast<std::size_t>(std::min<std::uint64_t>(remaining, kLargeChunkBytes));
+                    queue_read(read, next_offset, requested);
+                    next_offset += requested;
+                    ++in_flight;
+                }
+
+                service_nfs_context(nfs, in_flight == 0 ? 0 : 100);
+
+                bool drained_ready_read = true;
+                while (drained_ready_read) {
+                    drained_ready_read = false;
+                    auto ready_read =
+                        std::find_if(pending.begin(), pending.end(), [&](const PendingRawHandleRead& read) {
+                            return read.in_use && read.state.done && read.state.offset == next_emit_offset;
+                        });
+                    if (ready_read == pending.end()) {
+                        break;
+                    }
+
+                    PendingRawHandleRead& read = *ready_read;
+                    if (read.state.status < 0) {
+                        pool.release(read.state.handle);
+                        read.in_use = false;
+                        throw std::runtime_error("rpc_nfs_read_async failed: " + read.state.error);
+                    }
+                    if (read.state.status == 0 && read.state.requested != 0U) {
+                        pool.release(read.state.handle);
+                        read.in_use = false;
+                        throw std::runtime_error("unexpected EOF while raw-handle reading NFS file: " + file.rel_path);
+                    }
+
+                    const std::size_t bytes_read = static_cast<std::size_t>(read.state.status);
+                    const std::uint64_t chunk_offset = read.state.offset;
+                    const std::size_t requested = read.state.requested;
+                    const BufferHandle handle_for_visitor = read.state.handle;
+                    total_read += bytes_read;
+                    next_emit_offset += bytes_read;
+
+                    read.in_use = false;
+                    if (bytes_read != 0U) {
+                        RawFileChunk chunk;
+                        chunk.offset = chunk_offset;
+                        chunk.handle = handle_for_visitor;
+                        if (data_visitor) {
+                            data_visitor(std::move(chunk));
+                        } else {
+                            pool.release(handle_for_visitor);
+                        }
+                    } else {
+                        pool.release(handle_for_visitor);
+                    }
+
+                    if (bytes_read < requested) {
+                        const std::uint64_t retry_offset = chunk_offset + bytes_read;
+                        const std::size_t retry_bytes = requested - bytes_read;
+                        queue_read(read, retry_offset, retry_bytes);
+                    } else {
+                        --in_flight;
+                    }
+                    drained_ready_read = true;
+                }
+            }
+        } catch (...) {
+            drain_pending_reads();
             throw;
         }
         return total_read;
@@ -2062,6 +3553,24 @@ public:
         const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
         const std::function<bool()>& should_stop,
         const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
+        scan_flat_folders_impl(outstanding_folders, folder_provider, should_stop, folder_visitor, false);
+    }
+
+    void scan_flat_folders_streaming(
+        std::size_t outstanding_folders,
+        const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
+        const std::function<bool()>& should_stop,
+        const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
+        scan_flat_folders_impl(outstanding_folders, folder_provider, should_stop, folder_visitor, true);
+    }
+
+private:
+    void scan_flat_folders_impl(
+        std::size_t outstanding_folders,
+        const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
+        const std::function<bool()>& should_stop,
+        const std::function<void(FlatFolderScanBatch)>& folder_visitor,
+        bool stream_pages) const {
         struct nfs_context* nfs = nullptr;
         const std::size_t max_in_flight = std::max<std::size_t>(1, outstanding_folders);
         constexpr std::size_t kMaxTransientFolderRetries = 3;
@@ -2276,7 +3785,14 @@ public:
                 } else {
                     auto* directory = static_cast<struct nfsdir*>(slot.state.data);
                     try {
-                        batch = read_flat_directory_batch(nfs, directory, std::move(batch), should_stop);
+                        const std::function<void(FlatFolderScanBatch)> page_visitor =
+                            stream_pages ? folder_visitor : std::function<void(FlatFolderScanBatch)> {};
+                        batch = read_flat_directory_batch(nfs,
+                                                          directory,
+                                                          std::move(batch),
+                                                          should_stop,
+                                                          page_visitor,
+                                                          readdirplus_page_bytes_);
                     } catch (const std::exception& error) {
                         batch.failed = true;
                         batch.error = std::string(error.what()) + " while reading " + slot.remote_path;
@@ -2288,15 +3804,16 @@ public:
                 batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
                 slot.in_use = false;
                 --in_flight;
-                folder_visitor(std::move(batch));
+                if (!stream_pages || batch.failed) {
+                    folder_visitor(std::move(batch));
+                }
             }
         }
     }
 
-private:
     [[nodiscard]] LibNfsSession& session() const {
         if (!session_) {
-            session_ = std::make_unique<LibNfsSession>(root_url_);
+            session_ = std::make_unique<LibNfsSession>(root_url_, endpoint_index_);
         }
         return *session_;
     }
@@ -2304,7 +3821,9 @@ private:
     static FlatFolderScanBatch read_flat_directory_batch(struct nfs_context* nfs,
                                                          struct nfsdir* directory,
                                                          FlatFolderScanBatch batch,
-                                                         const std::function<bool()>& should_stop) {
+                                                         const std::function<bool()>& should_stop,
+                                                         const std::function<void(FlatFolderScanBatch)>& page_visitor,
+                                                         std::size_t readdirplus_page_bytes) {
         if (directory == nullptr) {
             batch.failed = true;
             batch.error = "nfs_opendir_async returned no directory handle";
@@ -2312,6 +3831,75 @@ private:
         }
 
         const std::string rel_prefix = normalize_path(batch.folder.rel_path);
+        auto* private_directory = reinterpret_cast<LibNfsPrivateDir*>(directory);
+        if (private_directory != nullptr && private_directory->fh.val != nullptr && private_directory->fh.len > 0) {
+            nfs_fh3 directory_handle {};
+            directory_handle.data.data_len = static_cast<u_int>(private_directory->fh.len);
+            directory_handle.data.data_val = private_directory->fh.val;
+
+            std::uint64_t cookie = 0;
+            char cookie_verifier[NFS3_COOKIEVERFSIZE] {};
+            bool eof = false;
+            while (!eof && !should_stop()) {
+                FlatFolderScanBatch page_batch;
+                if (page_visitor) {
+                    page_batch.folder = batch.folder;
+                    page_batch.scan_started_unix_ns = batch.scan_started_unix_ns;
+                    page_batch.complete = false;
+                }
+                RawReaddirplusState state;
+                state.cookie = cookie;
+                state.eof = false;
+                std::memcpy(state.cookie_verifier, cookie_verifier, NFS3_COOKIEVERFSIZE);
+                state.batch = page_visitor ? &page_batch : &batch;
+                state.rel_prefix = rel_prefix;
+                const int queue_result = rpc_nfs_readdirplus_async(nfs_get_rpc_context(nfs),
+                                                                   raw_readdirplus_callback,
+                                                                   &directory_handle,
+                                                                   cookie,
+                                                                   cookie_verifier,
+                                                                   static_cast<u_int>(readdirplus_page_bytes),
+                                                                   &state);
+                if (queue_result != 0) {
+                    const char* error = rpc_get_error(nfs_get_rpc_context(nfs));
+                    throw std::runtime_error("rpc_nfs_readdirplus_async queue failed: " +
+                                             std::string(error != nullptr ? error : "unknown error"));
+                }
+                while (!state.done) {
+                    service_nfs_context(nfs, 100);
+                }
+                if (state.status != RPC_STATUS_SUCCESS) {
+                    throw std::runtime_error(state.error.empty() ? "rpc_nfs_readdirplus_async failed" : state.error);
+                }
+                cookie = state.cookie;
+                std::memcpy(cookie_verifier, state.cookie_verifier, NFS3_COOKIEVERFSIZE);
+                eof = state.eof;
+                if (page_visitor) {
+                    page_batch.complete = eof;
+                    page_batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
+                    if (!page_batch.files.empty() || !page_batch.directories.empty() || eof) {
+                        page_visitor(std::move(page_batch));
+                    }
+                }
+            }
+            return batch;
+        }
+
+        FlatFolderScanBatch page_batch;
+        std::size_t page_records = 0;
+        const auto emit_fallback_page = [&](bool complete) {
+            if (!page_visitor || (page_records == 0U && !complete)) {
+                return;
+            }
+            page_batch.folder = batch.folder;
+            page_batch.scan_started_unix_ns = batch.scan_started_unix_ns;
+            page_batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
+            page_batch.complete = complete;
+            page_visitor(std::move(page_batch));
+            page_batch = {};
+            page_records = 0;
+        };
+
         while (auto* entry = nfs_readdir(nfs, directory)) {
             if (should_stop()) {
                 break;
@@ -2332,7 +3920,15 @@ private:
                 spec.mode = static_cast<std::uint32_t>(entry->mode & 0777U);
                 spec.uid = entry->uid;
                 spec.gid = entry->gid;
-                batch.directories.push_back(std::move(spec));
+                if (page_visitor) {
+                    page_batch.directories.push_back(std::move(spec));
+                    ++page_records;
+                    if (page_records >= 4096U) {
+                        emit_fallback_page(false);
+                    }
+                } else {
+                    batch.directories.push_back(std::move(spec));
+                }
                 continue;
             }
             if (!S_ISREG(mode)) {
@@ -2346,8 +3942,17 @@ private:
             spec.mode = static_cast<std::uint32_t>(entry->mode & 0777U);
             spec.uid = entry->uid;
             spec.gid = entry->gid;
-            batch.files.push_back(std::move(spec));
+            if (page_visitor) {
+                page_batch.files.push_back(std::move(spec));
+                ++page_records;
+                if (page_records >= 4096U) {
+                    emit_fallback_page(false);
+                }
+            } else {
+                batch.files.push_back(std::move(spec));
+            }
         }
+        emit_fallback_page(true);
         return batch;
     }
 
@@ -2498,6 +4103,8 @@ private:
     }
 
     std::string root_url_;
+    std::size_t endpoint_index_;
+    std::size_t readdirplus_page_bytes_;
     mutable std::unique_ptr<LibNfsSession> session_;
 };
 
@@ -2863,6 +4470,14 @@ void NfsBackend::scan_flat_folders(
     }
 }
 
+void NfsBackend::scan_flat_folders_streaming(
+    std::size_t outstanding_folders,
+    const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
+    const std::function<bool()>& should_stop,
+    const std::function<void(FlatFolderScanBatch)>& folder_visitor) const {
+    scan_flat_folders(outstanding_folders, folder_provider, should_stop, folder_visitor);
+}
+
 FileSpec NfsBackend::load_file(std::string_view rel_path, std::size_t outstanding_requests) const {
     (void)outstanding_requests;
     return load_file(rel_path);
@@ -2899,6 +4514,163 @@ std::uint64_t NfsBackend::read_file_stream(
         data_visitor(file.content);
     }
     return file.content.size();
+}
+
+std::uint64_t NfsBackend::read_file_into(std::string_view rel_path,
+                                         std::uint64_t declared_size,
+                                         std::byte* destination,
+                                         std::size_t destination_bytes) const {
+    (void)declared_size;
+    FileSpec file = load_file(rel_path);
+    if (file.content.size() > destination_bytes) {
+        throw std::runtime_error("destination buffer is too small");
+    }
+    if (!file.content.empty()) {
+        std::memcpy(destination, file.content.data(), file.content.size());
+    }
+    return file.content.size();
+}
+
+void NfsBackend::open_close_file(std::string_view rel_path) const {
+    const FileSpec file = load_file(rel_path);
+    (void)file;
+}
+
+PackedSmallFilesReadStats NfsBackend::read_small_files_packed(
+    const std::function<std::optional<FileSpec>()>& file_provider,
+    RawBufferPool& pool,
+    std::size_t max_in_flight_files,
+    const std::function<void(BufferHandle, std::uint64_t, std::uint64_t)>& buffer_visitor,
+    const std::function<bool()>& should_stop) const {
+    (void)max_in_flight_files;
+    PackedSmallFilesReadStats stats;
+    std::optional<BufferHandle> batch_handle;
+    std::uint64_t batch_files = 0;
+
+    const auto flush_batch = [&]() {
+        if (!batch_handle.has_value()) {
+            return;
+        }
+        const BufferHandle handle = *batch_handle;
+        batch_handle.reset();
+        const std::uint64_t batch_bytes = packed_small_file_payload_bytes(data_buffer(pool, handle));
+        if (batch_files == 0U) {
+            pool.release(handle);
+            return;
+        }
+        if (buffer_visitor) {
+            buffer_visitor(handle, batch_files, batch_bytes);
+        } else {
+            pool.release(handle);
+        }
+        ++stats.buffers_published;
+        batch_files = 0;
+    };
+
+    while (!(should_stop && should_stop())) {
+        std::optional<FileSpec> file = file_provider ? file_provider() : std::nullopt;
+        if (!file.has_value()) {
+            break;
+        }
+
+        const RecBuf record = make_recbuf(*file);
+        const std::uint64_t logical_size = file->declared_size != 0U ? file->declared_size : file->content.size();
+        PackedSmallFileMeta meta;
+        meta.file_id = record.own_hash;
+        meta.folder_hash = record.folder_hash;
+        meta.file_size = logical_size;
+        meta.mtime = record.mtime;
+        meta.mode = record.mode;
+        meta.uid = record.uid;
+        meta.gid = record.gid;
+        meta.rel_path = record.rel_path.view();
+
+        if (!batch_handle.has_value()) {
+            batch_handle = pool.acquire_spin();
+            reset_packed_small_file_buffer(data_buffer(pool, *batch_handle));
+        }
+
+        PackedSmallFileAppend append;
+        DataBuffer& buffer = data_buffer(pool, *batch_handle);
+        if (!prepare_packed_small_file_append(buffer, meta, static_cast<std::size_t>(logical_size), append)) {
+            flush_batch();
+            batch_handle = pool.acquire_spin();
+            DataBuffer& fresh = data_buffer(pool, *batch_handle);
+            reset_packed_small_file_buffer(fresh);
+            if (!prepare_packed_small_file_append(fresh, meta, static_cast<std::size_t>(logical_size), append)) {
+                pool.release(*batch_handle);
+                batch_handle.reset();
+                ++stats.files_failed;
+                continue;
+            }
+        }
+
+        const std::uint64_t bytes_read = read_file_into(file->rel_path, logical_size, append.data, append.data_capacity);
+        if (bytes_read != logical_size) {
+            ++stats.files_failed;
+            continue;
+        }
+        commit_packed_small_file_append(data_buffer(pool, *batch_handle), append);
+        ++batch_files;
+        ++stats.files_read;
+        stats.bytes_read += bytes_read;
+    }
+
+    flush_batch();
+    return stats;
+}
+
+PackedSmallFilesReadStats NfsBackend::read_small_files_raw_window(
+    const std::function<std::optional<FileSpec>()>& file_provider,
+    RawBufferPool& pool,
+    std::size_t max_in_flight_files,
+    const std::function<void(RawSmallFileRead&&)>& file_visitor,
+    const std::function<bool()>& should_stop) const {
+    (void)max_in_flight_files;
+    PackedSmallFilesReadStats stats;
+    while (!(should_stop && should_stop())) {
+        std::optional<FileSpec> file = file_provider ? file_provider() : std::nullopt;
+        if (!file.has_value()) {
+            break;
+        }
+
+        const std::uint64_t logical_size = file->declared_size != 0U ? file->declared_size : file->content.size();
+        if (logical_size == 0U) {
+            ++stats.files_read;
+            continue;
+        }
+        if (logical_size > kLargeChunkBytes) {
+            ++stats.files_failed;
+            continue;
+        }
+
+        BufferHandle handle = pool.acquire_spin();
+        DataBuffer& buffer = data_buffer(pool, handle);
+        buffer.trailer = {};
+        const std::uint64_t bytes_read =
+            read_file_into(file->rel_path, logical_size, buffer.bytes.data(), buffer.bytes.size());
+        if (bytes_read != logical_size) {
+            pool.release(handle);
+            ++stats.files_failed;
+            continue;
+        }
+        buffer.trailer.data_offset = 0;
+        buffer.trailer.data_len = static_cast<std::size_t>(bytes_read);
+
+        if (file_visitor) {
+            RawSmallFileRead completed;
+            completed.file = std::move(*file);
+            completed.handle = handle;
+            completed.bytes_read = bytes_read;
+            file_visitor(std::move(completed));
+        } else {
+            pool.release(handle);
+        }
+        ++stats.files_read;
+        ++stats.buffers_published;
+        stats.bytes_read += bytes_read;
+    }
+    return stats;
 }
 
 std::uint64_t NfsBackend::read_file_owned_chunks(
@@ -2985,6 +4757,22 @@ std::uint64_t NfsBackend::read_file_raw_chunks(
     return total;
 }
 
+std::uint64_t NfsBackend::read_file_raw_chunks_by_handle(
+    const FileSpec& file,
+    std::size_t outstanding_requests,
+    RawBufferPool& pool,
+    const std::function<void(RawFileChunk&&)>& data_visitor,
+    const std::function<bool()>& should_stop,
+    bool copy_payload_to_buffer) const {
+    return read_file_raw_chunks(file.rel_path,
+                                file.declared_size,
+                                outstanding_requests,
+                                pool,
+                                data_visitor,
+                                should_stop,
+                                copy_payload_to_buffer);
+}
+
 std::uint64_t NfsBackend::visit_file_chunks(
     std::string_view rel_path,
     std::uint64_t declared_size,
@@ -2998,11 +4786,15 @@ std::uint64_t NfsBackend::visit_file_chunks(
     return file.content.size();
 }
 
-std::unique_ptr<NfsBackend> make_nfs_backend(std::string root) {
+std::unique_ptr<NfsBackend> make_nfs_backend(std::string root,
+                                             std::size_t endpoint_index,
+                                             std::size_t readdirplus_page_bytes) {
     if (is_nfs_url(root)) {
 #if HYPERSYNC_HAS_LIBNFS
-        return std::make_unique<LibNfsBackend>(std::move(root));
+        return std::make_unique<LibNfsBackend>(std::move(root), endpoint_index, readdirplus_page_bytes);
 #else
+        (void)endpoint_index;
+        (void)readdirplus_page_bytes;
         throw std::runtime_error("libnfs support is not available in this build; install libnfs and rebuild");
 #endif
     }

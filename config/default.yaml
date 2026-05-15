@@ -34,6 +34,7 @@ jobs:
   nfs_meta_reader:
     worker_count: 8
     async_directory_depth: 1
+    readdirplus_page_bytes: 262144
     recbuf_window: 1000000
     streaming_mode_threshold: 1000000
     async_readdir: true
@@ -74,6 +75,7 @@ jobs:
   nfs_data_reader:
     data_reader_worker_count: 2
     outstanding_requests: 256
+    small_file_async_window: 0
     large_file_parallelism: 8
     small_file_threshold: 131072
     large_chunk_bytes: 1048576
@@ -81,6 +83,7 @@ jobs:
     resume_large_pool_percent: 70.0
     source_root: .
     copy_data_from_nfs: true
+    pack_small_files: false
   data_cacher:
     role: sender
     spill_threshold_percent: 85.0

@@ -16,40 +16,48 @@ NfsDataReaderConfig::NfsDataReaderConfig()
 
 NfsDataReaderConfig::NfsDataReaderConfig(std::size_t data_reader_worker_count,
                                          std::size_t outstanding_requests,
+                                         std::size_t small_file_async_window,
                                          std::size_t large_file_parallelism,
                                          std::size_t small_file_threshold,
                                          std::size_t large_chunk_bytes,
                                          double pause_large_pool_percent,
                                          double resume_large_pool_percent,
                                          std::string source_root,
-                                         bool copy_data_from_nfs)
+                                         bool copy_data_from_nfs,
+                                         bool pack_small_files,
+                                         std::size_t endpoint_index)
     : data_reader_worker_count(data_reader_worker_count),
       outstanding_requests(outstanding_requests),
+      small_file_async_window(small_file_async_window),
       large_file_parallelism(large_file_parallelism),
       small_file_threshold(small_file_threshold),
       large_chunk_bytes(large_chunk_bytes),
       pause_large_pool_percent(pause_large_pool_percent),
       resume_large_pool_percent(resume_large_pool_percent),
       source_root(std::move(source_root)),
-      copy_data_from_nfs(copy_data_from_nfs) {}
+      copy_data_from_nfs(copy_data_from_nfs),
+      pack_small_files(pack_small_files),
+      endpoint_index(endpoint_index) {}
 
 NfsDataReaderConfig load_nfs_data_reader_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("nfs_data_reader"));
     return NfsDataReaderConfig(config_size_t_or(values, "data_reader_worker_count", 2),
                                config_size_t(values, "outstanding_requests"),
+                               config_size_t_or(values, "small_file_async_window", 0),
                                config_size_t(values, "large_file_parallelism"),
                                config_size_t(values, "small_file_threshold"),
                                config_size_t(values, "large_chunk_bytes"),
                                config_double(values, "pause_large_pool_percent"),
                                config_double(values, "resume_large_pool_percent"),
                                config_string(values, "source_root"),
-                               config_bool_or(values, "copy_data_from_nfs", true));
+                               config_bool_or(values, "copy_data_from_nfs", true),
+                               config_bool_or(values, "pack_small_files", false));
 }
 
 NfsDataReader::NfsDataReader(NfsDataReaderConfig config)
     : TypedQueueJob("nfs_data_reader", message_kinds::data_chunk),
       config_(std::move(config)),
-      backend_(make_nfs_backend(config_.source_root)) {}
+      backend_(make_nfs_backend(config_.source_root, config_.endpoint_index)) {}
 
 NfsDataReader::~NfsDataReader() = default;
 
@@ -110,6 +118,38 @@ std::uint64_t NfsDataReader::stream_file_data(
     return backend().read_file_stream(file.rel_path, file.declared_size, config_.outstanding_requests, data_visitor);
 }
 
+std::uint64_t NfsDataReader::read_file_into(const FileSpec& file,
+                                            std::byte* destination,
+                                            std::size_t destination_bytes) const {
+    return backend().read_file_into(file.rel_path, file.declared_size, destination, destination_bytes);
+}
+
+void NfsDataReader::open_close_file(const FileSpec& file) const {
+    backend().open_close_file(file.rel_path);
+}
+
+PackedSmallFilesReadStats NfsDataReader::read_small_files_packed(
+    const std::function<std::optional<FileSpec>()>& file_provider,
+    RawBufferPool& pool,
+    const std::function<void(BufferHandle, std::uint64_t, std::uint64_t)>& buffer_visitor,
+    const std::function<bool()>& should_stop) const {
+    const std::size_t window = config_.small_file_async_window != 0U
+                                   ? config_.small_file_async_window
+                                   : std::max<std::size_t>(1, config_.outstanding_requests);
+    return backend().read_small_files_packed(file_provider, pool, window, buffer_visitor, should_stop);
+}
+
+PackedSmallFilesReadStats NfsDataReader::read_small_files_raw_window(
+    const std::function<std::optional<FileSpec>()>& file_provider,
+    RawBufferPool& pool,
+    const std::function<void(RawSmallFileRead&&)>& file_visitor,
+    const std::function<bool()>& should_stop) const {
+    const std::size_t window = config_.small_file_async_window != 0U
+                                   ? config_.small_file_async_window
+                                   : std::max<std::size_t>(1, config_.outstanding_requests);
+    return backend().read_small_files_raw_window(file_provider, pool, window, file_visitor, should_stop);
+}
+
 std::uint64_t NfsDataReader::stream_file_owned_chunks(
     const FileSpec& file,
     const std::function<void(OwnedFileChunk&&)>& data_visitor) const {
@@ -132,13 +172,12 @@ std::uint64_t NfsDataReader::stream_file_raw_chunks(
     RawBufferPool& pool,
     const std::function<void(RawFileChunk&&)>& data_visitor,
     const std::function<bool()>& should_stop) const {
-    return backend().read_file_raw_chunks(file.rel_path,
-                                         file.declared_size,
-                                         config_.outstanding_requests,
-                                         pool,
-                                         data_visitor,
-                                         should_stop,
-                                         config_.copy_data_from_nfs);
+    return backend().read_file_raw_chunks_by_handle(file,
+                                                    config_.outstanding_requests,
+                                                    pool,
+                                                    data_visitor,
+                                                    should_stop,
+                                                    config_.copy_data_from_nfs);
 }
 
 std::uint64_t NfsDataReader::visit_file_chunks(

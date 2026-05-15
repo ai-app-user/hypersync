@@ -64,7 +64,9 @@ private:
     [[nodiscard]] bool should_stop_now() const;
     void record_bytes_read(std::uint64_t bytes_read);
     void record_file_read();
+    void record_files_read(std::uint64_t file_count);
     void record_file_failed(const FileSpec& file);
+    void record_files_failed(std::uint64_t file_count);
 
     NfsDataReaderConfig config_;
     RawBufferPool& data_pool_;

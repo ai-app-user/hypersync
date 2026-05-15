@@ -8,6 +8,7 @@
 
 #include "common/hash_utils.hpp"
 #include "common/records.hpp"
+#include "core/data_buffer_codec.hpp"
 #include "core/nfs_backend.hpp"
 #include "core/pipeline_buffers.hpp"
 
@@ -74,17 +75,108 @@ NfsDataBufferReaderStats NfsDataBufferReaderJob::stats() const {
 }
 
 void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
-    (void)worker_index;
-    NfsDataReader reader(config_);
+    NfsDataReaderConfig worker_config = config_;
+    worker_config.endpoint_index = worker_index;
+    NfsDataReader reader(std::move(worker_config));
+    std::optional<FileSpec> carried_file;
     while (!should_stop_now()) {
-        const std::optional<FileSpec> file = file_provider_();
+        std::optional<FileSpec> file;
+        if (carried_file.has_value()) {
+            file = std::move(carried_file);
+            carried_file.reset();
+        } else {
+            file = file_provider_();
+        }
         if (!file.has_value()) {
             break;
         }
 
         try {
-            publish_file_chunks(reader, *file, worker_index);
-            record_file_read();
+            const std::uint64_t logical_size = file_logical_size(*file);
+            if (config_.copy_data_from_nfs &&
+                config_.pack_small_files &&
+                logical_size <= config_.small_file_threshold) {
+                FileSpec first_file = std::move(*file);
+                bool first_pending = true;
+                const PackedSmallFilesReadStats packed_stats = reader.read_small_files_packed(
+                    [&]() -> std::optional<FileSpec> {
+                        if (first_pending) {
+                            first_pending = false;
+                            return std::move(first_file);
+                        }
+                        std::optional<FileSpec> next_file = file_provider_();
+                        if (!next_file.has_value()) {
+                            return std::nullopt;
+                        }
+                        if (file_logical_size(*next_file) > config_.small_file_threshold) {
+                            carried_file = std::move(*next_file);
+                            return std::nullopt;
+                        }
+                        return next_file;
+                    },
+                    data_pool_,
+                    [&](BufferHandle handle, std::uint64_t file_count, std::uint64_t bytes_read) {
+                        if (!wait_for_output(worker_index, output_, handle)) {
+                            data_pool_.release(handle);
+                            throw NfsDataReaderStopped {};
+                        }
+                        record_bytes_read(bytes_read);
+                        record_files_read(file_count);
+                    },
+                    [this]() {
+                        return should_stop_now();
+                    });
+                record_files_failed(packed_stats.files_failed);
+            } else if (config_.copy_data_from_nfs &&
+                       !config_.pack_small_files &&
+                       config_.small_file_async_window > 1U &&
+                       logical_size <= config_.small_file_threshold) {
+                FileSpec first_file = std::move(*file);
+                bool first_pending = true;
+                std::uint64_t published_files = 0;
+                const PackedSmallFilesReadStats window_stats = reader.read_small_files_raw_window(
+                    [&]() -> std::optional<FileSpec> {
+                        if (first_pending) {
+                            first_pending = false;
+                            return std::move(first_file);
+                        }
+                        std::optional<FileSpec> next_file = file_provider_();
+                        if (!next_file.has_value()) {
+                            return std::nullopt;
+                        }
+                        if (file_logical_size(*next_file) > config_.small_file_threshold) {
+                            carried_file = std::move(*next_file);
+                            return std::nullopt;
+                        }
+                        return next_file;
+                    },
+                    data_pool_,
+                    [&](RawSmallFileRead&& completed) {
+                        DataBuffer& buffer = data_buffer(data_pool_, completed.handle);
+                        const RecBuf record = make_recbuf(completed.file);
+                        complete_trailer(record,
+                                         file_logical_size(completed.file),
+                                         buffer.trailer,
+                                         0);
+                        if (!wait_for_output(worker_index, output_, completed.handle)) {
+                            data_pool_.release(completed.handle);
+                            throw NfsDataReaderStopped {};
+                        }
+                        record_bytes_read(completed.bytes_read);
+                        ++published_files;
+                        record_file_read();
+                    },
+                    [this]() {
+                        return should_stop_now();
+                    });
+                if (window_stats.files_read > published_files) {
+                    record_files_read(window_stats.files_read - published_files);
+                }
+                record_files_failed(window_stats.files_failed);
+            } else {
+                publish_file_chunks(reader, *file, worker_index);
+                record_file_read();
+            }
         } catch (const NfsDataReaderStopped&) {
             break;
         } catch (...) {
@@ -162,17 +254,27 @@ void NfsDataBufferReaderJob::record_bytes_read(std::uint64_t bytes_read) {
 }
 
 void NfsDataBufferReaderJob::record_file_read() {
-    files_read_.fetch_add(1, std::memory_order_relaxed);
+    record_files_read(1);
+}
+
+void NfsDataBufferReaderJob::record_files_read(std::uint64_t file_count) {
+    files_read_.fetch_add(file_count, std::memory_order_relaxed);
     if (file_read_callback_) {
-        file_read_callback_();
+        for (std::uint64_t index = 0; index < file_count; ++index) {
+            file_read_callback_();
+        }
     }
 }
 
 void NfsDataBufferReaderJob::record_file_failed(const FileSpec& file) {
-    files_failed_.fetch_add(1, std::memory_order_relaxed);
+    record_files_failed(1);
     if (file_failed_callback_) {
         file_failed_callback_(file);
     }
+}
+
+void NfsDataBufferReaderJob::record_files_failed(std::uint64_t file_count) {
+    files_failed_.fetch_add(file_count, std::memory_order_relaxed);
 }
 
 }  // namespace hypersync

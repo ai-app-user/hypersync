@@ -3,10 +3,12 @@
 
 #include <memory>
 #include <functional>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "common/buffer_pool.hpp"
 #include "common/slot_pool.hpp"
 #include "common/types.hpp"
 #include "jobs/queue_job.hpp"
@@ -18,11 +20,14 @@ class NfsBackend;
 class RawBufferPool;
 struct OwnedFileChunk;
 struct PooledFileChunk;
+struct PackedSmallFilesReadStats;
 struct RawFileChunk;
+struct RawSmallFileRead;
 
 struct NfsDataReaderConfig {
     std::size_t data_reader_worker_count;
     std::size_t outstanding_requests;
+    std::size_t small_file_async_window;
     std::size_t large_file_parallelism;
     std::size_t small_file_threshold;
     std::size_t large_chunk_bytes;
@@ -30,17 +35,22 @@ struct NfsDataReaderConfig {
     double resume_large_pool_percent;
     std::string source_root;
     bool copy_data_from_nfs;
+    bool pack_small_files;
+    std::size_t endpoint_index;
 
     NfsDataReaderConfig();
     NfsDataReaderConfig(std::size_t data_reader_worker_count,
                         std::size_t outstanding_requests,
+                        std::size_t small_file_async_window,
                         std::size_t large_file_parallelism,
                         std::size_t small_file_threshold,
                         std::size_t large_chunk_bytes,
                         double pause_large_pool_percent,
                         double resume_large_pool_percent,
                         std::string source_root,
-                        bool copy_data_from_nfs = true);
+                        bool copy_data_from_nfs = true,
+                        bool pack_small_files = false,
+                        std::size_t endpoint_index = std::numeric_limits<std::size_t>::max());
 };
 
 [[nodiscard]] NfsDataReaderConfig load_nfs_data_reader_config(const ConfigStore& config);
@@ -59,6 +69,20 @@ public:
     [[nodiscard]] std::uint64_t stream_file_data(
         const FileSpec& file,
         const std::function<void(std::string_view)>& data_visitor) const;
+    [[nodiscard]] std::uint64_t read_file_into(const FileSpec& file,
+                                               std::byte* destination,
+                                               std::size_t destination_bytes) const;
+    void open_close_file(const FileSpec& file) const;
+    [[nodiscard]] PackedSmallFilesReadStats read_small_files_packed(
+        const std::function<std::optional<FileSpec>()>& file_provider,
+        RawBufferPool& pool,
+        const std::function<void(BufferHandle, std::uint64_t, std::uint64_t)>& buffer_visitor,
+        const std::function<bool()>& should_stop = {}) const;
+    [[nodiscard]] PackedSmallFilesReadStats read_small_files_raw_window(
+        const std::function<std::optional<FileSpec>()>& file_provider,
+        RawBufferPool& pool,
+        const std::function<void(RawSmallFileRead&&)>& file_visitor,
+        const std::function<bool()>& should_stop = {}) const;
     [[nodiscard]] std::uint64_t stream_file_owned_chunks(
         const FileSpec& file,
         const std::function<void(OwnedFileChunk&&)>& data_visitor) const;

@@ -79,14 +79,35 @@ struct DataReadBenchmarkReport {
     double elapsed_seconds = 0.0;
     std::size_t meta_reader_threads = 0;
     std::size_t metadata_async_depth = 0;
+    std::size_t readdirplus_page_bytes = 0;
     std::size_t data_reader_threads = 0;
     std::size_t data_outstanding_requests = 0;
+    std::size_t small_file_async_window = 0;
+    std::uint64_t max_file_size_bytes = 0;
     std::size_t max_files_queued = 0;
     std::size_t data_buffer_slots = 0;
     std::size_t data_queue_depth = 0;
     std::string data_copy_mode;
+    bool pack_small_files = false;
     bool meta_reader_async = false;
     bool data_reader_async = false;
+    std::uint64_t async_read_queued = 0;
+    std::uint64_t async_read_completed = 0;
+    std::uint64_t async_read_short = 0;
+    std::uint64_t async_read_failed = 0;
+    std::uint64_t async_read_zero = 0;
+    std::uint64_t async_read_bytes_requested = 0;
+    std::uint64_t async_read_bytes_completed = 0;
+    double async_read_avg_latency_ms = 0.0;
+    double async_read_max_latency_ms = 0.0;
+    std::uint64_t async_open_completed = 0;
+    std::uint64_t async_open_failed = 0;
+    double async_open_avg_latency_ms = 0.0;
+    double async_open_max_latency_ms = 0.0;
+    std::uint64_t async_close_completed = 0;
+    std::uint64_t async_close_failed = 0;
+    double async_close_avg_latency_ms = 0.0;
+    double async_close_max_latency_ms = 0.0;
 };
 
 struct DataHashBenchmarkReport {
@@ -106,12 +127,14 @@ struct DataHashBenchmarkReport {
     std::size_t metadata_async_depth = 0;
     std::size_t data_reader_threads = 0;
     std::size_t data_outstanding_requests = 0;
+    std::size_t small_file_async_window = 0;
     std::size_t hash_worker_threads = 0;
     std::size_t max_files_queued = 0;
     std::size_t data_buffer_slots = 0;
     std::size_t data_queue_depth = 0;
     std::size_t hash_work_factor = 1;
     std::string hash_algorithm;
+    bool pack_small_files = false;
     bool meta_reader_async = false;
     bool data_reader_async = false;
 };
@@ -300,15 +323,27 @@ public:
                                                                        bool recursive = true,
                                                                        std::size_t meta_reader_threads = 0,
                                                                        std::size_t metadata_async_depth = 0,
+                                                                       std::size_t readdirplus_page_bytes = 0,
                                                                        std::size_t data_reader_threads = 0,
                                                                        std::size_t data_outstanding_requests = 0,
+                                                                       std::size_t small_file_async_window = 0,
+                                                                       std::uint64_t max_file_size_bytes = 0,
                                                                        std::size_t max_files_queued = 1024,
                                                                        std::size_t data_buffer_slots = 0,
                                                                        std::size_t data_queue_depth = 0,
                                                                        const std::string& data_copy_mode = {},
+                                                                       bool pack_small_files = false,
                                                                        double max_duration_seconds = 0.0,
                                                                        std::uint32_t stats_interval_seconds = 5,
                                                                        const std::filesystem::path& status_socket_path = {}) const;
+    [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
+                                                                      bool recursive = true,
+                                                                      std::size_t meta_reader_threads = 0,
+                                                                      std::size_t metadata_async_depth = 0,
+                                                                      std::size_t open_threads = 0,
+                                                                      std::size_t max_files_queued = 1024,
+                                                                      double max_duration_seconds = 0.0,
+                                                                      std::uint32_t stats_interval_seconds = 5) const;
     [[nodiscard]] DataHashBenchmarkReport benchmark_data_hash_pipeline(const std::filesystem::path& source_root,
                                                                        bool recursive = true,
                                                                        const std::string& hash_algorithm = {},
@@ -316,11 +351,13 @@ public:
                                                                        std::size_t metadata_async_depth = 0,
                                                                        std::size_t data_reader_threads = 0,
                                                                        std::size_t data_outstanding_requests = 0,
+                                                                       std::size_t small_file_async_window = 0,
                                                                        std::size_t hash_worker_threads = 0,
                                                                        std::size_t max_files_queued = 1024,
                                                                        std::size_t data_buffer_slots = 0,
                                                                        std::size_t data_queue_depth = 0,
                                                                        std::size_t hash_work_factor = 0,
+                                                                       bool pack_small_files = false,
                                                                        double max_duration_seconds = 0.0,
                                                                        std::uint32_t stats_interval_seconds = 5,
                                                                        const std::filesystem::path& status_socket_path = {}) const;

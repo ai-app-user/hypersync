@@ -69,6 +69,15 @@ copying data for a non-zero-copy socket write. Even then, the copy must remain
 inside the backend adapter or transport Job. It must not leak into generic Job
 interfaces or become a Job-to-Job handoff mechanism.
 
+For NFSv3 data reads, the preferred small-file fast path is:
+
+`READDIRPLUS metadata scan -> FileSpec with opaque NFS handle -> raw READ by handle`
+
+This avoids per-file `open()`/`ACCESS`/`close()` on the data path. The NFS file
+handle is application-specific metadata carried inside metadata buffers. Generic
+Jobs, queues, senders, receivers, and discarders must still treat the buffer as
+opaque and must not interpret the handle.
+
 ### 0.4 No Runtime Allocation on Hot Paths
 
 All buffers, queue cells, batch storage, and transport frame buffers required
@@ -809,8 +818,8 @@ Two simple raw-buffer jobs exist for pipeline testing and performance calibratio
 
 - **BufferGeneratorJob:** acquires buffers from one `RawBufferPool`, fills them with a configured pattern, and pushes `BufferHandle` values to an output `BufQueue`. Supported patterns are `zero`, `fast_text`, and `xoshiro256`. `xoshiro256` is deterministic, fast, and intended to produce data that general-purpose compressors and dedupe systems should not reduce well when `compression_ratio` is `1.0`. Worker count, count limit, pattern, seed, and target compression ratio are configurable.
 - **BufferDiscarderJob:** pops `BufferHandle` values from an input `BufQueue`, looks up each pool through `BufferPoolRegistry`, and releases the buffer. It does not know or care whether the buffer is metadata, data, hash state, or future payload type.
-- **NfsDataBufferReaderJob:** reads `FileSpec` work from the current metadata adapter, fills preallocated `DataBuffer` slots through libnfs/local backend reads, and pushes buffer handles downstream. The output side follows the new raw-buffer contract. The input side is intentionally marked transitional until metadata records also move through `BufQueue`. The reader has an explicit copy mode: `copy` copies borrowed libnfs callback payloads into owned data buffers for any real downstream consumer, while `no-copy` keeps only length/offset metadata and exists only for reader-to-discarder performance isolation.
-- **DataHasherJob:** consumes data buffers or generic raw buffers, hashes the payload without copying it, records hot-path stats, and forwards the same buffer handle. For true `DataBuffer` payloads it also stamps a cheap chunk hash marker into the trailer for downstream diagnostics. `work_factor` repeats the selected per-buffer hash inside hasher workers for performance proofs; bytes are still counted once and buffer ownership semantics do not change.
+- **NfsDataBufferReaderJob:** reads `FileSpec` work from the current metadata adapter, fills preallocated `DataBuffer` slots through libnfs/local backend reads, and pushes buffer handles downstream. The output side follows the raw-buffer contract. The input side is intentionally marked transitional until metadata records also move through `BufQueue`. The reader has an explicit copy mode: `copy` copies borrowed libnfs callback payloads into owned data buffers for any real downstream consumer, while `no-copy` keeps only length/offset metadata and exists only for reader-to-discarder performance isolation. Small-file packing is supported as an explicit reader-owned fill mode so file bytes are copied only at the external backend boundary, never from one pipeline buffer into another. It remains configuration gated because the first libnfs multi-file async implementation measured slower than the raw one-file-per-buffer path on transfer1.
+- **DataHasherJob:** consumes data buffers or generic raw buffers, hashes the payload without copying it, records hot-path stats, and forwards the same buffer handle. For true `DataBuffer` payloads it also stamps a cheap chunk hash marker into the trailer for downstream diagnostics. Packed-small-file buffers are iterated in place and each embedded payload is hashed without repacking. `work_factor` repeats the selected per-buffer hash inside hasher workers for performance proofs; bytes are still counted once and buffer ownership semantics do not change.
 
 The metadata-only scanner path writes no file data and calculates no content
 hashes. Its output records include `scan_run_id`, `run_started_at_utc`,
@@ -1088,6 +1097,33 @@ enough workers and moderate synthetic CPU work did not reduce read throughput:
 the `xxh64` work-factor-4 run matched the reader-only ceiling while consuming
 more CPU. At excessive synthetic work, the shared host CPU/scheduler can still
 reduce the reader's achieved rate even though the queue handoff remains healthy.
+
+Additional 2026-05-15 reader baselines after the transfer1 rebuild:
+
+| Workload | Pipeline | Meta Threads | Data Threads | Outstanding Reads | Files | Bytes | Elapsed | Gbit/s | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Root mixed/large-file-biased | `NfsDataBufferReaderJob -> BufferDiscarderJob` | 64 | 32 | 16 | 15,614 read / 81,560 found | 1.87TB read | 120.1s | 124.7 | Early folders contained large files; data reader busy, output queue full, downstream discard not limiting. |
+| Small-file flat folder | `NfsDataBufferReaderJob -> BufferDiscarderJob` | 1 | 64 | 1 | 50,000 | 1.36GB | 3.18s | 3.41 | Folder `catbear/run_20260218_042836/talking-head`, average file size ~27KiB. |
+
+Small-file thread scaling on that folder:
+
+| Data Threads | Files/s | Gbit/s |
+|---:|---:|---:|
+| 32 | 9.9K | 2.15 |
+| 64 | 15.7K | 3.41 |
+| 96 | 15.9K | 3.45 |
+| 128 | 14.8K | 3.21 |
+| 192 | 7.2K | 1.56 |
+| 256 | 7.2K | 1.55 |
+
+Conclusion: small-file data read is dominated by per-file open/read/close
+sequencing. Per-file async read depth helps large files but not single-read
+small files. A configurable packed-small-file mode now keeps multiple small
+files open/read/close in flight per data-reader worker and fills pre-reserved
+owned `DataBuffer` entries directly from libnfs callbacks. It is not the default
+yet: the 2026-05-15 transfer1 test showed the raw one-file-per-buffer path still
+winning on the 50,000-file `talking-head` folder. Treat packed mode as a
+correctness-complete experimental path until its scheduling overhead is tuned.
 
 #### Buffer Generator Compression Ratio
 
@@ -1382,6 +1418,43 @@ At 100 Gbit/s WAN: 12.5 GB/s copy = ~6% of DDR5 bandwidth. Manageable in V1.
 - Pin NfsDataReader threads to cores local to NFS client NIC's NUMA node.
 - Pin DataCacher io_uring threads to cores local to NVMe drives' PCIe root complex.
 - Use `SO_INCOMING_CPU` or RFS (Receive Flow Steering) to ensure TCP receive processing happens on the same core that owns the receiving DataBuf slot.
+
+### 11.5 Transfer1 Network Runtime Profile
+
+For transfer1-class source workers, the network profile is part of the
+performance contract. If a VM is rebooted or replaced, reapply and verify this
+profile before trusting scan/read benchmarks. The helper script is
+`hypersync/deploy/tune-transfer1-network.sh`.
+
+The current validated profile for `ens3` on transfer1 is:
+
+| Setting | Required value | Reason |
+|---|---:|---|
+| MTU | `9000` | Reduces packet rate for 1 MiB NFS READ replies. |
+| RX/TX ring | `8192/8192` | Avoids small driver ring bottlenecks at high packet rates. |
+| RX coalescing | `adaptive-rx off`, `rx-usecs 12` | Predictable interrupt pacing. |
+| RPS CPUs | NUMA node0 mask `00000000,00000000,0000ffff,ffffffff,ffffffff` | Keeps receive work near the NIC. |
+| XPS CPUs | same NUMA node0 mask | Keeps transmit queue selection near the NIC. |
+| `rx-*/rps_flow_cnt` | `32768` per RX queue | Enables RFS flow tracking at high connection counts. |
+| `net.core.rps_sock_flow_entries` | `262144` | Global RFS flow table for 11 RX queues. |
+| TCPMSS mangle rules | `0` | Jumbo frames must not be clamped to 1460-byte MSS on NFS paths. |
+| `sunrpc.tcp_max_slot_table_entries` | `65536` | Matches high-concurrency NFS client profile. |
+| `sunrpc.tcp_slot_table_entries` | `65536` | Matches high-concurrency NFS client profile. |
+| NFS BDI read-ahead | `16384 KiB` | Keeps kernel-mounted NFS scan fallback aligned with high-throughput profile. |
+
+Hypersync data-reader benchmark commands that target the 200 Gbit/s class should
+also pin the process to NIC-local CPUs:
+
+```bash
+taskset -c 0-79 ./hypersync benchmark-data \
+  --data-reader-threads 64 \
+  --data-outstanding-requests 2
+```
+
+The node0-only RPS/XPS profile is intentionally different from the older
+all-host rsync profile. On this libnfs workload it benchmarked faster than
+all-CPU RPS/XPS, presumably because it avoids cross-NUMA traffic while still
+spreading packet processing beyond the 11 hardware queues.
 
 ---
 

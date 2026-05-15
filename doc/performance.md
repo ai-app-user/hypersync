@@ -340,6 +340,119 @@ Current conclusion: the NFS metadata reader is capable of the 5M records/s
 target, but DuckDB/parquet export is not yet keeping up. The main cost is in
 writer/export completion after the scan timer, not in libnfs metadata discovery.
 
+## Real NFS Data Read
+
+Transfer1 direct-libnfs data-read baselines on `2026-05-15`, using the deploy
+bundle at:
+
+```text
+/mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-diffpool-20260515T021459Z
+```
+
+Large/mixed source:
+
+```text
+nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+```
+
+Command shape:
+
+```text
+benchmark-data
+--meta-reader-threads 64
+--metadata-async-depth 256
+--data-reader-threads 32
+--data-outstanding-requests 16
+--max-files-queued 65536
+--data-buffer-slots 32768
+--data-queue-depth 16384
+--data-copy-mode copy
+--max-duration-seconds 120
+--stats-interval-seconds 10
+```
+
+Result:
+
+| Files Found | Folders Found | Files Read | Failed | Bytes Read | Elapsed | Gbit/s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 81,560 | 75,129 | 15,614 | 0 | 1.87TB | 120.1s | 124.7 |
+
+Small-file folder:
+
+```text
+nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/catbear/run_20260218_042836/talking-head
+```
+
+The folder contains 50,000 files with 1.36GB total logical size, about 27KiB per
+file. It was scanned non-recursively with one metadata reader and data
+`--data-outstanding-requests 1`.
+
+| Data Threads | Elapsed | Files/s | Gbit/s |
+|---:|---:|---:|---:|
+| 32 | 5.04s | 9.9K | 2.15 |
+| 64 | 3.18s | 15.7K | 3.41 |
+| 96 | 3.14s | 15.9K | 3.45 |
+| 128 | 3.37s | 14.8K | 3.21 |
+| 192 | 6.97s | 7.2K | 1.56 |
+| 256 | 6.99s | 7.2K | 1.55 |
+
+Follow-up implementation test, 2026-05-15 on transfer1
+`ubuntu@216.86.168.191`, same 50,000-file source folder. These runs used
+`--data-buffer-slots 4096` and `--data-queue-depth 2048`; an earlier 65,536
+data-slot command spent too long initializing an oversized 64GB data pool on the
+replacement host and was not a useful reader measurement.
+
+Raw one-file-per-buffer path, `--data-outstanding-requests 1`:
+
+| Data Threads | Elapsed | Files/s | Gbit/s |
+|---:|---:|---:|---:|
+| 64 | 2.56s | 19.5K | 4.24 |
+| 128 | 2.22s | 22.5K | 4.88 |
+| 256 | 3.04s | 16.5K | 3.57 |
+
+Experimental packed-small-file mode, `--pack-small-files`:
+
+| Data Threads | Small-File Window | Elapsed | Files/s | Gbit/s |
+|---:|---:|---:|---:|---:|
+| 64 | 1 | timed at 30s | 591/s completed | 0.13 |
+| 64 | 4 | 5.88s | 8.5K | 1.84 |
+| 64 | 16 | 5.59s | 8.9K | 1.94 |
+| 64 | 64 | 5.14s | 9.7K | 2.11 |
+| 64 | 128 | 5.00s | 10.0K | 2.17 |
+| 128 | 16 | 3.92s | 12.7K | 2.76 |
+| 256 | 16 | 2.83s | 17.7K | 3.83 |
+
+Additional larger-window sweep:
+
+| Data Threads | Small-File Window | Elapsed | Files/s | Gbit/s |
+|---:|---:|---:|---:|---:|
+| 16 | 256 | 19.60s | 2.6K | 0.55 |
+| 16 | 1024 | timed at 20s | 2.1K completed | 0.46 |
+| 32 | 256 | 12.80s | 3.9K | 0.85 |
+| 32 | 1024 | 11.89s | 4.2K | 0.91 |
+| 64 | 256 | 9.30s | 5.4K | 1.17 |
+| 128 | 256 | 5.84s | 8.6K | 1.86 |
+
+Conclusion: packed small-file buffers are functionally implemented and preserve
+generic buffer ownership, but this first libnfs multi-file async version is not
+yet the preferred small-file read path. The raw one-file-per-buffer path remains
+the default and the current best measurement for this folder. Packed mode should
+stay explicit until its libnfs scheduling/packing overhead is lower than raw.
+
+Async read latency instrumentation was added after the packed-mode regression
+was observed. Same transfer1 host and same 50,000-file source folder:
+
+| Mode | Data Threads | Window | Async Reads | Short Reads | Avg Completion | Avg Latency | Max Latency |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| raw | 128 | 1 | 49,991 | 0 | 27,103 B | 0.55 ms | 6.44 ms |
+| packed | 128 | 16 | 50,000 | 0 | 27,104 B | 14.45 ms | 308.76 ms |
+
+Conclusion from the latency counters: the server/libnfs path is not breaking
+28KB files into many 4KB reads in these runs. Each file completed as one async
+read on average, with no short reads. The packed path is slow because its
+multi-file flow causes much higher read completion latency and a long latency
+tail, not because the read buffer size is too small.
+
 ### 2026-05-15 Transfer1/Nopo1 Long Scan Calibration
 
 Purpose: verify that scanner-class metadata throughput is restored after
@@ -1007,5 +1120,519 @@ job/queue notes:
   previous deadlock signature disappeared: source/target queues drained and
     closed, and both processes exited without manual kill.
   target source_receiver accumulated about 3% wait_pool near tail only; it did
-    not block progress and all source buffers were received.
+  not block progress and all source buffers were received.
 ```
+
+NFS small-file data-read experiment, 2026-05-15, transfer1
+`ubuntu@216.86.168.191`, source folder
+`catbear/run_20260218_042836/talking-head`, 50,000 files,
+1,355,189,671 logical bytes, release build with libnfs:
+
+```text
+code/worktree:
+  staged at /mnt/local-nvme/wsync-codex/libnfs-sliding-20260515T052200Z
+
+change tested:
+  - service_nfs_context now drains immediately-ready libnfs socket events after
+    the blocking poll wakeup.
+  - added non-packed small-file sliding-window reader where each in-flight file
+    owns one data buffer and publishes immediately after completion.
+
+single data-reader thread:
+  old one-file-at-a-time path:
+    0.150 Gbit/s, avg read latency 0.538 ms, avg open latency 0.792 ms
+  sliding window 2:
+    0.031 Gbit/s, avg read latency 0.585 ms, avg open latency 6.22 ms
+  sliding window 4:
+    0.039 Gbit/s, avg read latency 5.18 ms, avg open latency 10.79 ms
+  sliding window 8:
+    0.044 Gbit/s, avg read latency 10.00 ms, avg open latency 21.64 ms
+  sliding window 16:
+    0.040 Gbit/s, avg read latency 27.43 ms, avg open latency 48.59 ms
+
+128 data-reader threads:
+  old one-file-at-a-time path:
+    4.217 Gbit/s, completed all 50,000 files in 2.57 s,
+    avg read latency 0.518 ms
+  sliding window 2:
+    3.792 Gbit/s, completed all 50,000 files in 2.86 s,
+    avg read latency 0.705 ms
+
+conclusion:
+  the packed/batch HoL issue was real and the sliding implementation removes
+  that architectural flaw, but this NFS server/context performs worse when a
+  single libnfs context carries concurrent small-file open/read/close state.
+  The fastest tested shape remains many independent reader workers/contexts
+  with one file in flight per context. Keep packed mode and same-context sliding
+  mode experimental until a raw READDIRPLUS/file-handle path or server-side
+  open behavior is improved.
+```
+
+Open-only benchmark, same transfer1 host and same 50,000-file folder. This mode
+does metadata scan -> file queue -> NFS open/close workers, with no data reads
+or data buffers:
+
+```text
+command shape:
+  benchmark-open --source <talking-head nfs url> --non-recursive \
+    --meta-reader-threads 1 --metadata-async-depth 16 \
+    --open-threads <n> --max-files-queued <4096|8192> \
+    --max-duration-seconds 20 --stats-interval-seconds 20
+
+open-only:
+  32 threads:   14,158 opens/s, avg open 0.946 ms
+  64 threads:   14,998 opens/s, avg open 1.000 ms
+  128 threads:  20,455 opens/s, avg open 1.205 ms
+  256 threads:  22,834 opens/s, avg open 1.189 ms
+  512 threads:   6,806 opens/s, 1 failed, avg open 1.200 ms
+  1024 threads:  3,556 opens/s, 488 failed, avg open 1.099 ms
+
+full open+read, same build:
+  128 threads: 2.81 Gbit/s, avg open 1.053 ms, avg read 1.633 ms
+  256 threads: 2.86 Gbit/s, avg open 1.136 ms, avg read 0.575 ms
+
+interpretation:
+  for this folder, average file size is about 27 KiB. Even 22,834 opens/s only
+  supplies about 5 Gbit/s of payload. That is far below the 200 Gbit/s NIC goal,
+  so small-file reads are open/operation-rate limited before they are bandwidth
+  limited. Splitting open and read can still help hide open latency for larger
+  files, but it cannot make this specific tiny-file workload reach 200 Gbit/s
+  unless we avoid per-file open cost with a lower-level file-handle path or
+  batch/pack files at the source.
+```
+
+Raw READDIRPLUS handle data-read experiment, 2026-05-15, transfer1
+`ubuntu@216.86.168.191`, same 50,000-file folder:
+
+```text
+standalone prototype, full file reads, no per-file ACCESS:
+  1 context:     0.22 Gbit/s
+  8 contexts:    1.71 Gbit/s
+  32 contexts:   6.53 Gbit/s
+  64 contexts:  10.91 Gbit/s
+  128 contexts: 14.56 Gbit/s
+  128 contexts, window 4: 14.66 Gbit/s
+  192 contexts: 12.11 Gbit/s
+  256+ contexts: worse, about 1.5-1.9 Gbit/s
+
+integrated benchmark-data pipeline after preserving READDIRPLUS handles in
+FileSpec and making NfsDataReader prefer raw READ by handle:
+  source nfs://nfs.crusoecloudcompute.com/.../talking-head
+    128 data-reader threads, copy:    3.75 Gbit/s
+  source nfs://172.27.255.18-33/.../talking-head
+    128 data-reader threads, copy:    4.31 Gbit/s
+    256 data-reader threads, copy:    2.60 Gbit/s
+    512 data-reader threads, copy:    1.68 Gbit/s, 338 failed files
+    128 data-reader threads, no-copy: 3.11 Gbit/s
+    256 data-reader threads, no-copy: 2.47 Gbit/s
+
+verification:
+  async_open_completed=0 and async_close_completed=0 in the integrated data
+  benchmark. All successful reads used raw NFSv3 READ against file handles from
+  READDIRPLUS.
+
+interpretation:
+  the raw file-handle path works and removes the high-level open/close tax. The
+  integrated benchmark is currently below the standalone prototype because the
+  scanner still opens each folder through the public libnfs directory path before
+  raw-listing it for handles, and the benchmark feeds readers through one shared
+  file queue. The next tuning target is therefore pipeline orchestration:
+  sharded file queues and native raw READDIRPLUS folder scanning, not the raw
+  NFS READ itself.
+```
+
+Raw-handle large/mixed window sweep, 2026-05-15, transfer1
+`ubuntu@216.86.168.191`, source
+`nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`,
+30 second runs, 64 metadata threads, metadata async depth 256, 128 data-reader
+threads, copy mode:
+
+```text
+window  Gbit/s   avg read latency   max latency   notes
+1       99.85    10.06 ms           269 ms        best in this sweep
+2       98.55    19.82 ms           1589 ms       same throughput, 2x latency
+4       94.45    43.52 ms           713 ms        worse, queued at server/backend
+8       95.90    85.26 ms           572 ms        worse, long queueing tail
+16      95.17    150.98 ms          1117 ms       worse, severe queueing
+```
+
+Conclusion: increasing `data_outstanding_requests` beyond 1 did not fill more
+network pipe on this source. It mostly created NFS/RPC queueing delay. The clean
+BDP-looking window-1 math was coincidental for this source mix: the backend
+appears to saturate around 95-105 Gbit/s for this client/source path before a
+per-context chunk window helps. Keep the default raw-handle large-file window at
+1 for now. Next scaling work should focus on independent endpoint/lane
+orchestration and sharded file queues rather than larger per-context windows.
+
+Sticky endpoint lane test, 2026-05-15, transfer1
+`ubuntu@216.86.168.191`, same 16-IP source and root-like mixed workload.
+Data-reader workers were assigned deterministic endpoint indexes instead of
+random endpoint selection: worker `i` uses expanded source endpoint
+`i % endpoint_count`.
+
+```text
+command shape:
+  benchmark-data --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 \
+    --meta-reader-threads 64 --metadata-async-depth 256 \
+    --data-reader-threads <n> --data-outstanding-requests 1 \
+    --max-files-queued 1048576 --data-buffer-slots <4096|8192> \
+    --data-queue-depth <4096|8192> --max-duration-seconds <30|60> \
+    --stats-interval-seconds <30|10>
+
+data_reader_threads  Gbit/s   avg read latency   notes
+128                  101.45   9.89 ms            all 16 endpoints active; async opens/closes 0
+256                   90.99   16.80 ms           worse; queueing latency increased
+512                   65.88   53.77 ms           worse; 2 failed reads and slow drain
+```
+
+Socket sampling during the 128-thread run showed active connections to every
+endpoint in `172.27.255.18-33`. Counts were not exactly 8 per IP because the
+metadata scanner still opens its own random libnfs sessions, but the data
+reader lane assignment is deterministic.
+
+Conclusion: sticky data-reader endpoint assignment makes the lane topology
+explicit and reproducible, but it does not move the observed wall beyond about
+100 Gbit/s on this source. Increasing context count beyond 128 still hurts, so
+the current best default remains 128 data readers, window 1. The next useful
+test is outside per-reader endpoint choice: NIC queue/IRQ layout, raw metadata
+scanner lane isolation, or independent client-side process/lane groups if we
+need to prove whether the wall is client orchestration or backend/fabric.
+
+RPS/XPS steering test, 2026-05-15, transfer1
+`ens3` is a 200 Gbit/s mlx5 device, but the cloud NIC exposes only 11 combined
+queues. The NIC is NUMA-local to node 0:
+
+```text
+lscpu:
+  CPUs: 160
+  NUMA node0: 0-79
+  NUMA node1: 80-159
+
+ethtool -l ens3:
+  Combined max/current: 11 / 11
+
+before:
+  rx rps_cpus: 00000000,00000000,00000000,00000000,00000000
+  rps_sock_flow_entries: 0
+```
+
+Two RPS/XPS masks were tested with the same sticky-lane 128-reader benchmark
+above, using fixed RX coalescing `rx-usecs=12`:
+
+```text
+mask                         Gbit/s hot window   final Gbit/s   avg read latency
+none / default               103.72 at 60s       101.45         9.89 ms
+NUMA node0 CPUs 0-79         111.54 at 60s       no clean exit  8.74 ms
+all CPUs 0-159               107.92 at 60s       106.74         9.40 ms
+```
+
+Node0 settings used:
+
+```text
+net.core.rps_sock_flow_entries=65536
+rx-*/rps_cpus=00000000,00000000,0000ffff,ffffffff,ffffffff
+rx-*/rps_flow_cnt=4096
+tx-*/xps_cpus=00000000,00000000,0000ffff,ffffffff,ffffffff
+ethtool -C ens3 adaptive-rx off rx-usecs 12
+```
+
+`NET_RX` counters showed activity on all CPUs during the RPS runs, but the
+hardware IRQ counters are still anchored to the 11 mlx5 completion queues. RPS
+helped, but did not unlock the second 100 Gbit/s. The best observed setting is
+the NUMA-local node0 mask; the all-CPU mask was slightly worse, likely from
+cross-NUMA traffic. Transfer1 was left with the node0 mask after the test.
+
+NUMA pinning and jumbo MTU test, 2026-05-15, transfer1
+Current MTU before testing was 1500. Jumbo frames were accepted on `ens3`, and a
+DF ping with 8972-byte payload to `172.27.255.18` succeeded. Benchmarks used the
+same RPS/XPS node0 settings above plus `taskset -c 0-79` to keep hypersync
+workers on the NIC-local NUMA node. MTU is now kept at 9000 for transfer1
+performance work.
+
+```text
+MTU   data readers  window  copy mode  Gbit/s hot/final  avg read latency  notes
+1500  128           1       copy       124.28 / 92.98    7.45 ms           final includes drain
+1500  256           1       copy       135.27 / 101.21   13.86 ms          faster hot, higher latency
+9000  128           1       copy       158.49 / 157.21   5.26 ms           zero failures
+9000  256           1       copy       184.46 / 183.62   11.28 ms          best stable copy run
+9000  320           1       copy       177.95 / 177.07   14.11 ms          worse than 256
+9000  384           1       copy       185.31 / 184.20   16.34 ms          similar throughput, worse latency
+9000  256           2       copy       189.85 / 188.96   17.34 ms          best observed throughput
+9000  256           3       copy       174.76 / 171.93   15.34 ms          worse
+9000  256           4       copy       182.15 / 180.10   32.20 ms          worse queueing
+9000  256           2       no-copy    182.74 / 181.10   21.06 ms          no-copy did not help
+```
+
+Conclusion: jumbo MTU is the largest networking lever observed so far. It moved
+the best run from about 124-135 Gbit/s hot-window with MTU 1500 to about
+189 Gbit/s with MTU 9000. The best setting in this sweep was MTU 9000,
+NUMA-node0 RPS/XPS, `taskset -c 0-79`, 256 data readers, and
+`data_outstanding_requests=2`. Going wider than 256 readers or deeper than
+window 2 did not reach 200 Gbit/s and mostly increased latency. No-copy did not
+improve throughput, so the remaining wall is not primarily the application
+buffer copy in this benchmark.
+
+Transfer1 optimized runtime profile, 2026-05-15
+After comparing against the older high-throughput host settings, transfer1 was
+updated and verified with this profile:
+
+```text
+host: ice1-transfer-001
+interface: ens3 / mlx5_core
+CPUs: 160
+NIC NUMA node: 0, local CPUs 0-79
+MTU: 9000
+PMTU to NFS private endpoint 172.27.255.18: OK
+RX/TX queues: 11/11
+combined channels: 11/11 max/current
+RX/TX ring: 8192/8192
+irqbalance: inactive
+RPS CPUs: 80/160, CPUs 0-79
+RPS mask: 00000000,00000000,0000ffff,ffffffff,ffffffff
+RPS flow cnt / RX queue: 32768
+XPS CPUs: 80/160, CPUs 0-79
+XPS mask: 00000000,00000000,0000ffff,ffffffff,ffffffff
+net.core.rps_sock_flow_entries: 262144
+net.core.rmem_max: 2147483647
+net.core.wmem_max: 2147483647
+net.ipv4.tcp_rmem: 4096 1048576 2147483647
+net.ipv4.tcp_wmem: 4096 1048576 2147483647
+TCP congestion control: bbr
+Default qdisc: fq
+tcp_mtu_probing: 1
+TCPMSS mangle rules: 0
+sunrpc.tcp_max_slot_table_entries: 65536
+sunrpc.tcp_slot_table_entries: 65536
+NFS mount: /mnt/crusoe-src
+NFS mode: ro
+NFS nconnect: 32
+NFS rsize/wsize: 1048576/1048576
+NFS flags: noatime,nodiratime,acregmax=600,acdirmax=600,spread_reads
+NFS BDI read-ahead: 16384 KiB
+```
+
+The runtime profile can be reapplied with:
+
+```bash
+hypersync/deploy/tune-transfer1-network.sh ens3
+```
+
+The recommended benchmark shape for the data-reader path on this profile is:
+
+```bash
+taskset -c 0-79 ./build/release/hypersync benchmark-data \
+  --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 \
+  --meta-reader-threads 64 --metadata-async-depth 256 \
+  --data-reader-threads 256 --data-outstanding-requests 2 \
+  --max-files-queued 1048576 --data-buffer-slots 12288 --data-queue-depth 12288
+```
+
+Optimized profile retest, 2026-05-15
+After applying the full optimized runtime profile permanently on transfer1
+(MTU 9000, rings 8192/8192, RPS flow table 262144, per-queue flow count 32768,
+TCPMSS rules removed, sunrpc max slots 65536, BDI read-ahead 16384 KiB), the
+same benchmark was rerun with lower data-reader counts and different per-reader
+async windows. All runs used `taskset -c 0-79`, 64 metadata threads, metadata
+async depth 256, and 30 second duration unless noted.
+
+```text
+data readers  window  final Gbit/s  avg read latency  failures  notes
+64            1       192.09        2.58 ms           0         lowest latency near line rate
+96            1       194.32        3.57 ms           0         best 30s final throughput
+128           1       193.85        4.65 ms           0         similar throughput, more latency
+192           1       191.69        7.99 ms           0         no throughput gain
+256           1       192.06        10.60 ms          0         no throughput gain
+64            2       194.18        5.25 ms           0         best low-thread windowed 30s run
+96            2       193.08        7.88 ms           0         no gain over 96/window 1
+128           2       191.99        8.94 ms           0         no gain
+192           2       190.24        15.85 ms          0         too much queueing
+256           2       187.22        20.94 ms          0         too much queueing
+128           3       191.10        15.46 ms          0         too much queueing
+192           3       192.24        22.79 ms          0         too much queueing
+```
+
+Longer 90 second confirmation:
+
+```text
+data readers  window  final Gbit/s  90s hot Gbit/s  avg read latency  failures
+96            1       180.82        182.57          4.23 ms           0
+64            2       190.97        191.96          5.24 ms           0
+```
+
+Conclusion: after the full host tuning, the system reaches the 190-195 Gbit/s
+class with far fewer data-reader workers than before. The best sustained
+low-resource shape is now 64 data readers with `data_outstanding_requests=2`.
+The 96-reader/window-1 shape is attractive for lowest latency and strong short
+runs, but it settled lower in the 90 second confirmation. Increasing readers
+beyond 128 or increasing async window beyond 2 mostly raises queueing latency
+without improving throughput.
+
+Current recommended data-reader benchmark shape:
+
+```bash
+taskset -c 0-79 ./build/release/hypersync benchmark-data \
+  --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 \
+  --meta-reader-threads 64 --metadata-async-depth 256 \
+  --data-reader-threads 64 --data-outstanding-requests 2 \
+  --max-files-queued 1048576 --data-buffer-slots 12288 --data-queue-depth 12288
+```
+
+Low-reader-count sweep, 2026-05-15
+Same optimized transfer1 runtime profile and benchmark shape, with only the
+data-reader worker count and async window changed:
+
+```text
+data readers  window  final Gbit/s  avg read latency  failures
+4             1       28.53         1.08 ms           0
+4             2       19.54         3.02 ms           0
+8             1       93.62         0.64 ms           0
+8             2       64.50         1.77 ms           0
+16            1       42.71         2.98 ms           0
+16            2       37.27         5.47 ms           0
+32            1       65.40         3.91 ms           0
+32            2       106.52        3.83 ms           0
+```
+
+These short runs are more sensitive to which source folders are sampled than the
+64+ reader sweeps, but they still show the shape clearly: below 64 readers the
+pipeline does not reliably fill the 200 Gbit/s NIC. A deeper per-reader window
+does not compensate consistently at very low reader counts; the reliable
+settings remain 64 readers/window 2 or 96 readers/window 1 depending on whether
+we prefer sustained throughput or slightly lower latency.
+
+Small-file-only data-read sweep, 2026-05-15
+Source folder:
+`nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/catbear/run_20260218_042836/talking-head`
+with 50,000 files and 1,355,189,671 bytes total, average file size about
+27 KiB. Runs used the optimized transfer1 profile, `taskset -c 0-79`,
+non-recursive scan, one metadata thread, and metadata async depth 16.
+
+```text
+data readers  window  elapsed s  files/s  Gbit/s  avg read latency  opens
+32            1       14.49      3,451    0.75    4.58 ms           0
+64            1       10.76      4,648    1.01    2.58 ms           0
+96            1        8.07      6,199    1.34    1.96 ms           0
+128           1       10.04      4,980    1.08    2.02 ms           0
+64            2       15.65      3,194    0.69    2.13 ms           50,000
+96            2       10.51      4,759    1.03    1.60 ms           50,000
+128           2        9.93      5,036    1.09    2.24 ms           50,000
+128           4       10.40      4,810    1.04    5.20 ms           50,000
+```
+
+Interpretation: the best current small-file result is 96 readers/window 1,
+about 6.2K files/s and 1.34 Gbit/s. This remains operation-rate limited, not
+bandwidth limited. A critical implementation detail is visible in the telemetry:
+window 1 used the raw READDIRPLUS handle path with zero async opens/closes, while
+windowed small-file modes currently go through the high-level open/read/close
+path and perform 50,000 opens. Before drawing conclusions about async windows
+for small files, the windowed small-file path should be refactored to use the raw
+NFSv3 file handles as well.
+
+Small-file raw-window integration update, 2026-05-15
+Changes tested on transfer1:
+
+- Windowed small-file reads now use `FileSpec::nfs_handle` and raw
+  `rpc_nfs_read_async`; the high-level open/read/close path is fallback only.
+- Packed-small-file reads now also use raw handles when available, so packed
+  batches avoid per-file open/close.
+- The benchmark file provider refills a thread-local batch of 128 `FileSpec`
+  records from the shared queue to reduce shared-queue mutex pressure.
+
+Same source folder and host tuning as above. These runs confirm the raw path is
+used in all tested modes:
+
+```text
+mode        meta threads  data readers  window  elapsed s  files/s  Gbit/s  avg read latency  opens
+raw         1             96            1        4.53       11,047   2.40    2.85 ms           0
+raw         1             96            2        5.03        9,949   2.16    6.06 ms           0
+raw         1             128           2        4.45       11,226   2.43    5.52 ms           0
+raw         1             96            4        7.46        6,702   1.45    8.84 ms           0
+packed      1             96            1        4.70       10,641   2.31    0.97 ms           0
+packed      1             128           1        5.44        9,191   1.99    1.01 ms           0
+packed      1             128           2        8.05        6,209   1.35    4.40 ms           0
+raw         4             96            1        4.88       10,237   2.22    1.01 ms           0
+raw         4             128           1        5.94        8,411   1.82    1.03 ms           0
+packed      4             96            1        6.16        8,118   1.76    1.14 ms           0
+packed      4             128           1        5.86        8,529   1.85    1.08 ms           0
+```
+
+A 1 second stats-interval run showed the real remaining integration bottleneck:
+for this huge flat folder, the data reader stayed idle for about four seconds
+while metadata discovery built the full 50,000-entry `FlatFolderScanBatch`.
+Only after that did `files_found` jump to 50,000 and data reads begin. At that
+point 25,945 files and 689,725,162 bytes were read in the next one-second
+sample, with a 1.01 ms average raw READ latency and zero opens.
+
+Conclusion: raw small-file data reads are now correctly zero-open, but the
+scanner still emits a whole flat folder as one batch. Very large flat folders
+therefore create a start-up bubble that dominates short small-file benchmarks.
+The next required fix is to make metadata scanning stream partial READDIRPLUS
+pages downstream for data-read/hash/sync pipelines, while preserving whole-folder
+batches for diff/checker modes that require complete flat-folder comparison.
+
+Streaming READDIRPLUS page tests, 2026-05-15
+The data-read benchmark now uses `scan_flat_folders_streaming`, which emits
+READDIRPLUS page batches with `complete=false` and sends a final EOF batch with
+`complete=true`. Diff/checker paths continue to use complete flat-folder batches.
+The page size is configurable through `jobs.nfs_meta_reader.readdirplus_page_bytes`
+and, for `benchmark-data`, `--readdirplus-page-bytes`; benchmark output records
+the effective `readdirplus_page_bytes` value.
+
+Same 50,000-file source, 96 data readers, window 1, one metadata reader:
+
+```text
+READDIRPLUS page  elapsed s  files/s  Gbit/s  startup/feed behavior
+512 KiB           2.26       22,136   4.80    first page effectively held most/all folder records
+256 KiB           2.08       24,049   5.21    best total time; active second read 49,441 files
+128 KiB           4.72       10,599   2.30    progressive feed, but too many metadata RPCs
+64 KiB            5.10        9,807   2.13    progressive feed, too chatty
+```
+
+With the selected 256 KiB page size, the second one-second sample had already
+read 49,441 files and 1,339,397,703 bytes, with zero opens/closes and 1.08 ms
+average raw READ latency. The remaining blended gap versus active throughput is
+mostly the first READDIRPLUS-page startup and the fact that this specific folder
+contains only 1.36 GB of data, so startup cost dominates the full run average.
+
+Sustained small-file-only read, 2026-05-15
+Source:
+`nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+with recursive scan and `--max-file-size-bytes 131072`, so only files at or
+below 128 KiB were enqueued to the data reader. Settings:
+
+```text
+meta_reader_threads=64
+metadata_async_depth=256
+readdirplus_page_bytes=262144
+data_reader_threads=96
+data_outstanding_requests=1
+small_file_async_window=1
+max_files_queued=1048576
+data_buffer_slots=12288
+data_queue_depth=12288
+taskset=0-79
+```
+
+Selected telemetry:
+
+```text
+elapsed  files_read  files/s avg from start  bytes_read     Gbit/s avg  avg read latency  queued_files
+30s      1,447,462   48,248                  77.4 GB        20.65       1.89 ms           1,048,576
+60s      3,062,320   51,038                  193.1 GB       25.74       1.79 ms           1,048,576
+90s      4,655,014   51,722                  285.1 GB       25.34       1.76 ms           1,048,576
+120s     6,330,945   52,757                  355.0 GB       23.67       1.72 ms           1,048,576
+180s     8,651,015   48,061                  438.0 GB       19.47       1.89 ms           0
+```
+
+Middle sustained rate from 30s to 120s:
+
+```text
+4,883,483 files / 90s = 54,261 files/s
+277.6 GB / 90s = 24.68 Gbit/s
+```
+
+Telemetry stayed zero-open/zero-close throughout. The file queue remained full
+from 30s through 170s, so this was no longer metadata starvation; during the
+middle of the run, the data reader/libnfs/backend path was the limiter. The last
+minute tailed down as the timer stopped new metadata work and the queued small
+files drained.

@@ -20,6 +20,7 @@ struct NfsMetaReaderConfig {
     std::size_t worker_count;
     std::size_t thread_count;
     std::size_t async_directory_depth;
+    std::size_t readdirplus_page_bytes;
     std::size_t recbuf_window;
     std::size_t streaming_mode_threshold;
     bool async_readdir;
@@ -33,7 +34,8 @@ struct NfsMetaReaderConfig {
                         bool async_readdir,
                         std::string source_root,
                         bool recursive,
-                        std::size_t async_directory_depth = 1);
+                        std::size_t async_directory_depth = 1,
+                        std::size_t readdirplus_page_bytes = 256U * 1024U);
 };
 
 [[nodiscard]] NfsMetaReaderConfig load_nfs_meta_reader_config(const ConfigStore& config);

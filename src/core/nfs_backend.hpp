@@ -3,7 +3,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -16,6 +18,8 @@
 
 namespace hypersync {
 
+constexpr std::size_t kNfsEndpointAny = std::numeric_limits<std::size_t>::max();
+
 bool is_nfs_url(std::string_view path);
 bool libnfs_support_enabled();
 [[nodiscard]] std::vector<std::string> expand_nfs_url_server_candidates(std::string_view root_url);
@@ -26,6 +30,7 @@ struct FlatFolderScanBatch {
     std::vector<FileSpec> directories;
     std::uint64_t scan_started_unix_ns = 0;
     std::uint64_t scan_finished_unix_ns = 0;
+    bool complete = true;
     bool failed = false;
     std::string error;
 };
@@ -44,6 +49,47 @@ struct RawFileChunk {
     std::uint64_t offset = 0;
     BufferHandle handle;
 };
+
+struct RawSmallFileRead {
+    FileSpec file;
+    BufferHandle handle;
+    std::uint64_t bytes_read = 0;
+};
+
+struct PackedSmallFilesReadStats {
+    std::uint64_t files_read = 0;
+    std::uint64_t files_failed = 0;
+    std::uint64_t buffers_published = 0;
+    std::uint64_t bytes_read = 0;
+};
+
+struct NfsAsyncReadLatencySnapshot {
+    std::uint64_t queued = 0;
+    std::uint64_t completed = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t zero_reads = 0;
+    std::uint64_t short_reads = 0;
+    std::uint64_t bytes_requested = 0;
+    std::uint64_t bytes_completed = 0;
+    std::uint64_t latency_ns = 0;
+    std::uint64_t max_latency_ns = 0;
+    std::array<std::uint64_t, 8> latency_buckets {};
+};
+
+struct NfsAsyncCommandLatencySnapshot {
+    std::uint64_t open_completed = 0;
+    std::uint64_t open_failed = 0;
+    std::uint64_t open_latency_ns = 0;
+    std::uint64_t open_max_latency_ns = 0;
+    std::uint64_t close_completed = 0;
+    std::uint64_t close_failed = 0;
+    std::uint64_t close_latency_ns = 0;
+    std::uint64_t close_max_latency_ns = 0;
+};
+
+void reset_nfs_async_read_latency_metrics();
+[[nodiscard]] NfsAsyncReadLatencySnapshot snapshot_nfs_async_read_latency_metrics();
+[[nodiscard]] NfsAsyncCommandLatencySnapshot snapshot_nfs_async_command_latency_metrics();
 
 class NfsBackend {
 public:
@@ -67,6 +113,11 @@ public:
         const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
         const std::function<bool()>& should_stop,
         const std::function<void(FlatFolderScanBatch)>& folder_visitor) const;
+    virtual void scan_flat_folders_streaming(
+        std::size_t outstanding_folders,
+        const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
+        const std::function<bool()>& should_stop,
+        const std::function<void(FlatFolderScanBatch)>& folder_visitor) const;
     [[nodiscard]] virtual FileSpec load_file(std::string_view rel_path) const = 0;
     [[nodiscard]] virtual FileSpec load_file(std::string_view rel_path, std::size_t outstanding_requests) const;
     [[nodiscard]] virtual std::uint64_t read_file_discard(std::string_view rel_path,
@@ -82,6 +133,23 @@ public:
         std::uint64_t declared_size,
         std::size_t outstanding_requests,
         const std::function<void(std::string_view)>& data_visitor) const;
+    [[nodiscard]] virtual std::uint64_t read_file_into(std::string_view rel_path,
+                                                       std::uint64_t declared_size,
+                                                       std::byte* destination,
+                                                       std::size_t destination_bytes) const;
+    virtual void open_close_file(std::string_view rel_path) const;
+    [[nodiscard]] virtual PackedSmallFilesReadStats read_small_files_packed(
+        const std::function<std::optional<FileSpec>()>& file_provider,
+        RawBufferPool& pool,
+        std::size_t max_in_flight_files,
+        const std::function<void(BufferHandle, std::uint64_t, std::uint64_t)>& buffer_visitor,
+        const std::function<bool()>& should_stop = {}) const;
+    [[nodiscard]] virtual PackedSmallFilesReadStats read_small_files_raw_window(
+        const std::function<std::optional<FileSpec>()>& file_provider,
+        RawBufferPool& pool,
+        std::size_t max_in_flight_files,
+        const std::function<void(RawSmallFileRead&&)>& file_visitor,
+        const std::function<bool()>& should_stop = {}) const;
     [[nodiscard]] virtual std::uint64_t read_file_owned_chunks(
         std::string_view rel_path,
         std::uint64_t declared_size,
@@ -96,6 +164,13 @@ public:
     [[nodiscard]] virtual std::uint64_t read_file_raw_chunks(
         std::string_view rel_path,
         std::uint64_t declared_size,
+        std::size_t outstanding_requests,
+        RawBufferPool& pool,
+        const std::function<void(RawFileChunk&&)>& data_visitor,
+        const std::function<bool()>& should_stop = {},
+        bool copy_payload_to_buffer = true) const;
+    [[nodiscard]] virtual std::uint64_t read_file_raw_chunks_by_handle(
+        const FileSpec& file,
         std::size_t outstanding_requests,
         RawBufferPool& pool,
         const std::function<void(RawFileChunk&&)>& data_visitor,
@@ -128,7 +203,10 @@ public:
     [[nodiscard]] virtual bool uses_async_api() const = 0;
 };
 
-[[nodiscard]] std::unique_ptr<NfsBackend> make_nfs_backend(std::string root);
+[[nodiscard]] std::unique_ptr<NfsBackend> make_nfs_backend(
+    std::string root,
+    std::size_t endpoint_index = kNfsEndpointAny,
+    std::size_t readdirplus_page_bytes = 0);
 [[nodiscard]] std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root);
 
 }  // namespace hypersync

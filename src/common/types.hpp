@@ -178,6 +178,9 @@ struct FileSpec {
     std::uint64_t hash_block_count = 0;
     std::string block_hash_algorithm;
     std::string block_hashes;
+    // Opaque NFSv3 file handle captured from READDIRPLUS. It is only
+    // interpreted by the libnfs backend; other jobs treat it as metadata.
+    std::vector<std::uint8_t> nfs_handle;
 };
 
 struct FileSnapshot {

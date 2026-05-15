@@ -86,15 +86,23 @@ Current state:
 - Data reading and hash calculation run as separate pipeline stages: the reader emits data-buffer records and the hasher owns hash state, ordering, and finalization.
 - Hash worker threads and hash queue depth are independently configurable.
 - A first-pass threaded data hasher job exists that consumes preallocated buffer handles, hashes payload bytes without copying, forwards the same handles downstream, and records per-job throughput stats.
+- Packed small-file `DataBuffer` payloads are defined in the shared core codec, and `DataHasherJob` hashes each embedded payload in place without repacking or allocating.
+- `NfsDataBufferReaderJob` can fill packed small-file buffers directly as an owned-buffer mode so downstream jobs receive normal generic buffer handles.
 - A data-read plus hash benchmark pipeline exists for testing NFS data reader, data hasher, and discard stages together with independently configurable reader and hash concurrency.
 - The data-read plus hash benchmark supports cooperative timer stop: metadata stops accepting new work, data readers stop queueing new async reads, already in-flight reads are drained safely, and final stats are printed.
 - Full-file MD5, SHA-256, XXH64, XXH3-64, and XXH3-128 hashes are calculated by feeding file bytes to the algorithm in exact file-offset order.
 - Block mode emits independent block hashes and does not claim that the joined block-hash list equals a standard whole-file hash.
+- Large-file data reads use multiple async libnfs read requests per reader worker.
+- Small-file packed-buffer mode has a configurable multi-file async libnfs
+  window per reader worker, but it remains experimental because the first
+  transfer1 measurement was slower than the proven one-file-per-buffer raw path.
 
 Remaining:
 - Define hash cache format and invalidation rules.
 - Support scanner metadata output as input.
 - Add periodic hash progress stats.
+- Tune or replace packed small-file read mode until it beats the raw
+  one-file-per-buffer path for small-file-heavy workloads.
 
 ### NFS Generator
 

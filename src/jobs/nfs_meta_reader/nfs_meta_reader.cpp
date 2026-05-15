@@ -15,10 +15,12 @@ NfsMetaReaderConfig::NfsMetaReaderConfig(std::size_t worker_count,
                                          bool async_readdir,
                                          std::string source_root,
                                          bool recursive,
-                                         std::size_t async_directory_depth)
+                                         std::size_t async_directory_depth,
+                                         std::size_t readdirplus_page_bytes)
     : worker_count(worker_count),
       thread_count(worker_count),
       async_directory_depth(async_directory_depth),
+      readdirplus_page_bytes(readdirplus_page_bytes),
       recbuf_window(recbuf_window),
       streaming_mode_threshold(streaming_mode_threshold),
       async_readdir(async_readdir),
@@ -30,19 +32,21 @@ NfsMetaReaderConfig load_nfs_meta_reader_config(const ConfigStore& config) {
     const std::size_t worker_count =
         config_size_t_or(values, "worker_count", config_size_t_or(values, "thread_count", 8));
     const std::size_t async_directory_depth = config_size_t_or(values, "async_directory_depth", 1);
+    const std::size_t readdirplus_page_bytes = config_size_t_or(values, "readdirplus_page_bytes", 256U * 1024U);
     return NfsMetaReaderConfig(worker_count,
                                config_size_t(values, "recbuf_window"),
                                config_size_t(values, "streaming_mode_threshold"),
                                config_bool(values, "async_readdir"),
                                config_string(values, "source_root"),
                                config_bool(values, "recursive"),
-                               async_directory_depth);
+                               async_directory_depth,
+                               readdirplus_page_bytes);
 }
 
 NfsMetaReader::NfsMetaReader(NfsMetaReaderConfig config)
     : TypedQueueJob("nfs_meta_reader", message_kinds::file_record),
       config_(std::move(config)),
-      backend_(make_nfs_backend(config_.source_root)) {}
+      backend_(make_nfs_backend(config_.source_root, kNfsEndpointAny, config_.readdirplus_page_bytes)) {}
 
 NfsMetaReader::~NfsMetaReader() = default;
 

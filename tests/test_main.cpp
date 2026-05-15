@@ -1497,6 +1497,76 @@ void test_data_hasher_hashes_and_forwards_raw_buffers() {
     EXPECT_EQ(pool.available(), pool.capacity());
 }
 
+void test_packed_small_file_data_buffers_hash_without_repacking() {
+    RawBufferPool pool = hypersync::make_data_buffer_pool(2U);
+    BufQueue reader_to_hasher(2U);
+    BufQueue hasher_to_discarder(2U);
+    BufferPoolRegistry registry;
+    registry.register_pool(pool);
+
+    std::optional<BufferHandle> acquired = pool.try_acquire();
+    EXPECT_TRUE(acquired.has_value());
+    hypersync::DataBuffer& buffer = hypersync::data_buffer(pool, *acquired);
+    hypersync::reset_packed_small_file_buffer(buffer);
+
+    hypersync::PackedSmallFileMeta alpha;
+    alpha.file_id = 11U;
+    alpha.folder_hash = 22U;
+    alpha.file_size = 3U;
+    alpha.mtime = 100U;
+    alpha.mode = 0644U;
+    alpha.uid = 1U;
+    alpha.gid = 2U;
+    alpha.rel_path = "folder/alpha.txt";
+    EXPECT_TRUE(hypersync::append_packed_small_file(buffer, alpha, "abc"));
+
+    hypersync::PackedSmallFileMeta beta;
+    beta.file_id = 33U;
+    beta.folder_hash = 22U;
+    beta.file_size = 6U;
+    beta.mtime = 101U;
+    beta.mode = 0600U;
+    beta.uid = 3U;
+    beta.gid = 4U;
+    beta.rel_path = "folder/beta.bin";
+    EXPECT_TRUE(hypersync::append_packed_small_file(buffer, beta, "012345"));
+
+    EXPECT_TRUE(hypersync::is_packed_small_file_buffer(buffer));
+    EXPECT_EQ(hypersync::packed_small_file_count(buffer), 2U);
+    EXPECT_EQ(hypersync::packed_small_file_payload_bytes(buffer), 9U);
+
+    std::vector<std::string> paths;
+    std::vector<std::string> payloads;
+    const bool visited = hypersync::visit_packed_small_files(buffer, [&](const hypersync::PackedSmallFileView& file) {
+        paths.emplace_back(file.rel_path);
+        payloads.emplace_back(file.data);
+    });
+    EXPECT_TRUE(visited);
+    EXPECT_EQ(paths.size(), 2U);
+    EXPECT_EQ(paths[0], std::string("folder/alpha.txt"));
+    EXPECT_EQ(paths[1], std::string("folder/beta.bin"));
+    EXPECT_EQ(payloads[0], std::string("abc"));
+    EXPECT_EQ(payloads[1], std::string("012345"));
+
+    DataHasherJob hasher(
+        DataHasherConfig(1U, hypersync::ContentHashAlgorithm::xxh3_64), reader_to_hasher, hasher_to_discarder, registry);
+    BufferDiscarderJob discarder(BufferDiscarderConfig(1U), hasher_to_discarder, registry);
+
+    discarder.start();
+    hasher.start();
+    EXPECT_TRUE(reader_to_hasher.push_wait(*acquired));
+    reader_to_hasher.close();
+    hasher.wait();
+    discarder.wait();
+
+    EXPECT_EQ(hasher.stats().buffers_hashed, 1U);
+    EXPECT_EQ(hasher.stats().bytes_hashed, 9U);
+    EXPECT_TRUE((buffer.trailer.flags & hypersync::kFlagHashValid) != 0U);
+    EXPECT_TRUE(hasher.stats().digest_marker != 0U);
+    EXPECT_EQ(discarder.stats().buffers_discarded, 1U);
+    EXPECT_EQ(pool.in_use(), 0U);
+}
+
 void test_nfs_data_buffer_reader_feeds_hasher_pipeline() {
     TempDir source("hypersync_nfs_data_buffer_reader");
     write_file(source.path / "alpha.bin", "abcdef");
@@ -1519,7 +1589,7 @@ void test_nfs_data_buffer_reader_feeds_hasher_pipeline() {
     BufferPoolRegistry registry;
     registry.register_pool(pool);
 
-    hypersync::NfsDataReaderConfig reader_config(2U, 2U, 1U, 4U, hypersync::kLargeChunkBytes, 85.0, 70.0, source.path.string());
+    hypersync::NfsDataReaderConfig reader_config(2U, 2U, 0U, 1U, 4U, hypersync::kLargeChunkBytes, 85.0, 70.0, source.path.string());
     NfsDataBufferReaderJob reader(reader_config,
                                   pool,
                                   reader_to_hasher,
@@ -1546,6 +1616,119 @@ void test_nfs_data_buffer_reader_feeds_hasher_pipeline() {
     EXPECT_EQ(reader.stats().bytes_read, 16U);
     EXPECT_EQ(hasher.stats().bytes_hashed, 16U);
     EXPECT_EQ(discarder.stats().buffers_discarded, 2U);
+    EXPECT_EQ(pool.in_use(), 0U);
+    EXPECT_EQ(pool.available(), pool.capacity());
+}
+
+void test_nfs_data_buffer_reader_packs_small_files_into_owned_buffer() {
+    TempDir source("hypersync_nfs_data_buffer_reader_pack");
+    write_file(source.path / "one.txt", "111");
+    write_file(source.path / "two.txt", "2222");
+    write_file(source.path / "three.txt", "33333");
+
+    std::vector<FileSpec> files;
+    files.emplace_back("one.txt", "", 1, 0644, 0, 0, true, 3);
+    files.emplace_back("two.txt", "", 2, 0644, 0, 0, true, 4);
+    files.emplace_back("three.txt", "", 3, 0644, 0, 0, true, 5);
+
+    std::atomic<std::size_t> next_file {0};
+    RawBufferPool pool = hypersync::make_data_buffer_pool(4U);
+    BufQueue reader_to_discarder(4U);
+    BufferPoolRegistry registry;
+    registry.register_pool(pool);
+
+    hypersync::NfsDataReaderConfig reader_config(1U, 1U, 0U, 1U, hypersync::kSmallFileThreshold,
+                                                 hypersync::kLargeChunkBytes, 85.0, 70.0, source.path.string());
+    reader_config.pack_small_files = true;
+    NfsDataBufferReaderJob reader(reader_config,
+                                  pool,
+                                  reader_to_discarder,
+                                  [&files, &next_file]() -> std::optional<FileSpec> {
+                                      const std::size_t index = next_file.fetch_add(1U);
+                                      if (index >= files.size()) {
+                                          return std::nullopt;
+                                      }
+                                      return files[index];
+                                  });
+
+    reader.start();
+    reader.wait();
+
+    BufferHandle handle;
+    EXPECT_TRUE(reader_to_discarder.try_pop(handle));
+    EXPECT_FALSE(reader_to_discarder.try_pop(handle));
+    hypersync::DataBuffer& buffer = hypersync::data_buffer(pool, handle);
+    EXPECT_TRUE(hypersync::is_packed_small_file_buffer(buffer));
+    EXPECT_EQ(hypersync::packed_small_file_count(buffer), 3U);
+    EXPECT_EQ(hypersync::packed_small_file_payload_bytes(buffer), 12U);
+    EXPECT_EQ(reader.stats().files_read, 3U);
+    EXPECT_EQ(reader.stats().bytes_read, 12U);
+
+    std::vector<std::string> paths;
+    const bool visited = hypersync::visit_packed_small_files(buffer, [&](const hypersync::PackedSmallFileView& file) {
+        paths.emplace_back(file.rel_path);
+    });
+    EXPECT_TRUE(visited);
+    EXPECT_EQ(paths.size(), 3U);
+    EXPECT_EQ(paths[0], std::string("one.txt"));
+    EXPECT_EQ(paths[1], std::string("two.txt"));
+    EXPECT_EQ(paths[2], std::string("three.txt"));
+
+    pool.release(handle);
+    EXPECT_EQ(pool.in_use(), 0U);
+    EXPECT_EQ(pool.available(), pool.capacity());
+}
+
+void test_nfs_data_buffer_reader_slides_small_files_without_packing() {
+    TempDir source("hypersync_nfs_data_buffer_reader_raw_window");
+    write_file(source.path / "one.txt", "111");
+    write_file(source.path / "two.txt", "2222");
+    write_file(source.path / "three.txt", "33333");
+
+    std::vector<FileSpec> files;
+    files.emplace_back("one.txt", "", 1, 0644, 0, 0, true, 3);
+    files.emplace_back("two.txt", "", 2, 0644, 0, 0, true, 4);
+    files.emplace_back("three.txt", "", 3, 0644, 0, 0, true, 5);
+
+    std::atomic<std::size_t> next_file {0};
+    RawBufferPool pool = hypersync::make_data_buffer_pool(8U);
+    BufQueue reader_to_discarder(8U);
+
+    hypersync::NfsDataReaderConfig reader_config(1U, 1U, 2U, 1U, hypersync::kSmallFileThreshold,
+                                                 hypersync::kLargeChunkBytes, 85.0, 70.0, source.path.string());
+    reader_config.pack_small_files = false;
+    NfsDataBufferReaderJob reader(reader_config,
+                                  pool,
+                                  reader_to_discarder,
+                                  [&files, &next_file]() -> std::optional<FileSpec> {
+                                      const std::size_t index = next_file.fetch_add(1U);
+                                      if (index >= files.size()) {
+                                          return std::nullopt;
+                                      }
+                                      return files[index];
+                                  });
+
+    reader.start();
+    reader.wait();
+
+    std::uint64_t total_bytes = 0;
+    std::size_t buffers = 0;
+    BufferHandle handle;
+    while (reader_to_discarder.try_pop(handle)) {
+        hypersync::DataBuffer& buffer = hypersync::data_buffer(pool, handle);
+        EXPECT_FALSE(hypersync::is_packed_small_file_buffer(buffer));
+        EXPECT_TRUE((buffer.trailer.flags & hypersync::kFlagSmallFile) != 0U);
+        EXPECT_TRUE((buffer.trailer.flags & hypersync::kFlagLastChunk) != 0U);
+        total_bytes += buffer.trailer.data_len;
+        ++buffers;
+        pool.release(handle);
+    }
+
+    EXPECT_EQ(buffers, 3U);
+    EXPECT_EQ(total_bytes, 12U);
+    EXPECT_EQ(reader.stats().files_read, 3U);
+    EXPECT_EQ(reader.stats().files_failed, 0U);
+    EXPECT_EQ(reader.stats().bytes_read, 12U);
     EXPECT_EQ(pool.in_use(), 0U);
     EXPECT_EQ(pool.available(), pool.capacity());
 }
@@ -1831,7 +2014,7 @@ void test_job_classes_exist_and_process_messages() {
     EXPECT_FALSE(discard_checker.pull(message));
     EXPECT_EQ(discard_checker.stats().deferred, 1U);
 
-    NfsDataReader data_reader({2, 256, 8, 4, 8, 85.0, 70.0, "."});
+    NfsDataReader data_reader({2, 256, 0, 8, 4, 8, 85.0, 70.0, "."});
     const FileSpec large_file{"root/large.bin", "abcdefghijklmnop", 10};
     const auto chunks = data_reader.chunk_file(large_file);
     EXPECT_EQ(chunks.size(), 2U);
@@ -2525,7 +2708,7 @@ void test_nfs_jobs_use_backend_for_local_sources() {
     EXPECT_EQ(hypersync::message_as<RecBuf>(message).rel_path.view(), std::string_view("sub/b.bin"));
     EXPECT_FALSE(flat_reader.pull(message));
 
-    NfsDataReader data_reader({2, 256, 8, 4, 8, 85.0, 70.0, source.path.string()});
+    NfsDataReader data_reader({2, 256, 0, 8, 4, 8, 85.0, 70.0, source.path.string()});
     EXPECT_FALSE(data_reader.using_async_backend());
     const auto loaded = data_reader.load_file("sub/b.bin");
     EXPECT_EQ(loaded.content, "0123456789");
@@ -2731,7 +2914,7 @@ void test_real_libnfs_loopback_export_can_scan_and_transfer() {
     EXPECT_EQ(backend->load_file("alpha.txt").content, "alpha");
 
     NfsMetaReader meta_reader({1, 1'000'000, 1'000'000, true, source_url, true});
-    NfsDataReader data_reader({2, 256, 8, 4, 8, 85.0, 70.0, source_url});
+    NfsDataReader data_reader({2, 256, 0, 8, 4, 8, 85.0, 70.0, source_url});
     EXPECT_TRUE(meta_reader.using_async_backend());
     EXPECT_TRUE(data_reader.using_async_backend());
     EXPECT_EQ(meta_reader.scan_tree().size(), 2U);
@@ -4003,9 +4186,18 @@ int main(int argc, char** argv) {
         {"data_hasher_hashes_and_forwards_raw_buffers",
          TestSuite::unit,
          test_data_hasher_hashes_and_forwards_raw_buffers},
+        {"packed_small_file_data_buffers_hash_without_repacking",
+         TestSuite::unit,
+         test_packed_small_file_data_buffers_hash_without_repacking},
         {"nfs_data_buffer_reader_feeds_hasher_pipeline",
          TestSuite::unit,
          test_nfs_data_buffer_reader_feeds_hasher_pipeline},
+        {"nfs_data_buffer_reader_packs_small_files_into_owned_buffer",
+         TestSuite::unit,
+         test_nfs_data_buffer_reader_packs_small_files_into_owned_buffer},
+        {"nfs_data_buffer_reader_slides_small_files_without_packing",
+         TestSuite::unit,
+         test_nfs_data_buffer_reader_slides_small_files_without_packing},
         {"scan_index_round_trip_and_folder_hashes", TestSuite::unit, test_scan_index_round_trip_and_folder_hashes},
         {"scan_index_rejects_bad_csv", TestSuite::unit, test_scan_index_rejects_bad_csv},
         {"state_machines_accept_valid_paths_and_reject_invalid_ones",

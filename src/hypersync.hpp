@@ -20,6 +20,7 @@
 #include "common/version.hpp"
 #include "common/watermarks.hpp"
 #include "core/diff_result_buffer_codec.hpp"
+#include "core/data_buffer_codec.hpp"
 #include "core/flat_folder_buffer_codec.hpp"
 #include "core/metadata_record_writer.hpp"
 #include "core/metadata_buffer_codec.hpp"
