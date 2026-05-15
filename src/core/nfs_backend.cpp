@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -60,6 +61,13 @@ extern "C" ssize_t write(int, const void*, size_t);
 namespace hypersync {
 
 namespace {
+
+std::uint64_t current_unix_time_nanoseconds() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
 
 std::uint64_t stat_mtime_ns(const struct stat& info) {
 #if defined(__APPLE__)
@@ -755,6 +763,8 @@ struct PendingDirectoryOpen {
     AsyncCommandState state;
     FileSpec folder;
     std::string remote_path;
+    std::chrono::steady_clock::time_point queued_at;
+    std::uint64_t scan_started_unix_ns = 0;
     std::size_t retry_attempts = 0;
     bool in_use = false;
 };
@@ -900,6 +910,33 @@ void pump_nfs_until_done(struct nfs_context* nfs, AsyncCommandState& state) {
             throw std::runtime_error("libnfs service failed: " + std::string(nfs_get_error(nfs)));
         }
     }
+}
+
+bool pump_nfs_until_done_until(struct nfs_context* nfs,
+                               AsyncCommandState& state,
+                               std::chrono::steady_clock::time_point deadline) {
+    while (!state.done) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        const int fd = nfs_get_fd(nfs);
+        const int events = nfs_which_events(nfs);
+
+        struct pollfd descriptor {
+            fd, static_cast<short>(events), 0
+        };
+
+        const int poll_result = fd >= 0 ? ::poll(&descriptor, 1, 100) : 0;
+        if (poll_result < 0) {
+            throw std::system_error(errno, std::generic_category(), "poll failed for libnfs context");
+        }
+
+        const int revents = poll_result > 0 ? descriptor.revents : 0;
+        if (nfs_service(nfs, revents) < 0) {
+            throw std::runtime_error("libnfs service failed: " + std::string(nfs_get_error(nfs)));
+        }
+    }
+    return true;
 }
 
 void pump_nfs_until_done(struct nfs_context* nfs, AsyncStat64State& state) {
@@ -1094,12 +1131,23 @@ public:
             throw std::runtime_error("NFS URL must include server and export path: " + connection_url_);
         }
 
-        run_async_command(
-            nfs_,
-            [&](AsyncCommandState* state) {
-                return nfs_mount_async(nfs_, url_->server, url_->path, generic_nfs_callback, state);
-            },
-            "nfs_mount_async");
+        AsyncCommandState mount_state;
+        const int queue_result =
+            nfs_mount_async(nfs_, url_->server, url_->path, generic_nfs_callback, &mount_state);
+        if (queue_result != 0) {
+            const char* error = nfs_get_error(nfs_);
+            throw std::runtime_error("nfs_mount_async queue failed: " +
+                                     std::string(error != nullptr ? error : "unknown error"));
+        }
+        constexpr auto kMountTimeout = std::chrono::seconds(5);
+        if (!pump_nfs_until_done_until(nfs_, mount_state, std::chrono::steady_clock::now() + kMountTimeout)) {
+            const std::string timed_out_url = connection_url_;
+            abandon_stuck_context();
+            throw std::runtime_error("nfs_mount_async timed out for " + timed_out_url);
+        }
+        if (mount_state.status < 0) {
+            throw std::runtime_error("nfs_mount_async failed: " + mount_state.error);
+        }
     }
 
     ~LibNfsSession() {
@@ -1122,6 +1170,14 @@ public:
 
     [[nodiscard]] const std::string& connection_url() const {
         return connection_url_;
+    }
+
+    // A timed-out libnfs context may block inside nfs_destroy_context().
+    // Recovery deliberately leaks that stuck context and reconnects with a
+    // fresh one so one dead NFS endpoint cannot stall the whole pipeline.
+    void abandon_stuck_context() noexcept {
+        url_ = nullptr;
+        nfs_ = nullptr;
     }
 
 private:
@@ -2006,15 +2062,31 @@ public:
         const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
         const std::function<bool()>& should_stop,
         const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
-        struct nfs_context* nfs = session().context();
+        struct nfs_context* nfs = nullptr;
         const std::size_t max_in_flight = std::max<std::size_t>(1, outstanding_folders);
         constexpr std::size_t kMaxTransientFolderRetries = 3;
+        // Directory opens can legitimately sit behind many other outstanding
+        // libnfs operations on large scans. A short per-open timeout causes
+        // whole-context recovery and requeues unrelated pending folders, which
+        // destroys the reader's steady-state throughput. Keep the hook here for
+        // future configurable failure handling, but default to the old behavior:
+        // let libnfs complete queued opens unless the job itself is stopping.
+        constexpr bool kDirectoryOpenTimeoutEnabled = false;
+        constexpr auto kDirectoryOpenTimeout = std::chrono::seconds(5);
         std::vector<PendingDirectoryOpen> pending(max_in_flight);
         std::deque<RetriedDirectoryOpen> retry_folders;
         std::size_t in_flight = 0;
         bool provider_exhausted = false;
 
+        auto close_completed_directory = [&](PendingDirectoryOpen& slot) {
+            if (nfs != nullptr && slot.state.done && slot.state.status >= 0 && slot.state.data != nullptr) {
+                nfs_closedir(nfs, static_cast<struct nfsdir*>(slot.state.data));
+                slot.state.data = nullptr;
+            }
+        };
+
         auto requeue_or_fail = [&](PendingDirectoryOpen& slot, const std::string& error) {
+            close_completed_directory(slot);
             if (slot.retry_attempts < kMaxTransientFolderRetries && !should_stop()) {
                 retry_folders.push_back(RetriedDirectoryOpen{std::move(slot.folder), slot.retry_attempts + 1U});
                 slot = {};
@@ -2023,6 +2095,8 @@ public:
 
             FlatFolderScanBatch batch;
             batch.folder = std::move(slot.folder);
+            batch.scan_started_unix_ns = slot.scan_started_unix_ns;
+            batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
             batch.failed = true;
             batch.error = error;
             if (!slot.remote_path.empty()) {
@@ -2033,10 +2107,11 @@ public:
         };
 
         auto recover_session = [&]() {
-            session_.reset();
-            if (!should_stop()) {
-                nfs = session().context();
+            if (session_) {
+                session_->abandon_stuck_context();
+                session_.reset();
             }
+            nfs = nullptr;
         };
 
         auto recover_pending = [&](const std::string& error) {
@@ -2051,7 +2126,39 @@ public:
             recover_session();
         };
 
+        auto stop_pending = [&]() {
+            for (PendingDirectoryOpen& slot : pending) {
+                if (!slot.in_use) {
+                    continue;
+                }
+                close_completed_directory(slot);
+                slot = {};
+            }
+            retry_folders.clear();
+            in_flight = 0;
+            provider_exhausted = true;
+            if (session_) {
+                session_->abandon_stuck_context();
+                session_.reset();
+            }
+        };
+
+        auto timed_out_open = [&]() -> bool {
+            if (!kDirectoryOpenTimeoutEnabled) {
+                return false;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            return std::any_of(pending.begin(), pending.end(), [&](const PendingDirectoryOpen& slot) {
+                return slot.in_use && !slot.state.done && now - slot.queued_at >= kDirectoryOpenTimeout;
+            });
+        };
+
         while (in_flight != 0 || (!should_stop() && (!retry_folders.empty() || !provider_exhausted))) {
+            if (should_stop()) {
+                stop_pending();
+                break;
+            }
+
             while (!should_stop() && in_flight < max_in_flight) {
                 std::optional<FileSpec> folder;
                 std::size_t retry_attempts = 0;
@@ -2085,6 +2192,29 @@ public:
                 const std::string normalized_path = normalize_path(slot.folder.rel_path);
                 slot.folder.rel_path = normalized_path;
                 slot.remote_path = normalized_path.empty() ? "/" : "/" + normalized_path;
+                slot.queued_at = std::chrono::steady_clock::now();
+                slot.scan_started_unix_ns = current_unix_time_nanoseconds();
+
+                if (nfs == nullptr) {
+                    try {
+                        nfs = session().context();
+                    } catch (const std::exception& error) {
+                        slot.in_use = false;
+                        if (retry_attempts < kMaxTransientFolderRetries && !should_stop()) {
+                            retry_folders.push_back(RetriedDirectoryOpen{std::move(slot.folder), retry_attempts + 1U});
+                        } else {
+                            FlatFolderScanBatch batch;
+                            batch.folder = std::move(slot.folder);
+                            batch.scan_started_unix_ns = slot.scan_started_unix_ns;
+                            batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
+                            batch.failed = true;
+                            batch.error = std::string(error.what()) + " while connecting for " + slot.remote_path;
+                            folder_visitor(std::move(batch));
+                        }
+                        slot = {};
+                        continue;
+                    }
+                }
 
                 const int queue_result =
                     nfs_opendir_async(nfs, slot.remote_path.c_str(), generic_nfs_callback, &slot.state);
@@ -2092,6 +2222,8 @@ public:
                     slot.in_use = false;
                     FlatFolderScanBatch batch;
                     batch.folder = std::move(slot.folder);
+                    batch.scan_started_unix_ns = slot.scan_started_unix_ns;
+                    batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
                     batch.failed = true;
                     const char* error = nfs_get_error(nfs);
                     batch.error = "nfs_opendir_async queue failed: " +
@@ -2120,6 +2252,14 @@ public:
                 recover_pending(error.what());
                 continue;
             }
+            if (should_stop()) {
+                stop_pending();
+                break;
+            }
+            if (timed_out_open()) {
+                recover_pending("nfs_opendir_async timed out");
+                continue;
+            }
 
             for (PendingDirectoryOpen& slot : pending) {
                 if (!slot.in_use || !slot.state.done) {
@@ -2128,6 +2268,7 @@ public:
 
                 FlatFolderScanBatch batch;
                 batch.folder = std::move(slot.folder);
+                batch.scan_started_unix_ns = slot.scan_started_unix_ns;
                 if (slot.state.status < 0) {
                     batch.failed = true;
                     batch.error = slot.state.error.empty() ? "nfs_opendir_async failed with unknown error"
@@ -2144,6 +2285,7 @@ public:
                         nfs_closedir(nfs, directory);
                     }
                 }
+                batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
                 slot.in_use = false;
                 --in_flight;
                 folder_visitor(std::move(batch));
@@ -2698,6 +2840,7 @@ void NfsBackend::scan_flat_folders(
 
         FlatFolderScanBatch batch;
         batch.folder = std::move(*folder);
+        batch.scan_started_unix_ns = current_unix_time_nanoseconds();
         try {
             visit_metadata_at(batch.folder.rel_path,
                               false,
@@ -2715,6 +2858,7 @@ void NfsBackend::scan_flat_folders(
             batch.failed = true;
             batch.error = ex.what();
         }
+        batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
         folder_visitor(std::move(batch));
     }
 }

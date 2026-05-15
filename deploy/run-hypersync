@@ -4,4 +4,7 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 export LD_LIBRARY_PATH="$script_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ -z "${HYPERSYNC_CONFIG:-}" && -f "$script_dir/default.yaml" ]]; then
+  export HYPERSYNC_CONFIG="$script_dir/default.yaml"
+fi
 exec "$script_dir/hypersync.bin" "$@"

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -16,6 +17,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <map>
@@ -44,6 +46,8 @@
 #include "common/filesystem_utils.hpp"
 #include "common/fixed_string.hpp"
 #include "common/hash_utils.hpp"
+#include "core/diff_result_buffer_codec.hpp"
+#include "core/flat_folder_buffer_codec.hpp"
 #include "core/metadata_record_writer.hpp"
 #include "core/metadata_buffer_codec.hpp"
 #include "core/nfs_backend.hpp"
@@ -73,6 +77,8 @@
 namespace hypersync {
 
 namespace {
+
+inline constexpr std::size_t kMetadataPartitionTransportPoolSlots = 1024U;
 
 enum class PriorityMessageType : std::uint32_t {
     session_start = 1,
@@ -214,6 +220,41 @@ struct DiffTargetFolderQueue {
     std::exception_ptr error;
 };
 
+struct DiffBatchQueue {
+    std::mutex mutex;
+    std::condition_variable cv_not_empty;
+    std::condition_variable cv_not_full;
+    std::deque<FlatFolderScanBatch> batches;
+    std::size_t max_entries = 65536;
+    std::size_t producers_remaining = 0;
+    bool done = false;
+    std::exception_ptr error;
+};
+
+struct FakeRemoteProcessorQueue {
+    std::mutex mutex;
+    std::condition_variable cv_not_empty;
+    std::condition_variable cv_not_full;
+    std::deque<FileSpec> folders;
+    std::size_t max_entries = 65536;
+    std::size_t producers_remaining = 0;
+    bool done = false;
+    std::exception_ptr error;
+};
+
+struct DiffPipelineTimingCounters {
+    std::atomic<std::uint64_t> source_wait_target_queue_ns{0};
+    std::atomic<std::uint64_t> source_wait_batch_queue_ns{0};
+    std::atomic<std::uint64_t> fake_remote_wait_request_ns{0};
+    std::atomic<std::uint64_t> fake_remote_wait_processor_queue_ns{0};
+    std::atomic<std::uint64_t> fake_remote_delay_ns{0};
+    std::atomic<std::uint64_t> fake_remote_wait_batch_queue_ns{0};
+    std::atomic<std::uint64_t> joiner_idle_ns{0};
+    std::atomic<std::uint64_t> joiner_process_ns{0};
+};
+
+using DiffBatchQueueShards = std::vector<std::unique_ptr<DiffBatchQueue>>;
+
 struct DataReadFileQueue {
     std::mutex mutex;
     std::condition_variable cv_not_empty;
@@ -324,7 +365,7 @@ void run_metadata_writer_partition_process(const MetadataRecordWriterConfig& wri
     }
 
     RawBufferPool receive_pool(kMetadataBatchBufferPoolId,
-                               64U,
+                               kMetadataPartitionTransportPoolSlots,
                                sizeof(MetadataBatchBuffer),
                                alignof(MetadataBatchBuffer));
     BufferPoolRegistry receive_registry;
@@ -387,7 +428,7 @@ public:
 
         for (std::size_t index = 0; index < partitions_; ++index) {
             states_.push_back(std::make_unique<PartitionSendState>(
-                64U,
+                kMetadataPartitionTransportPoolSlots,
                 metadata_partition_socket_path(output_path_, index)));
             states_.back()->sender.start();
         }
@@ -409,25 +450,26 @@ public:
 
         const std::size_t partition = metadata_partition_for_path(folder.spec.rel_path, partitions_);
         std::lock_guard<std::mutex> lock(states_[partition]->mutex);
-        bool include_folder_record = writer_config_.write_folders;
-        auto& batch = start_folder_batch(partition, folder, include_folder_record);
-        include_folder_record = false;
+        if (writer_config_.write_folders) {
+            append_generic_folder_record(partition, folder);
+        }
 
-        if (writer_config_.write_files) {
+        if (writer_config_.write_files && !files.empty()) {
+            auto& batch = start_folder_batch(partition, folder);
             for (const auto& file : files) {
                 if (!append_folder_metadata_batch_file(metadata_batch_buffer(states_[partition]->pool,
                                                                             states_[partition]->open_batch),
                                                        file)) {
                     flush_batch(partition);
-                    auto& continued_batch = start_folder_batch(partition, folder, include_folder_record);
+                    auto& continued_batch = start_folder_batch(partition, folder);
                     if (!append_folder_metadata_batch_file(continued_batch, file)) {
                         throw std::runtime_error("metadata file record does not fit folder metadata batch buffer");
                     }
                 }
             }
+            (void)batch;
+            flush_batch(partition);
         }
-        (void)batch;
-        flush_batch(partition);
     }
 
     void close() {
@@ -438,6 +480,7 @@ public:
         for (std::size_t index = 0; index < partitions_; ++index) {
             std::lock_guard<std::mutex> lock(states_[index]->mutex);
             flush_batch(index);
+            flush_generic_batch(index);
         }
         for (auto& state : states_) {
             state->queue.close();
@@ -495,6 +538,8 @@ private:
         BufferSenderJob sender;
         BufferHandle open_batch;
         bool has_open_batch = false;
+        BufferHandle open_generic_batch;
+        bool has_open_generic_batch = false;
         std::mutex mutex;
 
         PartitionSendState(std::size_t pool_slots, const std::filesystem::path& socket_path)
@@ -515,30 +560,49 @@ private:
     MetadataBatchBuffer& acquire_batch(std::size_t partition) {
         PartitionSendState& state = *states_[partition];
         if (!state.has_open_batch) {
-            state.open_batch = state.pool.acquire_spin();
+            state.open_batch = state.pool.acquire_wait();
             reset_metadata_batch(metadata_batch_buffer(state.pool, state.open_batch));
             state.has_open_batch = true;
         }
         return metadata_batch_buffer(state.pool, state.open_batch);
     }
 
+    MetadataBatchBuffer& acquire_generic_batch(std::size_t partition) {
+        PartitionSendState& state = *states_[partition];
+        if (!state.has_open_generic_batch) {
+            state.open_generic_batch = state.pool.acquire_wait();
+            reset_metadata_batch(metadata_batch_buffer(state.pool, state.open_generic_batch));
+            state.has_open_generic_batch = true;
+        }
+        return metadata_batch_buffer(state.pool, state.open_generic_batch);
+    }
+
     MetadataBatchBuffer& start_folder_batch(std::size_t partition,
-                                            const MetadataFolderRecord& folder,
-                                            bool include_folder_record) {
+                                            const MetadataFolderRecord& folder) {
         PartitionSendState& state = *states_[partition];
         if (state.has_open_batch) {
             throw std::runtime_error("cannot start folder metadata batch while another batch is open");
         }
-        state.open_batch = state.pool.acquire_spin();
+        state.open_batch = state.pool.acquire_wait();
         if (!reset_folder_metadata_batch(metadata_batch_buffer(state.pool, state.open_batch),
                                          folder,
-                                         include_folder_record)) {
+                                         false)) {
             state.pool.release(state.open_batch);
             state.has_open_batch = false;
             throw std::runtime_error("metadata folder path does not fit metadata batch buffer");
         }
         state.has_open_batch = true;
         return metadata_batch_buffer(state.pool, state.open_batch);
+    }
+
+    void append_generic_folder_record(std::size_t partition, const MetadataFolderRecord& folder) {
+        if (append_metadata_batch_folder(acquire_generic_batch(partition), folder)) {
+            return;
+        }
+        flush_generic_batch(partition);
+        if (!append_metadata_batch_folder(acquire_generic_batch(partition), folder)) {
+            throw std::runtime_error("metadata folder record does not fit metadata batch buffer");
+        }
     }
 
     void flush_batch(std::size_t partition) {
@@ -554,6 +618,21 @@ private:
             throw std::runtime_error("metadata sender queue closed while pushing scan batch");
         }
         state.has_open_batch = false;
+    }
+
+    void flush_generic_batch(std::size_t partition) {
+        PartitionSendState& state = *states_[partition];
+        if (!state.has_open_generic_batch) {
+            return;
+        }
+        BufferHandle handle = state.open_generic_batch;
+        if (metadata_batch_buffer(state.pool, handle).record_count == 0U) {
+            state.pool.release(handle);
+        } else if (!state.queue.push_wait(handle)) {
+            state.pool.release(handle);
+            throw std::runtime_error("metadata sender queue closed while pushing generic metadata batch");
+        }
+        state.has_open_generic_batch = false;
     }
 
     MetadataRecordWriterConfig writer_config_;
@@ -1407,6 +1486,227 @@ void fail_diff_target_folder_work(DiffTargetFolderQueue& queue,
     queue.cv.notify_all();
 }
 
+bool diff_target_folder_work_idle(DiffTargetFolderQueue& queue) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    return (queue.done || (queue.folders.empty() && queue.active == 0)) && queue.error == nullptr;
+}
+
+void configure_diff_batch_queue(DiffBatchQueue& queue,
+                                std::size_t producers,
+                                std::size_t max_entries) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.producers_remaining = producers;
+    queue.max_entries = std::max<std::size_t>(1U, max_entries);
+    queue.done = producers == 0U;
+}
+
+bool push_diff_batch(DiffBatchQueue& queue, FlatFolderScanBatch batch) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    queue.cv_not_full.wait(lock, [&queue]() {
+        return queue.done || queue.error || queue.batches.size() < queue.max_entries;
+    });
+    if (queue.done || queue.error) {
+        queue.cv_not_empty.notify_all();
+        queue.cv_not_full.notify_all();
+        return false;
+    }
+    queue.batches.push_back(std::move(batch));
+    lock.unlock();
+    queue.cv_not_empty.notify_one();
+    return true;
+}
+
+std::optional<FlatFolderScanBatch> take_diff_batch(DiffBatchQueue& queue, bool wait_for_work) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    const auto ready = [&queue]() {
+        return queue.done || queue.error || !queue.batches.empty();
+    };
+    if (wait_for_work) {
+        queue.cv_not_empty.wait(lock, ready);
+    } else if (!ready()) {
+        return std::nullopt;
+    }
+    if (queue.batches.empty()) {
+        return std::nullopt;
+    }
+    FlatFolderScanBatch batch = std::move(queue.batches.front());
+    queue.batches.pop_front();
+    lock.unlock();
+    queue.cv_not_full.notify_one();
+    return batch;
+}
+
+void finish_diff_batch_producer(DiffBatchQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.producers_remaining != 0U) {
+            --queue.producers_remaining;
+        }
+        if (queue.producers_remaining == 0U) {
+            queue.done = true;
+        }
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
+void fail_diff_batch_queue(DiffBatchQueue& queue,
+                           std::exception_ptr error = std::current_exception()) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.done = true;
+        queue.batches.clear();
+        if (!queue.error && error != nullptr) {
+            queue.error = error;
+        }
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
+bool diff_batch_queue_drained(DiffBatchQueue& queue) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    return queue.done && queue.batches.empty();
+}
+
+bool diff_batch_queue_empty(DiffBatchQueue& queue) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    return queue.batches.empty() && queue.error == nullptr;
+}
+
+DiffBatchQueueShards make_diff_batch_queue_shards(std::size_t shard_count,
+                                                  std::size_t producers,
+                                                  std::size_t max_entries_per_shard) {
+    DiffBatchQueueShards shards;
+    shards.reserve(shard_count);
+    for (std::size_t index = 0; index < shard_count; ++index) {
+        auto queue = std::make_unique<DiffBatchQueue>();
+        configure_diff_batch_queue(*queue, producers, max_entries_per_shard);
+        shards.push_back(std::move(queue));
+    }
+    return shards;
+}
+
+std::size_t diff_batch_shard_index(const FlatFolderScanBatch& batch, std::size_t shard_count) {
+    if (shard_count == 0U) {
+        return 0;
+    }
+    return std::hash<std::string>{}(normalize_path(batch.folder.rel_path)) % shard_count;
+}
+
+bool push_diff_batch(DiffBatchQueueShards& shards, FlatFolderScanBatch batch) {
+    if (shards.empty()) {
+        return false;
+    }
+    const std::size_t shard_index = diff_batch_shard_index(batch, shards.size());
+    return push_diff_batch(*shards[shard_index], std::move(batch));
+}
+
+void finish_diff_batch_producer(DiffBatchQueueShards& shards) {
+    for (auto& shard : shards) {
+        finish_diff_batch_producer(*shard);
+    }
+}
+
+void fail_diff_batch_queue(DiffBatchQueueShards& shards,
+                           std::exception_ptr error = std::current_exception()) {
+    for (auto& shard : shards) {
+        fail_diff_batch_queue(*shard, error);
+    }
+}
+
+void configure_fake_remote_processor_queue(FakeRemoteProcessorQueue& queue,
+                                           std::size_t producers,
+                                           std::size_t max_entries) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    queue.producers_remaining = producers;
+    queue.max_entries = std::max<std::size_t>(1U, max_entries);
+    queue.done = producers == 0U;
+}
+
+bool push_fake_remote_request(FakeRemoteProcessorQueue& queue, FileSpec folder) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    queue.cv_not_full.wait(lock, [&queue]() {
+        return queue.done || queue.error || queue.folders.size() < queue.max_entries;
+    });
+    if (queue.done || queue.error) {
+        queue.cv_not_empty.notify_all();
+        queue.cv_not_full.notify_all();
+        return false;
+    }
+    queue.folders.push_back(std::move(folder));
+    lock.unlock();
+    queue.cv_not_empty.notify_one();
+    return true;
+}
+
+std::optional<FileSpec> take_fake_remote_request(FakeRemoteProcessorQueue& queue) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    queue.cv_not_empty.wait(lock, [&queue]() {
+        return queue.done || queue.error || !queue.folders.empty();
+    });
+    if (queue.folders.empty()) {
+        return std::nullopt;
+    }
+    FileSpec folder = std::move(queue.folders.front());
+    queue.folders.pop_front();
+    lock.unlock();
+    queue.cv_not_full.notify_one();
+    return folder;
+}
+
+void finish_fake_remote_request_producer(FakeRemoteProcessorQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.producers_remaining != 0U) {
+            --queue.producers_remaining;
+        }
+        if (queue.producers_remaining == 0U) {
+            queue.done = true;
+        }
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
+void fail_fake_remote_processor_queue(FakeRemoteProcessorQueue& queue,
+                                      std::exception_ptr error = std::current_exception()) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.done = true;
+        queue.folders.clear();
+        if (!queue.error && error != nullptr) {
+            queue.error = error;
+        }
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
+bool all_diff_batch_queues_drained(DiffBatchQueueShards& shards) {
+    return std::all_of(shards.begin(), shards.end(), [](const auto& shard) {
+        return diff_batch_queue_drained(*shard);
+    });
+}
+
+bool all_diff_batch_queues_empty(DiffBatchQueueShards& shards) {
+    return std::all_of(shards.begin(), shards.end(), [](const auto& shard) {
+        return diff_batch_queue_empty(*shard);
+    });
+}
+
+void add_elapsed_ns(std::atomic<std::uint64_t>& counter,
+                    std::chrono::steady_clock::time_point started_at,
+                    std::chrono::steady_clock::time_point ended_at) {
+    counter.fetch_add(static_cast<std::uint64_t>(
+                          std::chrono::duration_cast<std::chrono::nanoseconds>(ended_at - started_at).count()),
+                      std::memory_order_relaxed);
+}
+
+double ns_to_seconds(std::uint64_t ns) {
+    return static_cast<double>(ns) / 1'000'000'000.0;
+}
+
 DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats& stats) {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed = stats.started_at == std::chrono::steady_clock::time_point{}
@@ -1472,6 +1772,32 @@ MonitorQueueSnapshot monitor_data_file_queue(std::string name, DataReadFileQueue
     snapshot.high_watermark = queue.files.size();
     snapshot.closed = queue.input_done || queue.stop;
     return snapshot;
+}
+
+MonitorQueueSnapshot monitor_queue_group(std::string name,
+                                         const std::vector<std::unique_ptr<BufQueue>>& queues) {
+    MonitorQueueSnapshot snapshot;
+    snapshot.name = std::move(name);
+    snapshot.closed = !queues.empty();
+    for (const auto& queue : queues) {
+        snapshot.capacity += queue->capacity();
+        snapshot.depth += queue->size();
+        snapshot.high_watermark += queue->high_watermark();
+        snapshot.pushed += queue->push_count();
+        snapshot.popped += queue->pop_count();
+        snapshot.closed = snapshot.closed && queue->closed();
+    }
+    snapshot.detail = "shards=" + std::to_string(queues.size());
+    return snapshot;
+}
+
+void add_runtime_metrics(RuntimeMetricsSnapshot& target, const RuntimeMetricsSnapshot& source) {
+    target.worker_count += source.worker_count;
+    target.total_wall_ns += source.total_wall_ns;
+    for (std::size_t index = 0; index < kRuntimeStateCount; ++index) {
+        target.state_wall_ns[index] += source.state_wall_ns[index];
+        target.current_workers[index] += source.current_workers[index];
+    }
 }
 
 std::uint64_t file_spec_logical_size(const FileSpec& file) {
@@ -2106,11 +2432,7 @@ void store_summary_target_batch(LiveDiffSummaryCoordinator& coordinator,
 void record_source_summary_diff_batch(bool recursive,
                                       FlatMetadataWorkQueue& source_queue,
                                       DiffTargetFolderQueue& target_queue,
-                                      LiveDiffSummaryCoordinator& coordinator,
-                                      const std::string& compare_mode,
-                                      bool allow_target_only,
-                                      TransferReport& report,
-                                      std::mutex& report_mutex,
+                                      DiffBatchQueueShards& source_batches,
                                       FlatFolderScanBatch batch) {
     if (batch.failed) {
         std::cerr << "diff skipped source folder '"
@@ -2120,6 +2442,7 @@ void record_source_summary_diff_batch(bool recursive,
             const std::string message = batch.error.empty() ? "failed to scan source root" : batch.error;
             fail_flat_folder_work(source_queue, std::make_exception_ptr(std::runtime_error(message)));
             fail_diff_target_folder_work(target_queue, std::make_exception_ptr(std::runtime_error(message)));
+            fail_diff_batch_queue(source_batches, std::make_exception_ptr(std::runtime_error(message)));
             return;
         }
         finish_flat_folder_work(source_queue);
@@ -2148,28 +2471,20 @@ void record_source_summary_diff_batch(bool recursive,
         return;
     }
 
-    store_summary_source_batch(coordinator,
-                               compare_mode,
-                               recursive,
-                               allow_target_only,
-                               target_queue,
-                               report,
-                               report_mutex,
-                               std::move(batch));
+    if (!push_diff_batch(source_batches, std::move(batch))) {
+        finish_flat_folder_work(source_queue);
+        return;
+    }
     enqueue_flat_folder_work(source_queue, std::move(child_work));
     finish_flat_folder_work(source_queue);
 }
 
 void source_summary_diff_worker(const std::string& source_root,
                                 bool recursive,
-                                const std::string& compare_mode,
-                                bool allow_target_only,
                                 std::size_t async_directory_depth,
                                 FlatMetadataWorkQueue& source_queue,
                                 DiffTargetFolderQueue& target_queue,
-                                LiveDiffSummaryCoordinator& coordinator,
-                                TransferReport& report,
-                                std::mutex& report_mutex) {
+                                DiffBatchQueueShards& source_batches) {
     auto source_backend = make_nfs_backend(source_root);
     try {
         source_backend->scan_flat_folders(
@@ -2183,19 +2498,11 @@ void source_summary_diff_worker(const std::string& source_root,
             [recursive,
              &source_queue,
              &target_queue,
-             &coordinator,
-             &compare_mode,
-             allow_target_only,
-             &report,
-             &report_mutex](FlatFolderScanBatch batch) {
+             &source_batches](FlatFolderScanBatch batch) {
                 record_source_summary_diff_batch(recursive,
                                                  source_queue,
                                                  target_queue,
-                                                 coordinator,
-                                                 compare_mode,
-                                                 allow_target_only,
-                                                 report,
-                                                 report_mutex,
+                                                 source_batches,
                                                  std::move(batch));
             });
         if (flat_metadata_scan_should_stop(source_queue)) {
@@ -2204,7 +2511,9 @@ void source_summary_diff_worker(const std::string& source_root,
     } catch (...) {
         fail_flat_folder_work(source_queue);
         fail_diff_target_folder_work(target_queue);
+        fail_diff_batch_queue(source_batches);
     }
+    finish_diff_batch_producer(source_batches);
 }
 
 bool diff_target_queue_should_stop(DiffTargetFolderQueue& queue) {
@@ -2213,14 +2522,9 @@ bool diff_target_queue_should_stop(DiffTargetFolderQueue& queue) {
 }
 
 void target_summary_diff_worker(const std::string& target_root,
-                                bool recursive,
-                                const std::string& compare_mode,
-                                bool allow_target_only,
                                 std::size_t async_directory_depth,
                                 DiffTargetFolderQueue& target_queue,
-                                LiveDiffSummaryCoordinator& coordinator,
-                                TransferReport& report,
-                                std::mutex& report_mutex) {
+                                DiffBatchQueueShards& target_batches) {
     auto target_backend = make_nfs_backend(target_root);
     try {
         target_backend->scan_flat_folders(
@@ -2231,18 +2535,106 @@ void target_summary_diff_worker(const std::string& target_root,
             [&target_queue] {
                 return diff_target_queue_should_stop(target_queue);
             },
-            [recursive,
-             &target_queue,
-             &coordinator,
-             &compare_mode,
-             allow_target_only,
-             &report,
-             &report_mutex](FlatFolderScanBatch batch) {
+            [&target_queue, &target_batches](FlatFolderScanBatch batch) {
                 if (batch.failed) {
                     std::cerr << "diff treats target folder '"
                               << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
                               << "' as empty: "
                               << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+                }
+                push_diff_batch(target_batches, std::move(batch));
+                finish_diff_target_folder_work(target_queue);
+            });
+    } catch (...) {
+        fail_diff_target_folder_work(target_queue);
+        fail_diff_batch_queue(target_batches);
+    }
+    finish_diff_batch_producer(target_batches);
+}
+
+void flush_unmatched_summary_batches(LiveDiffSummaryCoordinator& coordinator,
+                                     const std::string& compare_mode,
+                                     bool recursive,
+                                     bool allow_target_only,
+                                     DiffTargetFolderQueue& target_queue,
+                                     TransferReport& report,
+                                     std::mutex& report_mutex);
+
+bool summary_coordinator_empty(LiveDiffSummaryCoordinator& coordinator) {
+    std::lock_guard<std::mutex> lock(coordinator.mutex);
+    return coordinator.pending.empty();
+}
+
+bool all_joiner_pending_empty(const std::vector<std::unique_ptr<std::atomic<bool>>>& pending_empty) {
+    return std::all_of(pending_empty.begin(), pending_empty.end(), [](const auto& flag) {
+        return flag->load(std::memory_order_relaxed);
+    });
+}
+
+void close_diff_target_input_when_ready(DiffTargetFolderQueue& target_queue,
+                                        DiffBatchQueueShards& source_batches,
+                                        DiffBatchQueueShards& target_batches,
+                                        const std::vector<std::unique_ptr<std::atomic<bool>>>& pending_empty) {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(target_queue.mutex);
+            if (target_queue.done || target_queue.error) {
+                target_queue.cv.notify_all();
+                return;
+            }
+        }
+        if (all_diff_batch_queues_drained(source_batches) &&
+            all_diff_batch_queues_empty(target_batches) &&
+            all_joiner_pending_empty(pending_empty) &&
+            diff_target_folder_work_idle(target_queue)) {
+            mark_diff_target_input_done(target_queue);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void summary_diff_joiner_worker(const std::string& compare_mode,
+                                bool recursive,
+                                bool allow_target_only,
+                                DiffTargetFolderQueue& target_queue,
+                                DiffBatchQueue& source_batches,
+                                DiffBatchQueue& target_batches,
+                                TransferReport& report,
+                                std::mutex& report_mutex,
+                                DiffPipelineTimingCounters* timing = nullptr,
+                                std::atomic<bool>* pending_empty = nullptr) {
+    LiveDiffSummaryCoordinator coordinator;
+    if (pending_empty != nullptr) {
+        pending_empty->store(true, std::memory_order_relaxed);
+    }
+    try {
+        for (;;) {
+            bool did_work = false;
+            while (auto batch = take_diff_batch(source_batches, false)) {
+                const auto process_started_at = std::chrono::steady_clock::now();
+                if (pending_empty != nullptr) {
+                    pending_empty->store(false, std::memory_order_relaxed);
+                }
+                store_summary_source_batch(coordinator,
+                                           compare_mode,
+                                           recursive,
+                                           allow_target_only,
+                                           target_queue,
+                                           report,
+                                           report_mutex,
+                                           std::move(*batch));
+                if (timing != nullptr) {
+                    add_elapsed_ns(timing->joiner_process_ns,
+                                   process_started_at,
+                                   std::chrono::steady_clock::now());
+                }
+                did_work = true;
+            }
+            while (auto batch = take_diff_batch(target_batches, false)) {
+                const auto process_started_at = std::chrono::steady_clock::now();
+                if (pending_empty != nullptr) {
+                    pending_empty->store(false, std::memory_order_relaxed);
                 }
                 store_summary_target_batch(coordinator,
                                            compare_mode,
@@ -2251,11 +2643,50 @@ void target_summary_diff_worker(const std::string& target_root,
                                            target_queue,
                                            report,
                                            report_mutex,
-                                           std::move(batch));
-                finish_diff_target_folder_work(target_queue);
-            });
+                                           std::move(*batch));
+                if (timing != nullptr) {
+                    add_elapsed_ns(timing->joiner_process_ns,
+                                   process_started_at,
+                                   std::chrono::steady_clock::now());
+                }
+                did_work = true;
+            }
+            if (pending_empty != nullptr) {
+                pending_empty->store(summary_coordinator_empty(coordinator), std::memory_order_relaxed);
+            }
+
+            if (diff_batch_queue_drained(source_batches) && diff_batch_queue_drained(target_batches)) {
+                break;
+            }
+
+            if (!did_work) {
+                const auto idle_started_at = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                if (timing != nullptr) {
+                    add_elapsed_ns(timing->joiner_idle_ns,
+                                   idle_started_at,
+                                   std::chrono::steady_clock::now());
+                }
+            }
+        }
+
+        flush_unmatched_summary_batches(coordinator,
+                                        compare_mode,
+                                        recursive,
+                                        allow_target_only,
+                                        target_queue,
+                                        report,
+                                        report_mutex);
+        if (pending_empty != nullptr) {
+            pending_empty->store(true, std::memory_order_relaxed);
+        }
     } catch (...) {
         fail_diff_target_folder_work(target_queue);
+        fail_diff_batch_queue(source_batches);
+        fail_diff_batch_queue(target_batches);
+        if (pending_empty != nullptr) {
+            pending_empty->store(true, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -2304,7 +2735,10 @@ TransferReport run_summary_live_diff(const std::string& source_root,
                                      bool recursive,
                                      const NfsMetaReaderConfig& reader_config,
                                      double max_duration_seconds,
-                                     std::uint32_t stats_interval_seconds) {
+                                     std::uint32_t stats_interval_seconds,
+                                     std::size_t checker_threads,
+                                     std::size_t checker_request_queue_depth,
+                                     std::size_t checker_batch_queue_depth) {
     TransferReport report;
     report.mode = Mode::dry_run;
     const auto started_at = std::chrono::steady_clock::now();
@@ -2318,11 +2752,6 @@ TransferReport run_summary_live_diff(const std::string& source_root,
     }
 
     DiffTargetFolderQueue target_queue;
-    target_queue.max_entries = std::max<std::size_t>(
-        16384,
-        std::max<std::size_t>(1, reader_config.worker_count) *
-            std::max<std::size_t>(1, reader_config.async_directory_depth) * 2U);
-    LiveDiffSummaryCoordinator coordinator;
     std::mutex report_mutex;
     std::atomic<bool> stats_done{false};
     std::thread stats_thread;
@@ -2374,51 +2803,80 @@ TransferReport run_summary_live_diff(const std::string& source_root,
 
     const std::size_t thread_count = std::max<std::size_t>(1, reader_config.worker_count);
     const std::size_t async_depth = std::max<std::size_t>(1, reader_config.async_directory_depth);
+    const std::size_t checker_thread_count = std::max<std::size_t>(1, checker_threads);
     const bool allow_target_only = max_duration_seconds <= 0.0;
+    const std::size_t derived_request_queue_depth =
+        std::max<std::size_t>(16384, thread_count * async_depth * 2U);
+    target_queue.max_entries = checker_request_queue_depth != 0U
+                                   ? checker_request_queue_depth
+                                   : derived_request_queue_depth;
+    const std::size_t batch_queue_depth = checker_batch_queue_depth != 0U
+                                              ? checker_batch_queue_depth
+                                              : std::max<std::size_t>(16384, target_queue.max_entries);
+    const std::size_t batch_queue_depth_per_checker =
+        std::max<std::size_t>(1024U, (batch_queue_depth + checker_thread_count - 1U) / checker_thread_count);
+    DiffBatchQueueShards source_batches =
+        make_diff_batch_queue_shards(checker_thread_count, thread_count, batch_queue_depth_per_checker);
+    DiffBatchQueueShards target_batches =
+        make_diff_batch_queue_shards(checker_thread_count, thread_count, batch_queue_depth_per_checker);
+    std::vector<std::unique_ptr<std::atomic<bool>>> joiner_pending_empty;
+    joiner_pending_empty.reserve(checker_thread_count);
+    for (std::size_t index = 0; index < checker_thread_count; ++index) {
+        joiner_pending_empty.push_back(std::make_unique<std::atomic<bool>>(true));
+    }
     std::vector<std::thread> target_workers;
     std::vector<std::thread> source_workers;
+    std::vector<std::thread> checker_workers;
     target_workers.reserve(thread_count);
     source_workers.reserve(thread_count);
+    checker_workers.reserve(checker_thread_count);
     for (std::size_t index = 0; index < thread_count; ++index) {
         target_workers.emplace_back(target_summary_diff_worker,
                                     target_root,
-                                    recursive,
-                                    compare_mode,
-                                    allow_target_only,
                                     async_depth,
                                     std::ref(target_queue),
-                                    std::ref(coordinator),
-                                    std::ref(report),
-                                    std::ref(report_mutex));
+                                    std::ref(target_batches));
     }
+    for (std::size_t index = 0; index < checker_thread_count; ++index) {
+        checker_workers.emplace_back(summary_diff_joiner_worker,
+                                     compare_mode,
+                                     recursive,
+                                     allow_target_only,
+                                     std::ref(target_queue),
+                                     std::ref(*source_batches[index]),
+                                     std::ref(*target_batches[index]),
+                                     std::ref(report),
+                                     std::ref(report_mutex),
+                                     nullptr,
+                                     joiner_pending_empty[index].get());
+    }
+    std::thread target_closer(close_diff_target_input_when_ready,
+                              std::ref(target_queue),
+                              std::ref(source_batches),
+                              std::ref(target_batches),
+                              std::cref(joiner_pending_empty));
     for (std::size_t index = 0; index < thread_count; ++index) {
         source_workers.emplace_back(source_summary_diff_worker,
                                     source_root,
                                     recursive,
-                                    compare_mode,
-                                    allow_target_only,
                                     async_depth,
                                     std::ref(source_queue),
                                     std::ref(target_queue),
-                                    std::ref(coordinator),
-                                    std::ref(report),
-                                    std::ref(report_mutex));
+                                    std::ref(source_batches));
     }
 
     for (auto& worker : source_workers) {
         worker.join();
     }
-    mark_diff_target_input_done(target_queue);
+    if (target_closer.joinable()) {
+        target_closer.join();
+    }
     for (auto& worker : target_workers) {
         worker.join();
     }
-    flush_unmatched_summary_batches(coordinator,
-                                    compare_mode,
-                                    recursive,
-                                    allow_target_only,
-                                    target_queue,
-                                    report,
-                                    report_mutex);
+    for (auto& worker : checker_workers) {
+        worker.join();
+    }
     stats_done.store(true, std::memory_order_relaxed);
     if (stats_thread.joinable()) {
         stats_thread.join();
@@ -2430,7 +2888,1645 @@ TransferReport run_summary_live_diff(const std::string& source_root,
     if (target_queue.error) {
         std::rethrow_exception(target_queue.error);
     }
+    for (const auto& queue : source_batches) {
+        if (queue->error) {
+            std::rethrow_exception(queue->error);
+        }
+    }
+    for (const auto& queue : target_batches) {
+        if (queue->error) {
+            std::rethrow_exception(queue->error);
+        }
+    }
     return report;
+}
+
+enum class DistributedDiffFrameType : std::uint32_t {
+    config = 1,
+    source_folder = 2,
+    source_done = 3,
+    folder_result = 4,
+    target_done = 5,
+    error = 6,
+};
+
+struct DistributedDiffFrame {
+    DistributedDiffFrameType type = DistributedDiffFrameType::error;
+    std::string payload;
+};
+
+struct DistributedDiffSettings {
+    std::string compare_mode = "size";
+    bool recursive = true;
+    bool allow_target_only = true;
+};
+
+struct DistributedFolderDiffSummary {
+    std::string rel_path;
+    std::uint64_t source_scan_started_unix_ns = 0;
+    std::uint64_t source_scan_finished_unix_ns = 0;
+    std::uint64_t target_scan_started_unix_ns = 0;
+    std::uint64_t target_scan_finished_unix_ns = 0;
+    std::uint64_t result_sent_unix_ns = 0;
+    std::uint64_t result_received_unix_ns = 0;
+    std::uint64_t source_file_count = 0;
+    std::uint64_t target_file_count = 0;
+    std::uint64_t source_folder_count = 0;
+    std::uint64_t target_folder_count = 0;
+    std::uint64_t files_same = 0;
+    std::uint64_t files_changed = 0;
+    std::uint64_t files_new = 0;
+    std::uint64_t files_target_only = 0;
+    std::uint64_t files_failed = 0;
+    std::uint64_t source_logical_size_bytes = 0;
+    std::uint64_t target_logical_size_bytes = 0;
+    std::uint64_t same_logical_size_bytes = 0;
+    std::uint64_t changed_logical_size_bytes = 0;
+    std::uint64_t new_logical_size_bytes = 0;
+    std::uint64_t target_only_logical_size_bytes = 0;
+    std::uint64_t bytes_planned = 0;
+    std::uint8_t status = 0;
+    std::string error;
+};
+
+struct DistributedTargetWork {
+    std::optional<FlatFolderScanBatch> source_batch;
+    FileSpec target_folder;
+    bool target_only = false;
+};
+
+struct DistributedTargetQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<DistributedTargetWork> work;
+    std::size_t active = 0;
+    bool input_done = false;
+    bool done = false;
+    std::exception_ptr error;
+};
+
+struct DistributedDiffSharedStats {
+    std::mutex mutex;
+    DistributedDiffRunReport report;
+};
+
+inline constexpr std::uint64_t kDistributedDiffFrameMagic = 0x4859444946463031ULL;  // HYDIFF01.
+inline constexpr std::uint32_t kDistributedDiffFrameVersion = 1U;
+inline constexpr std::size_t kDistributedDiffHeaderBytes = 24U;
+inline constexpr std::size_t kDistributedDiffMaxPayloadBytes = 512U * 1024U * 1024U;
+
+std::uint64_t now_unix_ns() {
+    return unix_time_nanoseconds(std::chrono::system_clock::now());
+}
+
+void append_u8(std::string& out, std::uint8_t value) {
+    out.push_back(static_cast<char>(value));
+}
+
+void append_u32_be(std::string& out, std::uint32_t value) {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<char>((value >> static_cast<unsigned>(shift)) & 0xFFU));
+    }
+}
+
+void append_u64_be(std::string& out, std::uint64_t value) {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<char>((value >> static_cast<unsigned>(shift)) & 0xFFU));
+    }
+}
+
+void append_string_field(std::string& out, std::string_view value) {
+    if (value.size() > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("distributed diff string field is too large");
+    }
+    append_u32_be(out, static_cast<std::uint32_t>(value.size()));
+    out.append(value.data(), value.size());
+}
+
+std::uint8_t read_u8_field(std::string_view input, std::size_t& offset) {
+    if (offset >= input.size()) {
+        throw std::runtime_error("distributed diff payload is truncated");
+    }
+    return static_cast<std::uint8_t>(input[offset++]);
+}
+
+std::uint32_t read_u32_be_field(std::string_view input, std::size_t& offset) {
+    if (input.size() - offset < sizeof(std::uint32_t)) {
+        throw std::runtime_error("distributed diff payload is truncated");
+    }
+    std::uint32_t value = 0;
+    for (int index = 0; index < 4; ++index) {
+        value = (value << 8U) | static_cast<unsigned char>(input[offset++]);
+    }
+    return value;
+}
+
+std::uint64_t read_u64_be_field(std::string_view input, std::size_t& offset) {
+    if (input.size() - offset < sizeof(std::uint64_t)) {
+        throw std::runtime_error("distributed diff payload is truncated");
+    }
+    std::uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+        value = (value << 8U) | static_cast<unsigned char>(input[offset++]);
+    }
+    return value;
+}
+
+std::string read_string_field(std::string_view input, std::size_t& offset) {
+    const std::uint32_t bytes = read_u32_be_field(input, offset);
+    if (input.size() - offset < bytes) {
+        throw std::runtime_error("distributed diff string field is truncated");
+    }
+    std::string value(input.substr(offset, bytes));
+    offset += bytes;
+    return value;
+}
+
+std::string join_rel_child_path(std::string_view folder_path, std::string_view child_name) {
+    const std::string normalized_folder = normalize_path(folder_path);
+    if (normalized_folder.empty()) {
+        return normalize_path(child_name);
+    }
+    return normalize_path(normalized_folder + "/" + std::string(child_name));
+}
+
+std::string child_name_for_folder(std::string_view folder_path, std::string_view rel_path) {
+    const std::string normalized_folder = normalize_path(folder_path);
+    const std::string normalized_path = normalize_path(rel_path);
+    if (!normalized_folder.empty() &&
+        normalized_path.size() > normalized_folder.size() &&
+        normalized_path.compare(0U, normalized_folder.size(), normalized_folder) == 0 &&
+        normalized_path[normalized_folder.size()] == '/') {
+        return normalized_path.substr(normalized_folder.size() + 1U);
+    }
+    return base_name(normalized_path);
+}
+
+[[maybe_unused]] void write_distributed_diff_frame(int fd, DistributedDiffFrameType type, std::string_view payload) {
+    if (payload.size() > kDistributedDiffMaxPayloadBytes) {
+        throw std::runtime_error("distributed diff frame exceeds payload limit");
+    }
+    std::string header;
+    header.reserve(kDistributedDiffHeaderBytes);
+    append_u64_be(header, kDistributedDiffFrameMagic);
+    append_u32_be(header, kDistributedDiffFrameVersion);
+    append_u32_be(header, static_cast<std::uint32_t>(type));
+    append_u64_be(header, static_cast<std::uint64_t>(payload.size()));
+    write_all(fd, header.data(), header.size());
+    if (!payload.empty()) {
+        write_all(fd, payload.data(), payload.size());
+    }
+}
+
+[[maybe_unused]] std::optional<DistributedDiffFrame> read_distributed_diff_frame(int fd) {
+    std::array<char, kDistributedDiffHeaderBytes> header {};
+    if (!read_exact_or_eof(fd, header.data(), header.size())) {
+        return std::nullopt;
+    }
+    std::string_view header_view(header.data(), header.size());
+    std::size_t offset = 0;
+    if (read_u64_be_field(header_view, offset) != kDistributedDiffFrameMagic) {
+        throw std::runtime_error("distributed diff frame magic is invalid");
+    }
+    if (read_u32_be_field(header_view, offset) != kDistributedDiffFrameVersion) {
+        throw std::runtime_error("distributed diff frame version is unsupported");
+    }
+    DistributedDiffFrame frame;
+    frame.type = static_cast<DistributedDiffFrameType>(read_u32_be_field(header_view, offset));
+    const std::uint64_t payload_bytes = read_u64_be_field(header_view, offset);
+    if (payload_bytes > kDistributedDiffMaxPayloadBytes) {
+        throw std::runtime_error("distributed diff frame payload is too large");
+    }
+    frame.payload.assign(static_cast<std::size_t>(payload_bytes), '\0');
+    if (payload_bytes != 0U &&
+        !read_exact_or_eof(fd, frame.payload.data(), static_cast<std::size_t>(payload_bytes))) {
+        throw std::runtime_error("distributed diff frame payload ended early");
+    }
+    return frame;
+}
+
+[[maybe_unused]] std::string serialize_distributed_diff_settings(const DistributedDiffSettings& settings) {
+    std::string payload;
+    append_string_field(payload, settings.compare_mode);
+    append_u8(payload, settings.recursive ? 1U : 0U);
+    append_u8(payload, settings.allow_target_only ? 1U : 0U);
+    return payload;
+}
+
+[[maybe_unused]] DistributedDiffSettings deserialize_distributed_diff_settings(std::string_view payload) {
+    std::size_t offset = 0;
+    DistributedDiffSettings settings;
+    settings.compare_mode = read_string_field(payload, offset);
+    settings.recursive = read_u8_field(payload, offset) != 0U;
+    settings.allow_target_only = read_u8_field(payload, offset) != 0U;
+    return settings;
+}
+
+void append_file_spec_compact(std::string& payload, const FileSpec& spec, std::string_view folder_path) {
+    append_string_field(payload, child_name_for_folder(folder_path, spec.rel_path));
+    append_u64_be(payload, file_spec_logical_size(spec));
+    append_u64_be(payload, spec.mtime);
+    append_u32_be(payload, spec.mode);
+    append_u32_be(payload, spec.uid);
+    append_u32_be(payload, spec.gid);
+}
+
+FileSpec read_file_spec_compact(std::string_view payload, std::size_t& offset, std::string_view folder_path) {
+    FileSpec spec;
+    spec.rel_path = join_rel_child_path(folder_path, read_string_field(payload, offset));
+    spec.declared_size = read_u64_be_field(payload, offset);
+    spec.mtime = read_u64_be_field(payload, offset);
+    spec.mode = read_u32_be_field(payload, offset);
+    spec.uid = read_u32_be_field(payload, offset);
+    spec.gid = read_u32_be_field(payload, offset);
+    return spec;
+}
+
+[[maybe_unused]] std::string serialize_flat_folder_scan_batch(const FlatFolderScanBatch& batch) {
+    const std::string folder_path = normalize_path(batch.folder.rel_path);
+    std::string payload;
+    append_string_field(payload, folder_path);
+    append_u64_be(payload, batch.scan_started_unix_ns);
+    append_u64_be(payload, batch.scan_finished_unix_ns);
+    append_u8(payload, batch.failed ? 1U : 0U);
+    append_string_field(payload, batch.error);
+    append_u64_be(payload, batch.files.size());
+    append_u64_be(payload, batch.directories.size());
+    for (const auto& file : batch.files) {
+        append_file_spec_compact(payload, file, folder_path);
+    }
+    for (const auto& directory : batch.directories) {
+        append_file_spec_compact(payload, directory, folder_path);
+    }
+    return payload;
+}
+
+[[maybe_unused]] FlatFolderScanBatch deserialize_flat_folder_scan_batch(std::string_view payload) {
+    std::size_t offset = 0;
+    FlatFolderScanBatch batch;
+    batch.folder.rel_path = normalize_path(read_string_field(payload, offset));
+    batch.scan_started_unix_ns = read_u64_be_field(payload, offset);
+    batch.scan_finished_unix_ns = read_u64_be_field(payload, offset);
+    batch.failed = read_u8_field(payload, offset) != 0U;
+    batch.error = read_string_field(payload, offset);
+    const std::uint64_t file_count = read_u64_be_field(payload, offset);
+    const std::uint64_t directory_count = read_u64_be_field(payload, offset);
+    if (file_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+        directory_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("distributed diff folder batch has too many children");
+    }
+    batch.files.reserve(static_cast<std::size_t>(file_count));
+    for (std::uint64_t index = 0; index < file_count; ++index) {
+        batch.files.push_back(read_file_spec_compact(payload, offset, batch.folder.rel_path));
+    }
+    batch.directories.reserve(static_cast<std::size_t>(directory_count));
+    for (std::uint64_t index = 0; index < directory_count; ++index) {
+        batch.directories.push_back(read_file_spec_compact(payload, offset, batch.folder.rel_path));
+    }
+    if (offset != payload.size()) {
+        throw std::runtime_error("distributed diff folder batch has trailing bytes");
+    }
+    return batch;
+}
+
+[[maybe_unused]] std::string serialize_folder_diff_summary(const DistributedFolderDiffSummary& summary) {
+    std::string payload;
+    append_string_field(payload, summary.rel_path);
+    append_u64_be(payload, summary.source_scan_started_unix_ns);
+    append_u64_be(payload, summary.source_scan_finished_unix_ns);
+    append_u64_be(payload, summary.target_scan_started_unix_ns);
+    append_u64_be(payload, summary.target_scan_finished_unix_ns);
+    append_u64_be(payload, summary.result_sent_unix_ns);
+    append_u64_be(payload, summary.source_file_count);
+    append_u64_be(payload, summary.target_file_count);
+    append_u64_be(payload, summary.source_folder_count);
+    append_u64_be(payload, summary.target_folder_count);
+    append_u64_be(payload, summary.files_same);
+    append_u64_be(payload, summary.files_changed);
+    append_u64_be(payload, summary.files_new);
+    append_u64_be(payload, summary.files_target_only);
+    append_u64_be(payload, summary.files_failed);
+    append_u64_be(payload, summary.source_logical_size_bytes);
+    append_u64_be(payload, summary.target_logical_size_bytes);
+    append_u64_be(payload, summary.same_logical_size_bytes);
+    append_u64_be(payload, summary.changed_logical_size_bytes);
+    append_u64_be(payload, summary.new_logical_size_bytes);
+    append_u64_be(payload, summary.target_only_logical_size_bytes);
+    append_u64_be(payload, summary.bytes_planned);
+    append_u8(payload, summary.status);
+    append_string_field(payload, summary.error);
+    return payload;
+}
+
+[[maybe_unused]] DistributedFolderDiffSummary deserialize_folder_diff_summary(std::string_view payload) {
+    std::size_t offset = 0;
+    DistributedFolderDiffSummary summary;
+    summary.rel_path = normalize_path(read_string_field(payload, offset));
+    summary.source_scan_started_unix_ns = read_u64_be_field(payload, offset);
+    summary.source_scan_finished_unix_ns = read_u64_be_field(payload, offset);
+    summary.target_scan_started_unix_ns = read_u64_be_field(payload, offset);
+    summary.target_scan_finished_unix_ns = read_u64_be_field(payload, offset);
+    summary.result_sent_unix_ns = read_u64_be_field(payload, offset);
+    summary.source_file_count = read_u64_be_field(payload, offset);
+    summary.target_file_count = read_u64_be_field(payload, offset);
+    summary.source_folder_count = read_u64_be_field(payload, offset);
+    summary.target_folder_count = read_u64_be_field(payload, offset);
+    summary.files_same = read_u64_be_field(payload, offset);
+    summary.files_changed = read_u64_be_field(payload, offset);
+    summary.files_new = read_u64_be_field(payload, offset);
+    summary.files_target_only = read_u64_be_field(payload, offset);
+    summary.files_failed = read_u64_be_field(payload, offset);
+    summary.source_logical_size_bytes = read_u64_be_field(payload, offset);
+    summary.target_logical_size_bytes = read_u64_be_field(payload, offset);
+    summary.same_logical_size_bytes = read_u64_be_field(payload, offset);
+    summary.changed_logical_size_bytes = read_u64_be_field(payload, offset);
+    summary.new_logical_size_bytes = read_u64_be_field(payload, offset);
+    summary.target_only_logical_size_bytes = read_u64_be_field(payload, offset);
+    summary.bytes_planned = read_u64_be_field(payload, offset);
+    summary.status = read_u8_field(payload, offset);
+    summary.error = read_string_field(payload, offset);
+    if (offset != payload.size()) {
+        throw std::runtime_error("distributed diff summary has trailing bytes");
+    }
+    return summary;
+}
+
+[[maybe_unused]] DistributedFolderDiffSummary compare_distributed_folder_batches(const std::string& compare_mode,
+                                                                bool recursive,
+                                                                bool allow_target_only,
+                                                                const FlatFolderScanBatch& source_batch,
+                                                                const FlatFolderScanBatch& target_batch,
+                                                                std::vector<FileSpec>& target_only_child_work) {
+    DistributedFolderDiffSummary summary;
+    summary.rel_path = batch_folder_path(source_batch);
+    summary.source_scan_started_unix_ns = source_batch.scan_started_unix_ns;
+    summary.source_scan_finished_unix_ns = source_batch.scan_finished_unix_ns;
+    summary.target_scan_started_unix_ns = target_batch.scan_started_unix_ns;
+    summary.target_scan_finished_unix_ns = target_batch.scan_finished_unix_ns;
+    summary.source_file_count = source_batch.files.size();
+    summary.target_file_count = target_batch.failed ? 0U : target_batch.files.size();
+    summary.source_folder_count = source_batch.directories.size();
+    summary.target_folder_count = target_batch.failed ? 0U : target_batch.directories.size();
+
+    if (source_batch.failed) {
+        summary.status = 1U;
+        summary.files_failed = 1U;
+        summary.error = source_batch.error;
+        return summary;
+    }
+    if (target_batch.failed) {
+        summary.status = 2U;
+        summary.error = target_batch.error;
+    }
+
+    std::unordered_set<std::string> source_directories;
+    source_directories.reserve(source_batch.directories.size());
+    for (const auto& directory : source_batch.directories) {
+        source_directories.insert(normalize_path(directory.rel_path));
+    }
+
+    std::unordered_map<std::string_view, std::size_t> target_by_path;
+    std::vector<unsigned char> target_matched;
+    if (!target_batch.failed) {
+        target_by_path.reserve(target_batch.files.size());
+        target_matched.assign(target_batch.files.size(), 0U);
+        for (std::size_t index = 0; index < target_batch.files.size(); ++index) {
+            target_by_path.emplace(std::string_view(target_batch.files[index].rel_path), index);
+            summary.target_logical_size_bytes += file_spec_logical_size(target_batch.files[index]);
+        }
+    }
+
+    for (const auto& source : source_batch.files) {
+        const std::uint64_t source_size = file_spec_logical_size(source);
+        summary.source_logical_size_bytes += source_size;
+        const auto target_it = target_by_path.find(std::string_view(source.rel_path));
+        if (target_it == target_by_path.end()) {
+            ++summary.files_new;
+            summary.new_logical_size_bytes += source_size;
+            summary.bytes_planned += source_size;
+            continue;
+        }
+        target_matched[target_it->second] = 1U;
+        if (diff_file_specs_match(source, target_batch.files[target_it->second], compare_mode)) {
+            ++summary.files_same;
+            summary.same_logical_size_bytes += source_size;
+        } else {
+            ++summary.files_changed;
+            summary.changed_logical_size_bytes += source_size;
+            summary.bytes_planned += source_size;
+        }
+    }
+
+    if (allow_target_only && !target_batch.failed) {
+        for (std::size_t index = 0; index < target_batch.files.size(); ++index) {
+            if (target_matched[index] != 0U) {
+                continue;
+            }
+            ++summary.files_target_only;
+            summary.target_only_logical_size_bytes += file_spec_logical_size(target_batch.files[index]);
+        }
+        if (recursive) {
+            for (const auto& target_directory : target_batch.directories) {
+                if (source_directories.find(normalize_path(target_directory.rel_path)) == source_directories.end()) {
+                    FileSpec child = target_directory;
+                    child.need_check = false;
+                    target_only_child_work.push_back(std::move(child));
+                }
+            }
+        }
+    }
+
+    return summary;
+}
+
+[[maybe_unused]] DistributedFolderDiffSummary summarize_target_only_folder_batch(bool recursive,
+                                                                const FlatFolderScanBatch& target_batch,
+                                                                std::vector<FileSpec>& target_only_child_work) {
+    DistributedFolderDiffSummary summary;
+    summary.rel_path = batch_folder_path(target_batch);
+    summary.target_scan_started_unix_ns = target_batch.scan_started_unix_ns;
+    summary.target_scan_finished_unix_ns = target_batch.scan_finished_unix_ns;
+    summary.target_file_count = target_batch.failed ? 0U : target_batch.files.size();
+    summary.target_folder_count = target_batch.failed ? 0U : target_batch.directories.size();
+    if (target_batch.failed) {
+        summary.status = 2U;
+        summary.files_failed = 1U;
+        summary.error = target_batch.error;
+        return summary;
+    }
+    for (const auto& file : target_batch.files) {
+        ++summary.files_target_only;
+        const std::uint64_t size = file_spec_logical_size(file);
+        summary.target_logical_size_bytes += size;
+        summary.target_only_logical_size_bytes += size;
+    }
+    if (recursive) {
+        for (const auto& directory : target_batch.directories) {
+            FileSpec child = directory;
+            child.need_check = false;
+            target_only_child_work.push_back(std::move(child));
+        }
+    }
+    return summary;
+}
+
+[[maybe_unused]] void enqueue_distributed_target_work(DistributedTargetQueue& queue, DistributedTargetWork work) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.done || queue.error) {
+            return;
+        }
+        queue.work.push_back(std::move(work));
+    }
+    queue.cv.notify_one();
+}
+
+[[maybe_unused]] std::optional<DistributedTargetWork> take_distributed_target_work(DistributedTargetQueue& queue) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    queue.cv.wait(lock, [&queue]() {
+        return queue.done || queue.error || !queue.work.empty() || queue.input_done;
+    });
+    if (queue.error || queue.done || queue.work.empty()) {
+        return std::nullopt;
+    }
+    DistributedTargetWork work = std::move(queue.work.front());
+    queue.work.pop_front();
+    ++queue.active;
+    return work;
+}
+
+[[maybe_unused]] void finish_distributed_target_work(DistributedTargetQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.active != 0U) {
+            --queue.active;
+        }
+        if (queue.input_done && queue.work.empty() && queue.active == 0U) {
+            queue.done = true;
+        }
+    }
+    queue.cv.notify_all();
+}
+
+[[maybe_unused]] void mark_distributed_target_input_done(DistributedTargetQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.input_done = true;
+        if (queue.work.empty() && queue.active == 0U) {
+            queue.done = true;
+        }
+    }
+    queue.cv.notify_all();
+}
+
+[[maybe_unused]] void fail_distributed_target_queue(DistributedTargetQueue& queue,
+                                   std::exception_ptr error = std::current_exception()) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.done = true;
+        queue.work.clear();
+        if (!queue.error && error != nullptr) {
+            queue.error = error;
+        }
+    }
+    queue.cv.notify_all();
+}
+
+void write_folder_diff_csv_header(std::ostream& out) {
+    out << "rel_path,"
+        << "source_scan_started_unix_ns,source_scan_finished_unix_ns,"
+        << "target_scan_started_unix_ns,target_scan_finished_unix_ns,"
+        << "result_sent_unix_ns,result_received_unix_ns,"
+        << "source_file_count,target_file_count,total_file_count,"
+        << "source_folder_count,target_folder_count,"
+        << "same_file_count,changed_file_count,new_file_count,target_only_file_count,failed_file_count,"
+        << "source_logical_size_bytes,target_logical_size_bytes,"
+        << "same_logical_size_bytes,changed_logical_size_bytes,new_logical_size_bytes,target_only_logical_size_bytes,"
+        << "bytes_planned,status,error\n";
+}
+
+[[maybe_unused]] void write_folder_diff_csv_row(std::ostream& out, const DistributedFolderDiffSummary& summary) {
+    out << diff_csv_quote(summary.rel_path) << ','
+        << summary.source_scan_started_unix_ns << ','
+        << summary.source_scan_finished_unix_ns << ','
+        << summary.target_scan_started_unix_ns << ','
+        << summary.target_scan_finished_unix_ns << ','
+        << summary.result_sent_unix_ns << ','
+        << summary.result_received_unix_ns << ','
+        << summary.source_file_count << ','
+        << summary.target_file_count << ','
+        << (summary.source_file_count + summary.target_file_count) << ','
+        << summary.source_folder_count << ','
+        << summary.target_folder_count << ','
+        << summary.files_same << ','
+        << summary.files_changed << ','
+        << summary.files_new << ','
+        << summary.files_target_only << ','
+        << summary.files_failed << ','
+        << summary.source_logical_size_bytes << ','
+        << summary.target_logical_size_bytes << ','
+        << summary.same_logical_size_bytes << ','
+        << summary.changed_logical_size_bytes << ','
+        << summary.new_logical_size_bytes << ','
+        << summary.target_only_logical_size_bytes << ','
+        << summary.bytes_planned << ','
+        << static_cast<unsigned>(summary.status) << ','
+        << diff_csv_quote(summary.error) << '\n';
+}
+
+[[maybe_unused]] void merge_distributed_diff_summary(DistributedDiffRunReport& report,
+                                    const DistributedFolderDiffSummary& summary) {
+    ++report.folders_reported;
+    report.files_compared += summary.source_file_count + summary.files_target_only;
+    report.files_same += summary.files_same;
+    report.files_changed += summary.files_changed;
+    report.files_new += summary.files_new;
+    report.files_target_only += summary.files_target_only;
+    report.files_failed += summary.files_failed;
+    report.source_logical_size_bytes += summary.source_logical_size_bytes;
+    report.target_logical_size_bytes += summary.target_logical_size_bytes;
+    report.bytes_planned += summary.bytes_planned;
+}
+
+void print_distributed_diff_source_stats(const DistributedDiffRunReport& report,
+                                         std::chrono::steady_clock::time_point started_at,
+                                         std::uint64_t last_folders,
+                                         std::chrono::steady_clock::time_point last_at) {
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - started_at).count();
+    const double interval_elapsed = std::chrono::duration<double>(now - last_at).count();
+    const std::uint64_t interval_folders =
+        report.folders_reported >= last_folders ? report.folders_reported - last_folders : 0U;
+    const double folders_per_second = elapsed > 0.0 ? static_cast<double>(report.folders_reported) / elapsed : 0.0;
+    const double interval_folders_per_second =
+        interval_elapsed > 0.0 ? static_cast<double>(interval_folders) / interval_elapsed : 0.0;
+    const double files_per_second = elapsed > 0.0 ? static_cast<double>(report.files_compared) / elapsed : 0.0;
+    std::cout << "distributed_diff_source_stats"
+              << " folders_sent=" << report.folders_sent
+              << " folders_reported=" << report.folders_reported
+              << " folders_per_second=" << folders_per_second
+              << " interval_folders_per_second=" << interval_folders_per_second
+              << " files_per_second=" << files_per_second
+              << " files_compared=" << report.files_compared
+              << " same=" << report.files_same
+              << " changed=" << report.files_changed
+              << " new=" << report.files_new
+              << " target_only=" << report.files_target_only
+              << " bytes_planned=" << report.bytes_planned
+              << " elapsed_seconds=" << elapsed << std::endl;
+}
+
+std::size_t metadata_batch_payload_size(RawBufferPool& pool, const BufferHandle& handle) {
+    const MetadataBatchBuffer& buffer = metadata_batch_buffer(pool, handle);
+    return sizeof(std::uint32_t) + sizeof(std::uint32_t) + buffer.bytes_used;
+}
+
+void merge_folder_diff_summary(DistributedDiffRunReport& report, const FolderDiffSummary& summary) {
+    ++report.folders_reported;
+    report.files_compared += summary.source_file_count + summary.files_target_only;
+    report.files_same += summary.files_same;
+    report.files_changed += summary.files_changed;
+    report.files_new += summary.files_new;
+    report.files_target_only += summary.files_target_only;
+    report.files_failed += summary.files_failed;
+    report.source_logical_size_bytes += summary.source_logical_size_bytes;
+    report.target_logical_size_bytes += summary.target_logical_size_bytes;
+    report.bytes_planned += summary.bytes_planned;
+}
+
+void write_folder_diff_csv_row(std::ostream& out, const FolderDiffSummary& summary) {
+    out << diff_csv_quote(summary.rel_path) << ','
+        << summary.source_scan_started_unix_ns << ','
+        << summary.source_scan_finished_unix_ns << ','
+        << summary.target_scan_started_unix_ns << ','
+        << summary.target_scan_finished_unix_ns << ','
+        << summary.result_sent_unix_ns << ','
+        << summary.result_received_unix_ns << ','
+        << summary.source_file_count << ','
+        << summary.target_file_count << ','
+        << (summary.source_file_count + summary.target_file_count) << ','
+        << summary.source_folder_count << ','
+        << summary.target_folder_count << ','
+        << summary.files_same << ','
+        << summary.files_changed << ','
+        << summary.files_new << ','
+        << summary.files_target_only << ','
+        << summary.files_failed << ','
+        << summary.source_logical_size_bytes << ','
+        << summary.target_logical_size_bytes << ','
+        << summary.same_logical_size_bytes << ','
+        << summary.changed_logical_size_bytes << ','
+        << summary.new_logical_size_bytes << ','
+        << summary.target_only_logical_size_bytes << ','
+        << summary.bytes_planned << ','
+        << static_cast<unsigned>(summary.status) << ','
+        << diff_csv_quote(summary.error) << '\n';
+}
+
+template <typename AcquireBuffer, typename PushBuffer>
+void pack_flat_folder_batch_to_queue_with(const FlatFolderScanBatch& batch,
+                                          std::string_view compare_mode,
+                                          RawBufferPool& pool,
+                                          AcquireBuffer acquire_buffer,
+                                          PushBuffer push_buffer) {
+    const std::uint64_t logical_size = flat_folder_logical_size(batch.files);
+    const std::uint64_t metadata_hash =
+        batch.failed ? 0U : flat_folder_metadata_hash(batch.files, batch.directories, compare_mode);
+    const std::uint64_t file_count = batch.failed ? 0U : static_cast<std::uint64_t>(batch.files.size());
+    const std::uint64_t folder_count = batch.failed ? 0U : static_cast<std::uint64_t>(batch.directories.size());
+    std::uint32_t sequence = 0;
+
+    BufferHandle current = acquire_buffer();
+    reset_flat_folder_buffer(metadata_batch_buffer(pool, current),
+                             batch.folder,
+                             sequence,
+                             false,
+                             batch.failed,
+                             batch.error,
+                             file_count,
+                             folder_count,
+                             logical_size,
+                             metadata_hash,
+                             batch.scan_started_unix_ns,
+                             batch.scan_finished_unix_ns);
+
+    if (batch.failed) {
+        set_flat_folder_buffer_final(metadata_batch_buffer(pool, current), true);
+        push_buffer(current);
+        return;
+    }
+
+    const auto flush_current = [&](bool final_batch) {
+        set_flat_folder_buffer_final(metadata_batch_buffer(pool, current), final_batch);
+        push_buffer(current);
+    };
+
+    const auto start_next = [&] {
+        ++sequence;
+        current = acquire_buffer();
+        reset_flat_folder_buffer(metadata_batch_buffer(pool, current),
+                                 batch.folder,
+                                 sequence,
+                                 false,
+                                 false,
+                                 {},
+                                 file_count,
+                                 folder_count,
+                                 logical_size,
+                                 metadata_hash,
+                                 batch.scan_started_unix_ns,
+                                 batch.scan_finished_unix_ns);
+    };
+
+    for (const FileSpec& file : batch.files) {
+        if (!append_flat_folder_file(metadata_batch_buffer(pool, current), file, compare_mode)) {
+            flush_current(false);
+            start_next();
+            if (!append_flat_folder_file(metadata_batch_buffer(pool, current), file, compare_mode)) {
+                pool.release(current);
+                throw std::runtime_error("single file record is too large for flat-folder metadata buffer");
+            }
+        }
+    }
+    for (const FileSpec& folder : batch.directories) {
+        if (!append_flat_folder_folder(metadata_batch_buffer(pool, current), folder, compare_mode)) {
+            flush_current(false);
+            start_next();
+            if (!append_flat_folder_folder(metadata_batch_buffer(pool, current), folder, compare_mode)) {
+                pool.release(current);
+                throw std::runtime_error("single folder record is too large for flat-folder metadata buffer");
+            }
+        }
+    }
+    flush_current(true);
+}
+
+class FlatFolderScannerBufferJob final : public ThreadedJob {
+public:
+    FlatFolderScannerBufferJob(std::string root,
+                               bool recursive,
+                               std::string compare_mode,
+                               std::size_t worker_count,
+                               std::size_t async_depth,
+                               RawBufferPool& output_pool,
+                               BufQueue& output,
+                               double max_duration_seconds)
+        : ThreadedJob(worker_count),
+          root_(std::move(root)),
+          recursive_(recursive),
+          compare_mode_(std::move(compare_mode)),
+          async_depth_(std::max<std::size_t>(1U, async_depth)),
+          output_pool_(output_pool),
+          output_(output),
+          max_duration_seconds_(max_duration_seconds) {}
+
+    [[nodiscard]] DistributedDiffRunReport stats() const {
+        DistributedDiffRunReport report;
+        report.folders_sent = folders_sent_.load(std::memory_order_acquire);
+        report.files_compared = files_seen_.load(std::memory_order_acquire);
+        report.source_logical_size_bytes = logical_size_.load(std::memory_order_acquire);
+        return report;
+    }
+
+protected:
+    void on_starting() override {
+        {
+            std::lock_guard<std::mutex> lock(queue_.mutex);
+            queue_.folders.clear();
+            queue_.folders.push_back(FileSpec{});
+            queue_.active = 0;
+            queue_.done = false;
+            queue_.error = nullptr;
+            if (max_duration_seconds_ > 0.0) {
+                queue_.stop_at = std::chrono::steady_clock::now() +
+                                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                     std::chrono::duration<double>(max_duration_seconds_));
+            }
+        }
+        queue_.cv.notify_all();
+    }
+
+    void run_worker(std::size_t worker_index) override {
+        auto backend = make_nfs_backend(root_);
+        auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
+        backend->scan_flat_folders(
+            async_depth_,
+            [this](bool wait_for_work) {
+                return take_flat_folder_work(queue_, wait_for_work);
+            },
+            [this] {
+                return stop_requested() || flat_metadata_scan_should_stop(queue_);
+            },
+            [this, worker_index](FlatFolderScanBatch batch) {
+                if (!batch.failed && recursive_ && !flat_metadata_scan_should_stop(queue_)) {
+                    std::vector<FileSpec> child_work;
+                    child_work.reserve(batch.directories.size());
+                    for (FileSpec directory : batch.directories) {
+                        directory.rel_path = normalize_path(directory.rel_path);
+                        child_work.push_back(std::move(directory));
+                    }
+                    enqueue_flat_folder_work(queue_, std::move(child_work));
+                }
+                files_seen_.fetch_add(batch.files.size(), std::memory_order_relaxed);
+                logical_size_.fetch_add(flat_folder_logical_size(batch.files), std::memory_order_relaxed);
+                pack_flat_folder_batch_to_queue_with(
+                    batch,
+                    compare_mode_,
+                    output_pool_,
+                    [this, worker_index] {
+                        if (auto handle = wait_for_pool(worker_index, output_pool_); handle.has_value()) {
+                            return *handle;
+                        }
+                        throw std::runtime_error("flat folder scanner stopped while waiting for output buffer");
+                    },
+                    [this, worker_index](const BufferHandle& handle) {
+                        if (!wait_for_output(worker_index, output_, handle)) {
+                            output_pool_.release(handle);
+                            throw std::runtime_error("flat folder scanner output queue closed");
+                        }
+                    });
+                folders_sent_.fetch_add(1U, std::memory_order_relaxed);
+                finish_flat_folder_work(queue_);
+            });
+        if (flat_metadata_scan_should_stop(queue_)) {
+            request_flat_folder_stop(queue_);
+        }
+    }
+
+    void on_stop_requested() override {
+        request_flat_folder_stop(queue_);
+        output_.close();
+    }
+
+    void on_all_workers_finished() override {
+        output_.close();
+    }
+
+private:
+    std::string root_;
+    bool recursive_ = true;
+    std::string compare_mode_;
+    std::size_t async_depth_ = 1;
+    RawBufferPool& output_pool_;
+    BufQueue& output_;
+    double max_duration_seconds_ = 0.0;
+    FlatMetadataWorkQueue queue_;
+    std::atomic<std::uint64_t> folders_sent_ {0};
+    std::atomic<std::uint64_t> files_seen_ {0};
+    std::atomic<std::uint64_t> logical_size_ {0};
+};
+
+std::size_t shard_for_folder_hash(std::uint64_t folder_hash, std::size_t shard_count) {
+    return shard_count == 0U ? 0U : static_cast<std::size_t>(folder_hash % shard_count);
+}
+
+inline constexpr BufferPoolId kDistributedDiffSourcePoolId = 30;
+inline constexpr BufferPoolId kDistributedDiffRequestPoolId = 31;
+inline constexpr BufferPoolId kDistributedDiffTargetPoolId = 32;
+inline constexpr BufferPoolId kDistributedDiffResultPoolId = 33;
+inline constexpr std::uint32_t kDistributedDiffResultFlushRecords = 512;
+inline constexpr auto kDistributedDiffResultFlushInterval = std::chrono::milliseconds(500);
+
+RawBufferPool make_distributed_diff_metadata_pool(BufferPoolId pool_id, std::size_t capacity) {
+    return RawBufferPool(pool_id, capacity, sizeof(MetadataBatchBuffer), alignof(MetadataBatchBuffer));
+}
+
+class SourceBatchRouterJob final : public ThreadedJob {
+public:
+    struct Stats {
+        std::uint64_t source_batches_routed = 0;
+        std::uint64_t target_requests_sent = 0;
+    };
+
+    SourceBatchRouterJob(BufQueue& input,
+                         RawBufferPool& source_pool,
+                         RawBufferPool& request_pool,
+                         BufQueue& target_requests,
+                         std::vector<std::unique_ptr<BufQueue>>& diff_shards)
+        : ThreadedJob(1U),
+          input_(input),
+          source_pool_(source_pool),
+          request_pool_(request_pool),
+          target_requests_(target_requests),
+          diff_shards_(diff_shards) {}
+
+    [[nodiscard]] Stats stats() const {
+        return {source_batches_routed_.load(std::memory_order_acquire),
+                target_requests_sent_.load(std::memory_order_acquire)};
+    }
+
+protected:
+    void run_worker(std::size_t worker_index) override {
+        BufferHandle handle;
+        while (!stop_requested() && wait_for_input(worker_index, input_, handle)) {
+            const MetadataBatchBuffer& source_buffer = metadata_batch_buffer(source_pool_, handle);
+            const FlatFolderBufferInfo info = flat_folder_buffer_info(source_buffer);
+            if (info.sequence == 0U && !info.failed) {
+                const std::optional<BufferHandle> acquired = wait_for_pool(worker_index, request_pool_);
+                if (!acquired.has_value()) {
+                    source_pool_.release(handle);
+                    break;
+                }
+                BufferHandle request = *acquired;
+                FileSpec folder;
+                folder.rel_path.assign(info.folder_path);
+                folder.mtime = info.folder_mtime;
+                folder.mode = info.folder_mode;
+                folder.uid = info.folder_uid;
+                folder.gid = info.folder_gid;
+                reset_flat_folder_buffer(metadata_batch_buffer(request_pool_, request),
+                                         folder,
+                                         0,
+                                         true,
+                                         false,
+                                         {},
+                                         0,
+                                         0,
+                                         0,
+                                         0,
+                                         0,
+                                         0);
+                if (!wait_for_output(worker_index, target_requests_, request)) {
+                    request_pool_.release(request);
+                    source_pool_.release(handle);
+                    break;
+                }
+                target_requests_sent_.fetch_add(1U, std::memory_order_relaxed);
+            }
+            const std::size_t shard = shard_for_folder_hash(info.folder_hash, diff_shards_.size());
+            if (!wait_for_output(worker_index, *diff_shards_[shard], handle)) {
+                source_pool_.release(handle);
+                break;
+            }
+            source_batches_routed_.fetch_add(1U, std::memory_order_relaxed);
+        }
+    }
+
+    void on_stop_requested() override {
+        input_.close();
+        target_requests_.close();
+    }
+
+    void on_all_workers_finished() override {
+        target_requests_.close();
+    }
+
+private:
+    BufQueue& input_;
+    RawBufferPool& source_pool_;
+    RawBufferPool& request_pool_;
+    BufQueue& target_requests_;
+    std::vector<std::unique_ptr<BufQueue>>& diff_shards_;
+    std::atomic<std::uint64_t> source_batches_routed_ {0};
+    std::atomic<std::uint64_t> target_requests_sent_ {0};
+};
+
+class TargetFolderScannerBufferJob final : public ThreadedJob {
+public:
+    struct Stats {
+        std::uint64_t folders_scanned = 0;
+        std::uint64_t files_seen = 0;
+        std::uint64_t logical_size_bytes = 0;
+    };
+
+    TargetFolderScannerBufferJob(std::string target_root,
+                                 std::string compare_mode,
+                                 std::size_t worker_count,
+                                 std::size_t async_depth,
+                                 BufQueue& requests,
+                                 RawBufferPool& request_pool,
+                                 RawBufferPool& output_pool,
+                                 std::vector<std::unique_ptr<BufQueue>>& diff_shards)
+        : ThreadedJob(worker_count),
+          target_root_(std::move(target_root)),
+          compare_mode_(std::move(compare_mode)),
+          async_depth_(std::max<std::size_t>(1U, async_depth)),
+          requests_(requests),
+          request_pool_(request_pool),
+          output_pool_(output_pool),
+          diff_shards_(diff_shards) {}
+
+    [[nodiscard]] Stats stats() const {
+        return {folders_scanned_.load(std::memory_order_acquire),
+                files_seen_.load(std::memory_order_acquire),
+                logical_size_bytes_.load(std::memory_order_acquire)};
+    }
+
+protected:
+    void run_worker(std::size_t worker_index) override {
+        auto backend = make_nfs_backend(target_root_);
+        auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
+        backend->scan_flat_folders(
+            async_depth_,
+            [this, worker_index](bool wait_for_work) -> std::optional<FileSpec> {
+                BufferHandle request;
+                const bool got_request =
+                    wait_for_work ? wait_for_input(worker_index, requests_, request) : requests_.try_pop(request);
+                if (!got_request) {
+                    return std::nullopt;
+                }
+
+                const FlatFolderBufferInfo request_info =
+                    flat_folder_buffer_info(metadata_batch_buffer(request_pool_, request));
+                FileSpec folder;
+                folder.rel_path.assign(request_info.folder_path);
+                folder.mtime = request_info.folder_mtime;
+                folder.mode = request_info.folder_mode;
+                folder.uid = request_info.folder_uid;
+                folder.gid = request_info.folder_gid;
+                request_pool_.release(request);
+                return folder;
+            },
+            [this] {
+                return stop_requested();
+            },
+            [this, worker_index](FlatFolderScanBatch batch) {
+                files_seen_.fetch_add(batch.files.size(), std::memory_order_relaxed);
+                logical_size_bytes_.fetch_add(flat_folder_logical_size(batch.files), std::memory_order_relaxed);
+                const std::uint64_t folder_hash = folder_hash_for_path(batch.folder.rel_path);
+                const std::size_t shard = shard_for_folder_hash(folder_hash, diff_shards_.size());
+                pack_flat_folder_batch_to_queue_with(
+                    batch,
+                    compare_mode_,
+                    output_pool_,
+                    [this, worker_index] {
+                        if (auto handle = wait_for_pool(worker_index, output_pool_); handle.has_value()) {
+                            return *handle;
+                        }
+                        throw std::runtime_error("target folder scanner stopped while waiting for output buffer");
+                    },
+                    [this, worker_index, shard](const BufferHandle& handle) {
+                        if (!wait_for_output(worker_index, *diff_shards_[shard], handle)) {
+                            output_pool_.release(handle);
+                            throw std::runtime_error("target folder scanner output queue closed");
+                        }
+                    });
+                folders_scanned_.fetch_add(1U, std::memory_order_relaxed);
+            });
+    }
+
+    void on_stop_requested() override {
+        requests_.close();
+        for (auto& queue : diff_shards_) {
+            queue->close();
+        }
+    }
+
+    void on_all_workers_finished() override {
+        for (auto& queue : diff_shards_) {
+            queue->close();
+        }
+    }
+
+private:
+    std::string target_root_;
+    std::string compare_mode_;
+    std::size_t async_depth_ = 1;
+    BufQueue& requests_;
+    RawBufferPool& request_pool_;
+    RawBufferPool& output_pool_;
+    std::vector<std::unique_ptr<BufQueue>>& diff_shards_;
+    std::atomic<std::uint64_t> folders_scanned_ {0};
+    std::atomic<std::uint64_t> files_seen_ {0};
+    std::atomic<std::uint64_t> logical_size_bytes_ {0};
+};
+
+struct ComparableFlatFile {
+    std::uint64_t name_hash = 0;
+    std::uint64_t metadata_hash = 0;
+    std::uint64_t logical_size = 0;
+};
+
+struct PendingDiffFolder {
+    std::vector<BufferHandle> source;
+    std::vector<BufferHandle> target;
+    bool source_done = false;
+    bool target_done = false;
+};
+
+class FolderDiffShardJob final : public ThreadedJob {
+public:
+    struct Stats {
+        std::uint64_t folders_compared = 0;
+        std::uint64_t files_compared = 0;
+        std::uint64_t bytes_planned = 0;
+        std::uint64_t source_batches = 0;
+        std::uint64_t target_batches = 0;
+    };
+
+    FolderDiffShardJob(BufQueue& input,
+                       RawBufferPool& source_pool,
+                       RawBufferPool& target_pool,
+                       RawBufferPool& result_pool,
+                       BufQueue& results)
+        : ThreadedJob(1U),
+          input_(input),
+          source_pool_(source_pool),
+          target_pool_(target_pool),
+          result_pool_(result_pool),
+          results_(results) {}
+
+    [[nodiscard]] Stats stats() const {
+        return {folders_compared_.load(std::memory_order_acquire),
+                files_compared_.load(std::memory_order_acquire),
+                bytes_planned_.load(std::memory_order_acquire),
+                source_batches_.load(std::memory_order_acquire),
+                target_batches_.load(std::memory_order_acquire)};
+    }
+
+protected:
+    void run_worker(std::size_t worker_index) override {
+        BufferHandle handle;
+        while (!stop_requested() && wait_for_input(worker_index, input_, handle)) {
+            if (handle.pool_id == source_pool_.pool_id()) {
+                source_batches_.fetch_add(1U, std::memory_order_relaxed);
+                accept_batch(handle, true, worker_index);
+            } else if (handle.pool_id == target_pool_.pool_id()) {
+                target_batches_.fetch_add(1U, std::memory_order_relaxed);
+                accept_batch(handle, false, worker_index);
+            } else {
+                throw std::runtime_error("diff shard received a buffer from an unexpected pool");
+            }
+        }
+        flush_missing_targets(worker_index);
+        flush_result_buffer(worker_index);
+    }
+
+    void on_stop_requested() override {
+        input_.close();
+    }
+
+private:
+    void accept_batch(const BufferHandle& handle, bool source_side, std::size_t worker_index) {
+        RawBufferPool& pool = source_side ? source_pool_ : target_pool_;
+        const FlatFolderBufferInfo info = flat_folder_buffer_info(metadata_batch_buffer(pool, handle));
+        PendingDiffFolder& pending = pending_[info.folder_hash];
+        if (source_side) {
+            pending.source.push_back(handle);
+            pending.source_done = pending.source_done || info.final_batch;
+        } else {
+            pending.target.push_back(handle);
+            pending.target_done = pending.target_done || info.final_batch;
+        }
+        if (pending.source_done && pending.target_done) {
+            compare_ready_folder(info.folder_hash, pending, worker_index);
+            pending_.erase(info.folder_hash);
+        }
+    }
+
+    void flush_missing_targets(std::size_t worker_index) {
+        std::vector<std::uint64_t> ready;
+        ready.reserve(pending_.size());
+        for (const auto& [folder_hash, pending] : pending_) {
+            if (pending.source_done) {
+                ready.push_back(folder_hash);
+            }
+        }
+        for (std::uint64_t folder_hash : ready) {
+            auto it = pending_.find(folder_hash);
+            if (it == pending_.end()) {
+                continue;
+            }
+            compare_ready_folder(folder_hash, it->second, worker_index);
+            pending_.erase(it);
+        }
+    }
+
+    static void collect_files(const std::vector<BufferHandle>& handles,
+                              RawBufferPool& pool,
+                              std::vector<ComparableFlatFile>& out) {
+        for (const BufferHandle& handle : handles) {
+            visit_flat_folder_children(metadata_batch_buffer(pool, handle), [&out](FlatFolderChildView child) {
+                if (!child.is_file) {
+                    return;
+                }
+                out.push_back(ComparableFlatFile{child.name_hash, child.metadata_hash, child.logical_size});
+            });
+        }
+        std::sort(out.begin(), out.end(), [](const ComparableFlatFile& lhs, const ComparableFlatFile& rhs) {
+            return lhs.name_hash < rhs.name_hash;
+        });
+    }
+
+    void compare_ready_folder(std::uint64_t folder_hash,
+                              PendingDiffFolder& pending,
+                              std::size_t worker_index) {
+        (void)folder_hash;
+        FolderDiffSummary summary;
+        const bool has_source = !pending.source.empty();
+        const bool has_target = !pending.target.empty();
+        FlatFolderBufferInfo source_info;
+        FlatFolderBufferInfo target_info;
+        if (has_source) {
+            source_info = flat_folder_buffer_info(metadata_batch_buffer(source_pool_, pending.source.front()));
+            summary.rel_path = source_info.folder_path;
+            summary.source_scan_started_unix_ns = source_info.scan_started_unix_ns;
+            summary.source_scan_finished_unix_ns = source_info.scan_finished_unix_ns;
+            summary.source_file_count = source_info.total_file_count;
+            summary.source_folder_count = source_info.total_folder_count;
+            summary.source_logical_size_bytes = source_info.total_logical_size_bytes;
+        }
+        if (has_target) {
+            target_info = flat_folder_buffer_info(metadata_batch_buffer(target_pool_, pending.target.front()));
+            if (!has_source) {
+                summary.rel_path = target_info.folder_path;
+            }
+            summary.target_scan_started_unix_ns = target_info.scan_started_unix_ns;
+            summary.target_scan_finished_unix_ns = target_info.scan_finished_unix_ns;
+            summary.target_file_count = target_info.total_file_count;
+            summary.target_folder_count = target_info.total_folder_count;
+            summary.target_logical_size_bytes = target_info.total_logical_size_bytes;
+        }
+
+        if (!has_source || source_info.failed) {
+            summary.status = 1U;
+            summary.files_failed = 1U;
+            summary.error = has_source ? source_info.error : std::string_view("missing source folder batch");
+        } else if (!has_target || target_info.failed) {
+            summary.status = 2U;
+            summary.files_new = source_info.total_file_count;
+            summary.new_logical_size_bytes = source_info.total_logical_size_bytes;
+            summary.bytes_planned = source_info.total_logical_size_bytes;
+            summary.error = has_target ? target_info.error : std::string_view("missing target folder batch");
+        } else if (source_info.total_file_count == target_info.total_file_count &&
+                   source_info.total_folder_count == target_info.total_folder_count &&
+                   source_info.total_logical_size_bytes == target_info.total_logical_size_bytes &&
+                   source_info.metadata_hash == target_info.metadata_hash) {
+            summary.files_same = source_info.total_file_count;
+            summary.same_logical_size_bytes = source_info.total_logical_size_bytes;
+        } else {
+            std::vector<ComparableFlatFile> source_files;
+            std::vector<ComparableFlatFile> target_files;
+            source_files.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(
+                source_info.total_file_count, static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))));
+            target_files.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(
+                target_info.total_file_count, static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))));
+            collect_files(pending.source, source_pool_, source_files);
+            collect_files(pending.target, target_pool_, target_files);
+            std::size_t source_index = 0;
+            std::size_t target_index = 0;
+            while (source_index < source_files.size() || target_index < target_files.size()) {
+                if (target_index >= target_files.size() ||
+                    (source_index < source_files.size() &&
+                     source_files[source_index].name_hash < target_files[target_index].name_hash)) {
+                    ++summary.files_new;
+                    summary.new_logical_size_bytes += source_files[source_index].logical_size;
+                    summary.bytes_planned += source_files[source_index].logical_size;
+                    ++source_index;
+                    continue;
+                }
+                if (source_index >= source_files.size() ||
+                    target_files[target_index].name_hash < source_files[source_index].name_hash) {
+                    ++summary.files_target_only;
+                    summary.target_only_logical_size_bytes += target_files[target_index].logical_size;
+                    ++target_index;
+                    continue;
+                }
+                if (source_files[source_index].metadata_hash == target_files[target_index].metadata_hash) {
+                    ++summary.files_same;
+                    summary.same_logical_size_bytes += source_files[source_index].logical_size;
+                } else {
+                    ++summary.files_changed;
+                    summary.changed_logical_size_bytes += source_files[source_index].logical_size;
+                    summary.bytes_planned += source_files[source_index].logical_size;
+                }
+                ++source_index;
+                ++target_index;
+            }
+        }
+
+        summary.result_sent_unix_ns = now_unix_ns();
+        folders_compared_.fetch_add(1U, std::memory_order_relaxed);
+        files_compared_.fetch_add(summary.source_file_count + summary.files_target_only,
+                                  std::memory_order_relaxed);
+        bytes_planned_.fetch_add(summary.bytes_planned, std::memory_order_relaxed);
+        emit_summary(summary, worker_index);
+        for (const BufferHandle& handle : pending.source) {
+            source_pool_.release(handle);
+        }
+        for (const BufferHandle& handle : pending.target) {
+            target_pool_.release(handle);
+        }
+    }
+
+    void emit_summary(const FolderDiffSummary& summary, std::size_t worker_index) {
+        if (!open_result_.has_value()) {
+            open_result_ = acquire_result_buffer(worker_index);
+            reset_diff_result_buffer(metadata_batch_buffer(result_pool_, *open_result_));
+        }
+        if (!append_diff_result(metadata_batch_buffer(result_pool_, *open_result_), summary)) {
+            flush_result_buffer(worker_index);
+            open_result_ = acquire_result_buffer(worker_index);
+            reset_diff_result_buffer(metadata_batch_buffer(result_pool_, *open_result_));
+            if (!append_diff_result(metadata_batch_buffer(result_pool_, *open_result_), summary)) {
+                result_pool_.release(*open_result_);
+                open_result_.reset();
+                throw std::runtime_error("single diff summary is too large for result buffer");
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (last_result_flush_.time_since_epoch().count() == 0) {
+            last_result_flush_ = now;
+        }
+        if (metadata_batch_buffer(result_pool_, *open_result_).record_count >= kDistributedDiffResultFlushRecords ||
+            now - last_result_flush_ >= kDistributedDiffResultFlushInterval) {
+            flush_result_buffer(worker_index);
+        }
+    }
+
+    [[nodiscard]] BufferHandle acquire_result_buffer(std::size_t worker_index) {
+        if (auto handle = wait_for_pool(worker_index, result_pool_); handle.has_value()) {
+            return *handle;
+        }
+        throw std::runtime_error("folder diff shard stopped while waiting for result buffer");
+    }
+
+    void flush_result_buffer(std::size_t worker_index) {
+        if (!open_result_.has_value()) {
+            return;
+        }
+        if (metadata_batch_buffer(result_pool_, *open_result_).record_count == 0U) {
+            result_pool_.release(*open_result_);
+            open_result_.reset();
+            return;
+        }
+        if (!wait_for_output(worker_index, results_, *open_result_)) {
+            result_pool_.release(*open_result_);
+            open_result_.reset();
+            throw std::runtime_error("folder diff result queue closed");
+        }
+        open_result_.reset();
+        last_result_flush_ = std::chrono::steady_clock::now();
+    }
+
+    BufQueue& input_;
+    RawBufferPool& source_pool_;
+    RawBufferPool& target_pool_;
+    RawBufferPool& result_pool_;
+    BufQueue& results_;
+    std::unordered_map<std::uint64_t, PendingDiffFolder> pending_;
+    std::optional<BufferHandle> open_result_;
+    std::chrono::steady_clock::time_point last_result_flush_ {};
+    std::atomic<std::uint64_t> folders_compared_ {0};
+    std::atomic<std::uint64_t> files_compared_ {0};
+    std::atomic<std::uint64_t> bytes_planned_ {0};
+    std::atomic<std::uint64_t> source_batches_ {0};
+    std::atomic<std::uint64_t> target_batches_ {0};
+};
+
+class DiffResultReportWriterJob final : public ThreadedJob {
+public:
+    DiffResultReportWriterJob(BufQueue& input,
+                              RawBufferPool& input_pool,
+                              std::filesystem::path output_path)
+        : ThreadedJob(1U),
+          input_(input),
+          input_pool_(input_pool),
+          output_path_(std::move(output_path)) {}
+
+    [[nodiscard]] DistributedDiffRunReport report() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return report_;
+    }
+
+protected:
+    void on_starting() override {
+        if (!output_path_.empty()) {
+            if (output_path_.has_parent_path()) {
+                std::filesystem::create_directories(output_path_.parent_path());
+            }
+            output_.open(output_path_);
+            if (!output_) {
+                throw std::runtime_error("failed to open distributed diff folder report: " +
+                                         output_path_.string());
+            }
+            write_folder_diff_csv_header(output_);
+        }
+    }
+
+    void run_worker(std::size_t worker_index) override {
+        BufferHandle handle;
+        while (!stop_requested() && wait_for_input(worker_index, input_, handle)) {
+            MetadataBatchBuffer& buffer = metadata_batch_buffer(input_pool_, handle);
+            visit_diff_results(buffer, [this, worker_index](FolderDiffSummary summary) {
+                summary.result_received_unix_ns = now_unix_ns();
+                std::lock_guard<std::mutex> lock(mutex_);
+                merge_folder_diff_summary(report_, summary);
+                if (output_) {
+                    auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
+                    write_folder_diff_csv_row(output_, summary);
+                }
+            });
+            input_pool_.release(handle);
+        }
+    }
+
+    void on_stop_requested() override {
+        input_.close();
+    }
+
+private:
+    BufQueue& input_;
+    RawBufferPool& input_pool_;
+    std::filesystem::path output_path_;
+    mutable std::mutex mutex_;
+    DistributedDiffRunReport report_;
+    std::ofstream output_;
+};
+
+void append_fixed_decimal(std::string& out, std::uint64_t value, std::size_t width) {
+    const std::size_t old_size = out.size();
+    out.resize(old_size + width);
+    for (std::size_t offset = 0; offset < width; ++offset) {
+        const std::size_t digit_index = old_size + width - 1U - offset;
+        out[digit_index] = static_cast<char>('0' + (value % 10U));
+        value /= 10U;
+    }
+}
+
+std::string synthetic_diff_folder_path(std::uint64_t folder_index) {
+    std::string path;
+    path.reserve(22U);
+    path.append("synthetic/dir_");
+    append_fixed_decimal(path, folder_index, 8U);
+    return path;
+}
+
+std::string synthetic_diff_file_path(std::uint64_t folder_index, std::uint64_t file_index) {
+    std::string path;
+    path.reserve(40U);
+    path.append("synthetic/dir_");
+    append_fixed_decimal(path, folder_index, 8U);
+    path.append("/file_");
+    append_fixed_decimal(path, file_index, 12U);
+    path.append(".dat");
+    return path;
+}
+
+std::uint64_t synthetic_diff_files_in_folder(std::uint64_t file_count,
+                                             std::uint64_t folder_count,
+                                             std::uint64_t folder_index) {
+    if (folder_count == 0U || folder_index >= folder_count) {
+        return 0;
+    }
+    const std::uint64_t base = file_count / folder_count;
+    const std::uint64_t remainder = file_count % folder_count;
+    return base + (folder_index < remainder ? 1U : 0U);
+}
+
+std::uint64_t synthetic_diff_file_size(std::uint64_t file_index, std::uint64_t average_file_size) {
+    if (average_file_size == 0U) {
+        return 0;
+    }
+    const std::uint64_t mixed = (file_index * 11400714819323198485ULL) ^ (file_index >> 17U);
+    return 1U + (mixed % (average_file_size * 2U));
+}
+
+FlatFolderScanBatch make_synthetic_diff_batch(std::uint64_t file_count,
+                                              std::uint64_t folder_count,
+                                              std::uint64_t average_file_size,
+                                              std::uint64_t folder_index) {
+    FlatFolderScanBatch batch;
+    batch.folder.rel_path = synthetic_diff_folder_path(folder_index);
+    batch.folder.mtime = 1'700'000'000'000'000'000ULL + folder_index;
+    batch.folder.mode = 0755;
+    batch.folder.uid = static_cast<std::uint32_t>(1000U + (folder_index % 97U));
+    batch.folder.gid = static_cast<std::uint32_t>(1000U + (folder_index % 89U));
+
+    const std::uint64_t files_in_folder =
+        synthetic_diff_files_in_folder(file_count, folder_count, folder_index);
+    batch.files.reserve(static_cast<std::size_t>(files_in_folder));
+    for (std::uint64_t offset = 0; offset < files_in_folder; ++offset) {
+        const std::uint64_t file_index = folder_index + (offset * folder_count);
+        FileSpec file;
+        file.rel_path = synthetic_diff_file_path(folder_index, file_index);
+        file.declared_size = synthetic_diff_file_size(file_index, average_file_size);
+        file.mtime = 1'700'000'000'000'000'000ULL + file_index;
+        file.mode = 0644;
+        file.uid = static_cast<std::uint32_t>(1000U + (file_index % 97U));
+        file.gid = static_cast<std::uint32_t>(1000U + (file_index % 89U));
+        batch.files.push_back(std::move(file));
+    }
+    return batch;
+}
+
+void synthetic_diff_source_worker(std::uint64_t file_count,
+                                  std::uint64_t folder_count,
+                                  std::uint64_t average_file_size,
+                                  std::atomic<std::uint64_t>& next_folder,
+                                  DiffTargetFolderQueue& target_queue,
+                                  DiffBatchQueueShards& source_batches,
+                                  std::atomic<std::uint64_t>& files_generated,
+                                  std::atomic<std::uint64_t>& folders_generated,
+                                  std::atomic<std::uint64_t>& bytes_generated,
+                                  DiffPipelineTimingCounters* timing = nullptr) {
+    try {
+        for (;;) {
+            const std::uint64_t folder_index = next_folder.fetch_add(1U, std::memory_order_relaxed);
+            if (folder_index >= folder_count) {
+                break;
+            }
+            FlatFolderScanBatch batch =
+                make_synthetic_diff_batch(file_count, folder_count, average_file_size, folder_index);
+            std::uint64_t logical_size = 0;
+            for (const auto& file : batch.files) {
+                logical_size += file_spec_logical_size(file);
+            }
+            FileSpec target_folder = batch.folder;
+            target_folder.need_check = true;
+            const auto target_wait_started_at = std::chrono::steady_clock::now();
+            if (!enqueue_diff_target_folder(target_queue, std::move(target_folder))) {
+                break;
+            }
+            if (timing != nullptr) {
+                add_elapsed_ns(timing->source_wait_target_queue_ns,
+                               target_wait_started_at,
+                               std::chrono::steady_clock::now());
+            }
+            const std::uint64_t file_total = static_cast<std::uint64_t>(batch.files.size());
+            const auto batch_wait_started_at = std::chrono::steady_clock::now();
+            if (!push_diff_batch(source_batches, std::move(batch))) {
+                break;
+            }
+            if (timing != nullptr) {
+                add_elapsed_ns(timing->source_wait_batch_queue_ns,
+                               batch_wait_started_at,
+                               std::chrono::steady_clock::now());
+            }
+            files_generated.fetch_add(file_total, std::memory_order_relaxed);
+            folders_generated.fetch_add(1U, std::memory_order_relaxed);
+            bytes_generated.fetch_add(logical_size, std::memory_order_relaxed);
+        }
+    } catch (...) {
+        fail_diff_target_folder_work(target_queue);
+        fail_diff_batch_queue(source_batches);
+    }
+    finish_diff_batch_producer(source_batches);
+}
+
+void fake_remote_request_receiver_worker(DiffTargetFolderQueue& target_queue,
+                                         FakeRemoteProcessorQueue& processor_queue,
+                                         DiffBatchQueueShards& target_batches,
+                                         DiffPipelineTimingCounters* timing = nullptr) {
+    try {
+        for (;;) {
+            const auto request_wait_started_at = std::chrono::steady_clock::now();
+            std::optional<FileSpec> folder = take_diff_target_folder_work(target_queue, true);
+            if (timing != nullptr) {
+                add_elapsed_ns(timing->fake_remote_wait_request_ns,
+                               request_wait_started_at,
+                               std::chrono::steady_clock::now());
+            }
+            if (!folder.has_value()) {
+                break;
+            }
+            const auto processor_queue_wait_started_at = std::chrono::steady_clock::now();
+            const bool accepted = push_fake_remote_request(processor_queue, std::move(*folder));
+            if (timing != nullptr) {
+                add_elapsed_ns(timing->fake_remote_wait_processor_queue_ns,
+                               processor_queue_wait_started_at,
+                               std::chrono::steady_clock::now());
+            }
+            finish_diff_target_folder_work(target_queue);
+            if (!accepted) {
+                break;
+            }
+        }
+    } catch (...) {
+        fail_diff_target_folder_work(target_queue);
+        fail_fake_remote_processor_queue(processor_queue);
+        fail_diff_batch_queue(target_batches);
+    }
+    finish_fake_remote_request_producer(processor_queue);
+}
+
+void fake_remote_processor_worker(std::uint64_t file_count,
+                                  std::uint64_t folder_count,
+                                  std::uint64_t average_file_size,
+                                  std::uint64_t remote_delay_microseconds,
+                                  FakeRemoteProcessorQueue& processor_queue,
+                                  DiffBatchQueueShards& target_batches,
+                                  std::atomic<std::uint64_t>& folders_checked,
+                                  DiffPipelineTimingCounters* timing = nullptr) {
+    try {
+        for (;;) {
+            std::optional<FileSpec> folder = take_fake_remote_request(processor_queue);
+            if (!folder.has_value()) {
+                break;
+            }
+            if (remote_delay_microseconds != 0U) {
+                const auto delay_started_at = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(std::chrono::microseconds(remote_delay_microseconds));
+                if (timing != nullptr) {
+                    add_elapsed_ns(timing->fake_remote_delay_ns,
+                                   delay_started_at,
+                                   std::chrono::steady_clock::now());
+                }
+            }
+            std::uint64_t folder_index = 0;
+            const std::string& rel_path = folder->rel_path;
+            if (rel_path.size() >= 8U) {
+                const std::string_view suffix(rel_path.data() + rel_path.size() - 8U, 8U);
+                std::from_chars(suffix.data(), suffix.data() + suffix.size(), folder_index);
+            }
+            FlatFolderScanBatch batch =
+                make_synthetic_diff_batch(file_count, folder_count, average_file_size, folder_index);
+            const auto batch_wait_started_at = std::chrono::steady_clock::now();
+            if (!push_diff_batch(target_batches, std::move(batch))) {
+                break;
+            }
+            if (timing != nullptr) {
+                add_elapsed_ns(timing->fake_remote_wait_batch_queue_ns,
+                               batch_wait_started_at,
+                               std::chrono::steady_clock::now());
+            }
+            folders_checked.fetch_add(1U, std::memory_order_relaxed);
+        }
+    } catch (...) {
+        fail_fake_remote_processor_queue(processor_queue);
+        fail_diff_batch_queue(target_batches);
+    }
+    finish_diff_batch_producer(target_batches);
 }
 
 std::size_t queued_data_read_files(DataReadFileQueue& queue) {
@@ -2958,6 +5054,8 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
             snapshot.processed_count = stats_snapshot.buffers_read;
             snapshot.byte_count = stats_snapshot.bytes_read;
             snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = data_reader_job.runtime_metrics().snapshot();
             snapshot.detail = "files_read=" + std::to_string(stats_snapshot.files_read) +
                               " files_failed=" + std::to_string(stats_snapshot.files_failed);
             return snapshot;
@@ -2971,6 +5069,8 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
             snapshot.processed_count = stats_snapshot.buffers_discarded;
             snapshot.byte_count = stats_snapshot.bytes_discarded;
             snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = discarder.runtime_metrics().snapshot();
             return snapshot;
         });
         status_registry.register_queue("folder_work_queue", [&folder_queue]() {
@@ -3164,6 +5264,8 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
             snapshot.processed_count = stats_snapshot.buffers_read;
             snapshot.byte_count = stats_snapshot.bytes_read;
             snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = data_reader_job.runtime_metrics().snapshot();
             snapshot.detail = "files_read=" + std::to_string(stats_snapshot.files_read) +
                               " files_failed=" + std::to_string(stats_snapshot.files_failed);
             return snapshot;
@@ -3177,6 +5279,8 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
             snapshot.processed_count = stats_snapshot.buffers_hashed;
             snapshot.byte_count = stats_snapshot.bytes_hashed;
             snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = hasher.runtime_metrics().snapshot();
             snapshot.detail = "hash=" + stats_snapshot.algorithm +
                               " work_factor=" + std::to_string(stats_snapshot.work_factor);
             return snapshot;
@@ -3190,6 +5294,8 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
             snapshot.processed_count = stats_snapshot.buffers_discarded;
             snapshot.byte_count = stats_snapshot.bytes_discarded;
             snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = discarder.runtime_metrics().snapshot();
             return snapshot;
         });
         status_registry.register_queue("folder_work_queue", [&folder_queue]() {
@@ -5524,7 +7630,10 @@ TransferReport TransferEngine::diff_metadata_trees(const std::filesystem::path& 
                                                    std::size_t metadata_async_depth,
                                                    double max_duration_seconds,
                                                    bool collect_detailed_records,
-                                                   std::uint32_t stats_interval_seconds) const {
+                                                   std::uint32_t stats_interval_seconds,
+                                                   std::size_t checker_threads,
+                                                   std::size_t checker_request_queue_depth,
+                                                   std::size_t checker_batch_queue_depth) const {
     if (compare_mode != "size" && compare_mode != "time" && compare_mode != "content") {
         throw std::invalid_argument("diff compare mode must be size, time, or content");
     }
@@ -5545,6 +7654,13 @@ TransferReport TransferEngine::diff_metadata_trees(const std::filesystem::path& 
     if (metadata_async_depth != 0) {
         reader_config.async_directory_depth = metadata_async_depth;
     }
+    const CheckerConfig checker_config = load_checker_config(config_store_);
+    const std::size_t effective_checker_threads =
+        checker_threads != 0U ? checker_threads : checker_config.worker_count;
+    const std::size_t effective_checker_request_queue_depth =
+        checker_request_queue_depth != 0U ? checker_request_queue_depth : checker_config.target_request_queue_depth;
+    const std::size_t effective_checker_batch_queue_depth =
+        checker_batch_queue_depth != 0U ? checker_batch_queue_depth : checker_config.batch_queue_depth;
 
     if (!collect_detailed_records) {
         return run_summary_live_diff(reader_config.source_root,
@@ -5553,7 +7669,10 @@ TransferReport TransferEngine::diff_metadata_trees(const std::filesystem::path& 
                                      recursive,
                                      reader_config,
                                      max_duration_seconds,
-                                     stats_interval_seconds);
+                                     stats_interval_seconds,
+                                     effective_checker_threads,
+                                     effective_checker_request_queue_depth,
+                                     effective_checker_batch_queue_depth);
     }
 
     TransferReport report;
@@ -5782,9 +7901,13 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
-    meta_config.worker_count = std::max<std::size_t>(1, meta_reader_threads);
-    meta_config.thread_count = meta_config.worker_count;
-    meta_config.async_directory_depth = std::max<std::size_t>(1, metadata_async_depth);
+    if (meta_reader_threads != 0U) {
+        meta_config.worker_count = meta_reader_threads;
+        meta_config.thread_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0U) {
+        meta_config.async_directory_depth = metadata_async_depth;
+    }
 
     NfsDataReaderConfig data_config = load_nfs_data_reader_config(config_store_);
     data_config.source_root = source_root.string();
@@ -5849,14 +7972,20 @@ DataHashBenchmarkReport TransferEngine::benchmark_data_hash_pipeline(const std::
                                                                      double max_duration_seconds,
                                                                      std::uint32_t stats_interval_seconds,
                                                                      const std::filesystem::path& status_socket_path) const {
-    const ContentHashAlgorithm algorithm = parse_content_hash_algorithm(hash_algorithm);
+    const DataHasherConfig hasher_config = load_data_hasher_config(config_store_);
+    const ContentHashAlgorithm algorithm =
+        hash_algorithm.empty() ? hasher_config.algorithm : parse_content_hash_algorithm(hash_algorithm);
 
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
-    meta_config.worker_count = std::max<std::size_t>(1, meta_reader_threads);
-    meta_config.thread_count = meta_config.worker_count;
-    meta_config.async_directory_depth = std::max<std::size_t>(1, metadata_async_depth);
+    if (meta_reader_threads != 0U) {
+        meta_config.worker_count = meta_reader_threads;
+        meta_config.thread_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0U) {
+        meta_config.async_directory_depth = metadata_async_depth;
+    }
 
     NfsDataReaderConfig data_config = load_nfs_data_reader_config(config_store_);
     data_config.source_root = source_root.string();
@@ -5875,9 +8004,8 @@ DataHashBenchmarkReport TransferEngine::benchmark_data_hash_pipeline(const std::
         run_parallel_data_hash_scan(meta_config,
                                     data_config,
                                     algorithm,
-                                    hash_worker_threads == 0 ? data_config.data_reader_worker_count
-                                                             : hash_worker_threads,
-                                    hash_work_factor,
+                                    hash_worker_threads == 0 ? hasher_config.worker_count : hash_worker_threads,
+                                    hash_work_factor == 0 ? hasher_config.work_factor : hash_work_factor,
                                     max_files_queued,
                                     data_buffer_slots,
                                     data_queue_depth,
@@ -5891,11 +8019,12 @@ DataHashBenchmarkReport TransferEngine::benchmark_data_hash_pipeline(const std::
     report.data_reader_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
     report.data_outstanding_requests = std::max<std::size_t>(1, data_config.outstanding_requests);
     report.hash_worker_threads = hash_worker_threads == 0
-                                     ? std::max<std::size_t>(1, data_config.data_reader_worker_count)
+                                     ? std::max<std::size_t>(1, hasher_config.worker_count)
                                      : std::max<std::size_t>(1, hash_worker_threads);
     report.max_files_queued = std::max<std::size_t>(1, max_files_queued);
     report.hash_algorithm = to_string(algorithm);
-    report.hash_work_factor = std::max<std::size_t>(1, hash_work_factor);
+    report.hash_work_factor =
+        std::max<std::size_t>(1, hash_work_factor == 0 ? hasher_config.work_factor : hash_work_factor);
     return report;
 }
 
@@ -5915,15 +8044,21 @@ HashInventoryReport TransferEngine::hash_inventory_pipeline(const std::filesyste
                                                             const std::string& metadata_output_format,
                                                             const std::string& metadata_records,
                                                             double max_duration_seconds) const {
-    const ContentHashAlgorithm algorithm = parse_content_hash_algorithm(hash_algorithm);
+    const DataHasherConfig hasher_config = load_data_hasher_config(config_store_);
+    const ContentHashAlgorithm algorithm =
+        hash_algorithm.empty() ? hasher_config.algorithm : parse_content_hash_algorithm(hash_algorithm);
     const HashMode hash_mode = parse_hash_mode(hash_mode_value);
 
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
-    meta_config.worker_count = std::max<std::size_t>(1, meta_reader_threads);
-    meta_config.thread_count = meta_config.worker_count;
-    meta_config.async_directory_depth = std::max<std::size_t>(1, metadata_async_depth);
+    if (meta_reader_threads != 0U) {
+        meta_config.worker_count = meta_reader_threads;
+        meta_config.thread_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0U) {
+        meta_config.async_directory_depth = metadata_async_depth;
+    }
 
     NfsDataReaderConfig data_config = load_nfs_data_reader_config(config_store_);
     data_config.source_root = source_root.string();
@@ -5969,7 +8104,7 @@ HashInventoryReport TransferEngine::hash_inventory_pipeline(const std::filesyste
     report.data_reader_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
     report.data_outstanding_requests = std::max<std::size_t>(1, data_config.outstanding_requests);
     report.hash_worker_threads = hash_worker_threads == 0
-                                     ? std::max<std::size_t>(1, data_config.data_reader_worker_count)
+                                     ? std::max<std::size_t>(1, hasher_config.worker_count)
                                      : std::max<std::size_t>(1, hash_worker_threads);
     report.max_files_queued = std::max<std::size_t>(1, max_files_queued);
     report.max_hash_chunks_queued = std::max<std::size_t>(1, max_hash_chunks_queued);
@@ -7088,6 +9223,733 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
         std::filesystem::remove_all(effective_socket_dir, ignored);
     }
     return report;
+}
+
+FakeRemoteDiffBenchmarkReport TransferEngine::benchmark_fake_remote_diff_pipeline(
+    std::uint64_t file_count,
+    std::uint64_t folder_count,
+    std::uint64_t average_file_size,
+    std::size_t source_threads,
+    std::size_t fake_remote_threads,
+    std::uint64_t remote_delay_microseconds,
+    std::size_t request_queue_depth,
+    std::size_t batch_queue_depth,
+    std::uint32_t stats_interval_seconds,
+    std::size_t checker_threads) const {
+    const CheckerConfig checker_config = load_checker_config(config_store_);
+    const std::size_t checker_thread_count =
+        checker_threads != 0U ? checker_threads : checker_config.worker_count;
+    const std::size_t effective_request_queue_depth =
+        request_queue_depth != 0U ? request_queue_depth : checker_config.target_request_queue_depth;
+    const std::size_t effective_batch_queue_depth =
+        batch_queue_depth != 0U ? batch_queue_depth : checker_config.batch_queue_depth;
+
+    if (folder_count == 0U ||
+        source_threads == 0U ||
+        fake_remote_threads == 0U ||
+        checker_thread_count == 0U ||
+        effective_request_queue_depth == 0U ||
+        effective_batch_queue_depth == 0U) {
+        throw std::invalid_argument("fake remote diff benchmark numeric parameters must be positive");
+    }
+
+    DiffTargetFolderQueue target_queue;
+    target_queue.max_entries = effective_request_queue_depth;
+    const std::size_t batch_queue_depth_per_checker =
+        std::max<std::size_t>(1024U, (effective_batch_queue_depth + checker_thread_count - 1U) / checker_thread_count);
+    DiffBatchQueueShards source_batches =
+        make_diff_batch_queue_shards(checker_thread_count, source_threads, batch_queue_depth_per_checker);
+    DiffBatchQueueShards target_batches =
+        make_diff_batch_queue_shards(checker_thread_count, fake_remote_threads, batch_queue_depth_per_checker);
+    FakeRemoteProcessorQueue fake_processor_queue;
+    configure_fake_remote_processor_queue(fake_processor_queue,
+                                          fake_remote_threads,
+                                          effective_request_queue_depth);
+
+    TransferReport diff_report;
+    diff_report.mode = Mode::dry_run;
+    std::mutex report_mutex;
+    std::atomic<std::uint64_t> next_folder{0};
+    std::atomic<std::uint64_t> source_files_generated{0};
+    std::atomic<std::uint64_t> source_folders_generated{0};
+    std::atomic<std::uint64_t> source_bytes_generated{0};
+    std::atomic<std::uint64_t> target_folders_checked{0};
+    std::atomic<bool> source_done{false};
+    std::atomic<bool> stats_done{false};
+    DiffPipelineTimingCounters timing;
+    std::vector<std::unique_ptr<std::atomic<bool>>> joiner_pending_empty;
+    joiner_pending_empty.reserve(checker_thread_count);
+    for (std::size_t index = 0; index < checker_thread_count; ++index) {
+        joiner_pending_empty.push_back(std::make_unique<std::atomic<bool>>(true));
+    }
+
+    const auto started_at = std::chrono::steady_clock::now();
+    std::thread stats_thread;
+    if (stats_interval_seconds != 0U) {
+        stats_thread = std::thread([&]() {
+            std::uint64_t last_source_files = 0;
+            std::uint64_t last_compared_files = 0;
+            auto last_at = started_at;
+            while (!stats_done.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::seconds(stats_interval_seconds));
+                if (stats_done.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                std::uint64_t compared = 0;
+                std::uint64_t same = 0;
+                {
+                    std::lock_guard<std::mutex> lock(report_mutex);
+                    compared = diff_report.files_total;
+                    same = diff_report.files_skipped;
+                }
+                const std::uint64_t source_files = source_files_generated.load(std::memory_order_relaxed);
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - started_at).count();
+                const double interval_elapsed = std::chrono::duration<double>(now - last_at).count();
+                const double source_rate = interval_elapsed > 0.0
+                                               ? static_cast<double>(source_files - last_source_files) / interval_elapsed
+                                               : 0.0;
+                const double compare_rate = interval_elapsed > 0.0
+                                                ? static_cast<double>(compared - last_compared_files) / interval_elapsed
+                                                : 0.0;
+                std::cout << "fake_diff_stats"
+                          << " source_records_per_second=" << source_rate
+                          << " compared_records_per_second=" << compare_rate
+                          << " source_files=" << source_files
+                          << " compared_files=" << compared
+                          << " same=" << same
+                          << " target_folders_checked="
+                          << target_folders_checked.load(std::memory_order_relaxed)
+                          << " source_done=" << (source_done.load(std::memory_order_relaxed) ? "true" : "false")
+                          << " elapsed_seconds=" << elapsed << std::endl;
+                last_source_files = source_files;
+                last_compared_files = compared;
+                last_at = now;
+            }
+        });
+    }
+
+    std::vector<std::thread> remote_receivers;
+    remote_receivers.reserve(fake_remote_threads);
+    for (std::size_t index = 0; index < fake_remote_threads; ++index) {
+        remote_receivers.emplace_back(fake_remote_request_receiver_worker,
+                                      std::ref(target_queue),
+                                      std::ref(fake_processor_queue),
+                                      std::ref(target_batches),
+                                      &timing);
+    }
+
+    std::vector<std::thread> fake_processors;
+    fake_processors.reserve(fake_remote_threads);
+    for (std::size_t index = 0; index < fake_remote_threads; ++index) {
+        fake_processors.emplace_back(fake_remote_processor_worker,
+                                     file_count,
+                                     folder_count,
+                                     average_file_size,
+                                     remote_delay_microseconds,
+                                     std::ref(fake_processor_queue),
+                                     std::ref(target_batches),
+                                     std::ref(target_folders_checked),
+                                     &timing);
+    }
+
+    std::vector<std::thread> checker_workers;
+    checker_workers.reserve(checker_thread_count);
+    for (std::size_t index = 0; index < checker_thread_count; ++index) {
+        checker_workers.emplace_back(summary_diff_joiner_worker,
+                                     std::string("size"),
+                                     false,
+                                     false,
+                                     std::ref(target_queue),
+                                     std::ref(*source_batches[index]),
+                                     std::ref(*target_batches[index]),
+                                     std::ref(diff_report),
+                                     std::ref(report_mutex),
+                                     &timing,
+                                     joiner_pending_empty[index].get());
+    }
+    std::thread target_closer(close_diff_target_input_when_ready,
+                              std::ref(target_queue),
+                              std::ref(source_batches),
+                              std::ref(target_batches),
+                              std::cref(joiner_pending_empty));
+
+    std::vector<std::thread> source_workers;
+    source_workers.reserve(source_threads);
+    for (std::size_t index = 0; index < source_threads; ++index) {
+        source_workers.emplace_back(synthetic_diff_source_worker,
+                                    file_count,
+                                    folder_count,
+                                    average_file_size,
+                                    std::ref(next_folder),
+                                    std::ref(target_queue),
+                                    std::ref(source_batches),
+                                    std::ref(source_files_generated),
+                                    std::ref(source_folders_generated),
+                                    std::ref(source_bytes_generated),
+                                    &timing);
+    }
+
+    for (auto& worker : source_workers) {
+        worker.join();
+    }
+    const auto source_ended_at = std::chrono::steady_clock::now();
+    source_done.store(true, std::memory_order_relaxed);
+
+    if (target_closer.joinable()) {
+        target_closer.join();
+    }
+    for (auto& worker : remote_receivers) {
+        worker.join();
+    }
+    for (auto& worker : fake_processors) {
+        worker.join();
+    }
+    for (auto& worker : checker_workers) {
+        worker.join();
+    }
+    const auto ended_at = std::chrono::steady_clock::now();
+
+    stats_done.store(true, std::memory_order_relaxed);
+    if (stats_thread.joinable()) {
+        stats_thread.join();
+    }
+
+    if (target_queue.error) {
+        std::rethrow_exception(target_queue.error);
+    }
+    if (fake_processor_queue.error) {
+        std::rethrow_exception(fake_processor_queue.error);
+    }
+    for (const auto& queue : source_batches) {
+        if (queue->error) {
+            std::rethrow_exception(queue->error);
+        }
+    }
+    for (const auto& queue : target_batches) {
+        if (queue->error) {
+            std::rethrow_exception(queue->error);
+        }
+    }
+
+    FakeRemoteDiffBenchmarkReport report;
+    report.source_files_generated = source_files_generated.load(std::memory_order_relaxed);
+    report.source_folders_generated = source_folders_generated.load(std::memory_order_relaxed);
+    report.target_folders_checked = target_folders_checked.load(std::memory_order_relaxed);
+    report.bytes_compared = source_bytes_generated.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(report_mutex);
+        report.files_compared = diff_report.files_total;
+        report.files_same = diff_report.files_skipped;
+    }
+    report.source_elapsed_seconds = std::chrono::duration<double>(source_ended_at - started_at).count();
+    report.total_elapsed_seconds = std::chrono::duration<double>(ended_at - started_at).count();
+    report.source_records_per_second = report.source_elapsed_seconds > 0.0
+                                           ? static_cast<double>(report.source_files_generated) /
+                                                 report.source_elapsed_seconds
+                                           : 0.0;
+    report.total_records_per_second = report.total_elapsed_seconds > 0.0
+                                          ? static_cast<double>(report.files_compared) /
+                                                report.total_elapsed_seconds
+                                          : 0.0;
+    report.source_threads = source_threads;
+    report.fake_remote_threads = fake_remote_threads;
+    report.checker_threads = checker_thread_count;
+    report.remote_delay_microseconds = remote_delay_microseconds;
+    report.request_queue_depth = effective_request_queue_depth;
+    report.batch_queue_depth = effective_batch_queue_depth;
+    report.source_wait_target_queue_seconds =
+        ns_to_seconds(timing.source_wait_target_queue_ns.load(std::memory_order_relaxed));
+    report.source_wait_batch_queue_seconds =
+        ns_to_seconds(timing.source_wait_batch_queue_ns.load(std::memory_order_relaxed));
+    report.fake_remote_wait_request_seconds =
+        ns_to_seconds(timing.fake_remote_wait_request_ns.load(std::memory_order_relaxed));
+    report.fake_remote_wait_processor_queue_seconds =
+        ns_to_seconds(timing.fake_remote_wait_processor_queue_ns.load(std::memory_order_relaxed));
+    report.fake_remote_delay_seconds =
+        ns_to_seconds(timing.fake_remote_delay_ns.load(std::memory_order_relaxed));
+    report.fake_remote_wait_batch_queue_seconds =
+        ns_to_seconds(timing.fake_remote_wait_batch_queue_ns.load(std::memory_order_relaxed));
+    report.joiner_idle_seconds = ns_to_seconds(timing.joiner_idle_ns.load(std::memory_order_relaxed));
+    report.joiner_process_seconds = ns_to_seconds(timing.joiner_process_ns.load(std::memory_order_relaxed));
+    return report;
+}
+
+DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
+    const std::filesystem::path& source_root,
+    const std::string& target_host,
+    std::uint16_t target_port,
+    const std::filesystem::path& folder_report_path,
+    const std::string& compare_mode,
+    bool recursive,
+    std::size_t meta_reader_threads,
+    std::size_t metadata_async_depth,
+    double max_duration_seconds,
+    std::uint32_t stats_interval_seconds) const {
+    const auto started_at = std::chrono::steady_clock::now();
+    NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
+    if (meta_reader_threads != 0U) {
+        reader_config.worker_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0U) {
+        reader_config.async_directory_depth = metadata_async_depth;
+    }
+    const std::size_t worker_count = std::max<std::size_t>(1U, reader_config.worker_count);
+    const std::size_t async_depth = std::max<std::size_t>(1U, reader_config.async_directory_depth);
+
+    const std::size_t pool_slots =
+        std::max<std::size_t>(64U, std::min<std::size_t>(2048U, worker_count * async_depth));
+    RawBufferPool send_pool = make_metadata_batch_buffer_pool(pool_slots);
+    RawBufferPool result_pool = make_metadata_batch_buffer_pool(pool_slots);
+    BufQueue send_queue(pool_slots);
+    BufQueue result_queue(pool_slots);
+    BufferPoolRegistry send_registry;
+    send_registry.register_pool(send_pool);
+
+    ScopedFd fd = connect_tcp(target_host, target_port, 200, 50);
+    BufferStreamReceiverJob result_receiver(1U, result_pool, result_queue, fd.get());
+    DiffResultReportWriterJob result_writer(result_queue, result_pool, folder_report_path);
+    BufferStreamSenderJob source_sender(1U,
+                                        send_queue,
+                                        send_registry,
+                                        fd.get(),
+                                        metadata_batch_payload_size);
+    FlatFolderScannerBufferJob scanner(source_root.string(),
+                                       recursive,
+                                       compare_mode,
+                                       worker_count,
+                                       async_depth,
+                                       send_pool,
+                                       send_queue,
+                                       max_duration_seconds);
+
+    StatusRegistry status_registry;
+    std::unique_ptr<PeriodicStatusReporter> status_reporter;
+    if (stats_interval_seconds != 0U) {
+        status_registry.register_job("source_scanner", [&scanner]() {
+            const DistributedDiffRunReport stats = scanner.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "source_scanner";
+            snapshot.running = scanner.running();
+            snapshot.worker_count = scanner.worker_count();
+            snapshot.processed_count = stats.folders_sent;
+            snapshot.byte_count = stats.source_logical_size_bytes;
+            snapshot.count_unit = "folders";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = scanner.runtime_metrics().snapshot();
+            snapshot.detail = "files_seen=" + std::to_string(stats.files_compared);
+            return snapshot;
+        });
+        status_registry.register_job("source_sender", [&source_sender]() {
+            const BufferTransportStats stats = source_sender.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "source_sender";
+            snapshot.running = source_sender.running();
+            snapshot.worker_count = source_sender.worker_count();
+            snapshot.processed_count = stats.buffers;
+            snapshot.byte_count = stats.payload_bytes;
+            snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = source_sender.runtime_metrics().snapshot();
+            return snapshot;
+        });
+        status_registry.register_job("result_receiver", [&result_receiver]() {
+            const BufferTransportStats stats = result_receiver.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "result_receiver";
+            snapshot.running = result_receiver.running();
+            snapshot.worker_count = result_receiver.worker_count();
+            snapshot.processed_count = stats.buffers;
+            snapshot.byte_count = stats.payload_bytes;
+            snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = result_receiver.runtime_metrics().snapshot();
+            return snapshot;
+        });
+        status_registry.register_job("result_writer", [&result_writer]() {
+            const DistributedDiffRunReport stats = result_writer.report();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "result_writer";
+            snapshot.running = result_writer.running();
+            snapshot.worker_count = result_writer.worker_count();
+            snapshot.processed_count = stats.folders_reported;
+            snapshot.byte_count = stats.files_compared;
+            snapshot.count_unit = "folders";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = result_writer.runtime_metrics().snapshot();
+            snapshot.detail = "files_compared=" + std::to_string(stats.files_compared) +
+                              " same=" + std::to_string(stats.files_same) +
+                              " changed=" + std::to_string(stats.files_changed) +
+                              " new=" + std::to_string(stats.files_new) +
+                              " failed=" + std::to_string(stats.files_failed);
+            return snapshot;
+        });
+        status_registry.register_queue("source_send_queue", [&send_queue]() {
+            return monitor_buf_queue("source_send_queue", send_queue);
+        });
+        status_registry.register_queue("result_queue", [&result_queue]() {
+            return monitor_buf_queue("result_queue", result_queue);
+        });
+        status_reporter = std::make_unique<PeriodicStatusReporter>(
+            status_registry,
+            std::chrono::seconds(stats_interval_seconds),
+            [](std::string status) {
+                std::cout << status << std::flush;
+            });
+    }
+
+    std::atomic<bool> stats_done{false};
+    std::thread stats_thread;
+    if (stats_interval_seconds != 0U) {
+        stats_thread = std::thread([&] {
+            std::uint64_t last_folders = 0;
+            auto last_at = started_at;
+            while (!stats_done.load(std::memory_order_relaxed)) {
+                for (std::uint32_t tick = 0; tick < stats_interval_seconds * 10U; ++tick) {
+                    if (stats_done.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (stats_done.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                DistributedDiffRunReport snapshot = result_writer.report();
+                snapshot.folders_sent = scanner.stats().folders_sent;
+                print_distributed_diff_source_stats(snapshot, started_at, last_folders, last_at);
+                last_folders = snapshot.folders_reported;
+                last_at = std::chrono::steady_clock::now();
+            }
+        });
+    }
+
+    result_receiver.start();
+    result_writer.start();
+    source_sender.start();
+    scanner.start();
+    if (status_reporter) {
+        status_reporter->start();
+    }
+
+    std::exception_ptr wait_error;
+    try {
+        scanner.wait();
+        source_sender.wait();
+        result_receiver.wait();
+        result_writer.wait();
+    } catch (...) {
+        wait_error = std::current_exception();
+        try {
+            scanner.stop();
+        } catch (...) {}
+        try {
+            source_sender.stop();
+        } catch (...) {}
+        try {
+            result_receiver.stop();
+        } catch (...) {}
+        try {
+            result_writer.stop();
+        } catch (...) {}
+    }
+
+    stats_done.store(true, std::memory_order_relaxed);
+    if (stats_thread.joinable()) {
+        stats_thread.join();
+    }
+    if (status_reporter) {
+        status_reporter->stop();
+        std::cout << status_registry.render_human() << std::flush;
+    }
+    if (wait_error) {
+        std::rethrow_exception(wait_error);
+    }
+
+    DistributedDiffRunReport report = result_writer.report();
+    report.folders_sent = scanner.stats().folders_sent;
+    report.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    report.folders_per_second =
+        report.elapsed_seconds > 0.0 ? static_cast<double>(report.folders_reported) / report.elapsed_seconds : 0.0;
+    report.files_per_second =
+        report.elapsed_seconds > 0.0 ? static_cast<double>(report.files_compared) / report.elapsed_seconds : 0.0;
+    return report;
+}
+
+void TransferEngine::run_distributed_diff_target(const std::filesystem::path& target_root,
+                                                 const std::string& listen_host,
+                                                 std::uint16_t listen_port,
+                                                 const std::string& compare_mode,
+                                                 bool recursive,
+                                                 std::size_t target_threads,
+                                                 std::size_t metadata_async_depth,
+                                                 std::uint32_t stats_interval_seconds) const {
+    NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
+    const std::size_t worker_count =
+        std::max<std::size_t>(1U, target_threads != 0U ? target_threads : reader_config.worker_count);
+    const std::size_t async_depth =
+        std::max<std::size_t>(1U, metadata_async_depth != 0U ? metadata_async_depth : reader_config.async_directory_depth);
+
+    ScopedFd listener = listen_tcp(listen_host, listen_port, static_cast<int>(worker_count + 1U));
+    std::cout << "distributed_diff_target_listening host=" << listen_host
+              << " port=" << listen_port
+              << " target=" << target_root.string()
+              << " threads=" << worker_count
+              << " metadata_async_depth=" << async_depth << std::endl;
+    ScopedFd fd = accept_tcp(listener.get());
+
+    (void)recursive;
+    const std::size_t shard_count = std::max<std::size_t>(1U, std::min<std::size_t>(worker_count, 128U));
+    const std::size_t pool_slots =
+        std::max<std::size_t>(64U, std::min<std::size_t>(2048U, worker_count * async_depth));
+    const std::size_t queue_depth = std::max<std::size_t>(64U, pool_slots);
+    const std::size_t shard_depth = std::max<std::size_t>(64U, (queue_depth + shard_count - 1U) / shard_count);
+
+    RawBufferPool source_pool = make_distributed_diff_metadata_pool(kDistributedDiffSourcePoolId, pool_slots);
+    RawBufferPool request_pool = make_distributed_diff_metadata_pool(kDistributedDiffRequestPoolId, pool_slots);
+    RawBufferPool target_pool = make_distributed_diff_metadata_pool(kDistributedDiffTargetPoolId, pool_slots);
+    RawBufferPool result_pool = make_distributed_diff_metadata_pool(kDistributedDiffResultPoolId, pool_slots);
+    BufQueue received_source_queue(queue_depth);
+    BufQueue target_request_queue(queue_depth);
+    BufQueue result_queue(queue_depth);
+    std::vector<std::unique_ptr<BufQueue>> diff_shard_queues;
+    diff_shard_queues.reserve(shard_count);
+    for (std::size_t index = 0; index < shard_count; ++index) {
+        diff_shard_queues.push_back(std::make_unique<BufQueue>(shard_depth * 2U));
+    }
+
+    BufferPoolRegistry result_registry;
+    result_registry.register_pool(result_pool);
+    BufferStreamReceiverJob source_receiver(1U, source_pool, received_source_queue, fd.get());
+    SourceBatchRouterJob router(received_source_queue,
+                                source_pool,
+                                request_pool,
+                                target_request_queue,
+                                diff_shard_queues);
+    TargetFolderScannerBufferJob target_scanner(target_root.string(),
+                                                compare_mode,
+                                                worker_count,
+                                                async_depth,
+                                                target_request_queue,
+                                                request_pool,
+                                                target_pool,
+                                                diff_shard_queues);
+    std::vector<std::unique_ptr<FolderDiffShardJob>> diff_shards;
+    diff_shards.reserve(shard_count);
+    for (std::size_t index = 0; index < shard_count; ++index) {
+        diff_shards.push_back(std::make_unique<FolderDiffShardJob>(*diff_shard_queues[index],
+                                                                   source_pool,
+                                                                   target_pool,
+                                                                   result_pool,
+                                                                   result_queue));
+    }
+    BufferStreamSenderJob result_sender(1U,
+                                        result_queue,
+                                        result_registry,
+                                        fd.get(),
+                                        metadata_batch_payload_size);
+    StatusRegistry status_registry;
+    std::unique_ptr<PeriodicStatusReporter> status_reporter;
+    if (stats_interval_seconds != 0U) {
+        status_registry.register_job("source_receiver", [&source_receiver]() {
+            const BufferTransportStats stats = source_receiver.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "source_receiver";
+            snapshot.running = source_receiver.running();
+            snapshot.worker_count = source_receiver.worker_count();
+            snapshot.processed_count = stats.buffers;
+            snapshot.byte_count = stats.payload_bytes;
+            snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = source_receiver.runtime_metrics().snapshot();
+            return snapshot;
+        });
+        status_registry.register_job("source_router", [&router]() {
+            const SourceBatchRouterJob::Stats stats = router.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "source_router";
+            snapshot.running = router.running();
+            snapshot.worker_count = router.worker_count();
+            snapshot.processed_count = stats.source_batches_routed;
+            snapshot.byte_count = stats.target_requests_sent;
+            snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = router.runtime_metrics().snapshot();
+            snapshot.detail = "target_requests=" + std::to_string(stats.target_requests_sent);
+            return snapshot;
+        });
+        status_registry.register_job("target_scanner", [&target_scanner]() {
+            const TargetFolderScannerBufferJob::Stats stats = target_scanner.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "target_scanner";
+            snapshot.running = target_scanner.running();
+            snapshot.worker_count = target_scanner.worker_count();
+            snapshot.processed_count = stats.folders_scanned;
+            snapshot.byte_count = stats.logical_size_bytes;
+            snapshot.count_unit = "folders";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = target_scanner.runtime_metrics().snapshot();
+            snapshot.detail = "files_seen=" + std::to_string(stats.files_seen);
+            return snapshot;
+        });
+        status_registry.register_job("diff_shards", [&diff_shards]() {
+            FolderDiffShardJob::Stats totals;
+            RuntimeMetricsSnapshot runtime;
+            bool running = false;
+            for (const auto& shard : diff_shards) {
+                const FolderDiffShardJob::Stats stats = shard->stats();
+                totals.folders_compared += stats.folders_compared;
+                totals.files_compared += stats.files_compared;
+                totals.bytes_planned += stats.bytes_planned;
+                totals.source_batches += stats.source_batches;
+                totals.target_batches += stats.target_batches;
+                running = running || shard->running();
+                add_runtime_metrics(runtime, shard->runtime_metrics().snapshot());
+            }
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "diff_shards";
+            snapshot.running = running;
+            snapshot.worker_count = diff_shards.size();
+            snapshot.processed_count = totals.folders_compared;
+            snapshot.byte_count = totals.bytes_planned;
+            snapshot.count_unit = "folders";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = runtime;
+            snapshot.detail = "files_compared=" + std::to_string(totals.files_compared) +
+                              " source_batches=" + std::to_string(totals.source_batches) +
+                              " target_batches=" + std::to_string(totals.target_batches);
+            return snapshot;
+        });
+        status_registry.register_job("result_sender", [&result_sender]() {
+            const BufferTransportStats stats = result_sender.stats();
+            MonitorJobSnapshot snapshot;
+            snapshot.name = "result_sender";
+            snapshot.running = result_sender.running();
+            snapshot.worker_count = result_sender.worker_count();
+            snapshot.processed_count = stats.buffers;
+            snapshot.byte_count = stats.payload_bytes;
+            snapshot.count_unit = "buffers";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = result_sender.runtime_metrics().snapshot();
+            return snapshot;
+        });
+        status_registry.register_queue("received_source_queue", [&received_source_queue]() {
+            return monitor_buf_queue("received_source_queue", received_source_queue);
+        });
+        status_registry.register_queue("target_request_queue", [&target_request_queue]() {
+            return monitor_buf_queue("target_request_queue", target_request_queue);
+        });
+        status_registry.register_queue("diff_shard_queues", [&diff_shard_queues]() {
+            return monitor_queue_group("diff_shard_queues", diff_shard_queues);
+        });
+        status_registry.register_queue("result_queue", [&result_queue]() {
+            return monitor_buf_queue("result_queue", result_queue);
+        });
+        status_reporter = std::make_unique<PeriodicStatusReporter>(
+            status_registry,
+            std::chrono::seconds(stats_interval_seconds),
+            [](std::string status) {
+                std::cout << status << std::flush;
+            });
+    }
+    std::atomic<bool> stats_done{false};
+
+    std::thread stats_thread;
+    const auto started_at = std::chrono::steady_clock::now();
+    if (stats_interval_seconds != 0U) {
+        stats_thread = std::thread([&] {
+            std::uint64_t last_folders = 0;
+            auto last_at = started_at;
+            while (!stats_done.load(std::memory_order_relaxed)) {
+                for (std::uint32_t tick = 0; tick < stats_interval_seconds * 10U; ++tick) {
+                    if (stats_done.load(std::memory_order_relaxed)) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (stats_done.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                const BufferTransportStats rx = source_receiver.stats();
+                const BufferTransportStats tx = result_sender.stats();
+                std::uint64_t folders_compared = 0;
+                for (const auto& shard : diff_shards) {
+                    folders_compared += shard->stats().folders_compared;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - started_at).count();
+                const double interval_elapsed = std::chrono::duration<double>(now - last_at).count();
+                const std::uint64_t interval_folders =
+                    folders_compared >= last_folders ? folders_compared - last_folders : 0U;
+                std::cout << "distributed_diff_target_stats"
+                          << " source_buffers_received=" << rx.buffers
+                          << " result_buffers_sent=" << tx.buffers
+                          << " folders_compared=" << folders_compared
+                          << " interval_folders_per_second="
+                          << (interval_elapsed > 0.0 ? static_cast<double>(interval_folders) / interval_elapsed : 0.0)
+                          << " receive_queue_depth=" << received_source_queue.size()
+                          << " request_queue_depth=" << target_request_queue.size()
+                          << " result_queue_depth=" << result_queue.size()
+                          << " elapsed_seconds=" << elapsed << std::endl;
+                last_folders = folders_compared;
+                last_at = now;
+            }
+        });
+    }
+
+    source_receiver.start();
+    router.start();
+    target_scanner.start();
+    for (auto& shard : diff_shards) {
+        shard->start();
+    }
+    result_sender.start();
+    if (status_reporter) {
+        status_reporter->start();
+    }
+
+    std::exception_ptr wait_error;
+    try {
+        source_receiver.wait();
+        router.wait();
+        target_scanner.wait();
+        for (auto& shard : diff_shards) {
+            shard->wait();
+        }
+        result_queue.close();
+        result_sender.wait();
+    } catch (...) {
+        wait_error = std::current_exception();
+        try {
+            source_receiver.stop();
+        } catch (...) {}
+        try {
+            router.stop();
+        } catch (...) {}
+        try {
+            target_scanner.stop();
+        } catch (...) {}
+        for (auto& shard : diff_shards) {
+            try {
+                shard->stop();
+            } catch (...) {}
+        }
+        result_queue.close();
+        try {
+            result_sender.stop();
+        } catch (...) {}
+    }
+
+    stats_done.store(true, std::memory_order_relaxed);
+    if (stats_thread.joinable()) {
+        stats_thread.join();
+    }
+    if (status_reporter) {
+        status_reporter->stop();
+        std::cout << status_registry.render_human() << std::flush;
+    }
+    if (wait_error) {
+        std::rethrow_exception(wait_error);
+    }
 }
 
 TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& runtime) const {

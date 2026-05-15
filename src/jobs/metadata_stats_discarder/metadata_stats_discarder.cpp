@@ -15,16 +15,19 @@ MetadataStatsDiscarderConfig::MetadataStatsDiscarderConfig()
 
 MetadataStatsDiscarderConfig::MetadataStatsDiscarderConfig(bool enabled,
                                                            std::uint32_t print_interval_seconds,
-                                                           std::string output)
+                                                           std::string output,
+                                                           bool track_unique_folders)
     : enabled(enabled),
       print_interval_seconds(print_interval_seconds),
-      output(std::move(output)) {}
+      output(std::move(output)),
+      track_unique_folders(track_unique_folders) {}
 
 MetadataStatsDiscarderConfig load_metadata_stats_discarder_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("metadata_stats_discarder"));
     return MetadataStatsDiscarderConfig(config_bool_or(values, "enabled", false),
                                         config_u32_or(values, "print_interval_seconds", 5),
-                                        config_string_or(values, "output", "stderr"));
+                                        config_string_or(values, "output", "stderr"),
+                                        config_bool_or(values, "track_unique_folders", true));
 }
 
 MetadataStatsDiscarder::MetadataStatsDiscarder(MetadataStatsDiscarderConfig config)
@@ -82,7 +85,11 @@ void MetadataStatsDiscarder::discard_record(const RecBuf& record) {
         ++accepted_;
         ++discarded_;
         logical_size_bytes_ += record.size;
-        folders_.insert(parent_path(record.rel_path));
+        if (config_.track_unique_folders) {
+            folders_.insert(parent_path(record.rel_path));
+        } else {
+            ++folders_found_;
+        }
     }
     maybe_print();
 }
@@ -91,7 +98,11 @@ void MetadataStatsDiscarder::record_folder(std::string folder_path) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ++accepted_;
-        folders_.insert(normalize_path(folder_path));
+        if (config_.track_unique_folders) {
+            folders_.insert(normalize_path(folder_path));
+        } else {
+            ++folders_found_;
+        }
     }
     maybe_print();
 }
@@ -104,9 +115,26 @@ void MetadataStatsDiscarder::record_batch(std::size_t files_found,
         accepted_ += files_found + folders_found.size();
         discarded_ += files_found;
         logical_size_bytes_ += logical_size_bytes;
-        for (const auto& folder : folders_found) {
-            folders_.insert(normalize_path(folder));
+        if (config_.track_unique_folders) {
+            for (const auto& folder : folders_found) {
+                folders_.insert(normalize_path(folder));
+            }
+        } else {
+            folders_found_ += folders_found.size();
         }
+    }
+    maybe_print();
+}
+
+void MetadataStatsDiscarder::record_batch(std::size_t files_found,
+                                          std::uint64_t logical_size_bytes,
+                                          std::size_t folders_found) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        accepted_ += files_found + folders_found;
+        discarded_ += files_found;
+        logical_size_bytes_ += logical_size_bytes;
+        folders_found_ += folders_found;
     }
     maybe_print();
 }
@@ -150,7 +178,7 @@ MetadataStatsSnapshot MetadataStatsDiscarder::snapshot() const {
     MetadataStatsSnapshot result;
     result.records_discarded = discarded_;
     result.files_found = discarded_;
-    result.folders_found = folders_.size();
+    result.folders_found = config_.track_unique_folders ? folders_.size() : folders_found_;
     result.logical_size_bytes = logical_size_bytes_;
     result.elapsed_seconds = elapsed;
     result.records_per_second = elapsed > 0.0 ? static_cast<double>(accepted_) / elapsed : 0.0;

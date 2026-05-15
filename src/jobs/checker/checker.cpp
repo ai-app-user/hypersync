@@ -7,12 +7,27 @@ namespace hypersync {
 CheckerConfig::CheckerConfig()
     : CheckerConfig(load_checker_config(ConfigStore{})) {}
 
-CheckerConfig::CheckerConfig(bool discard_checked_records)
-    : discard_checked_records(discard_checked_records) {}
+CheckerConfig::CheckerConfig(bool discard_checked_records,
+                             std::size_t worker_count,
+                             std::size_t target_request_queue_depth,
+                             std::size_t batch_queue_depth)
+    : discard_checked_records(discard_checked_records),
+      worker_count(worker_count),
+      target_request_queue_depth(target_request_queue_depth),
+      batch_queue_depth(batch_queue_depth) {}
 
 CheckerConfig load_checker_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("checker"));
-    return CheckerConfig(config_bool(values, "discard_checked_records"));
+    const std::size_t worker_count =
+        config_size_t_or(values, "worker_count", config_size_t_or(values, "thread_count", 1));
+    const std::size_t target_request_queue_depth =
+        config_size_t_or(values,
+                         "target_request_queue_depth",
+                         config_size_t_or(values, "request_queue_depth", 65536));
+    return CheckerConfig(config_bool(values, "discard_checked_records"),
+                         worker_count,
+                         target_request_queue_depth,
+                         config_size_t_or(values, "batch_queue_depth", 65536));
 }
 
 Checker::Checker(CheckerConfig config)

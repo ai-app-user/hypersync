@@ -5,15 +5,23 @@
 #include "common/types.hpp"
 #include "jobs/queue_job.hpp"
 
+#include <cstddef>
+
 namespace hypersync {
 
 class ConfigStore;
 
 struct CheckerConfig {
-    bool discard_checked_records;
+    bool discard_checked_records = false;
+    std::size_t worker_count = 1;
+    std::size_t target_request_queue_depth = 65536;
+    std::size_t batch_queue_depth = 65536;
 
     CheckerConfig();
-    explicit CheckerConfig(bool discard_checked_records);
+    explicit CheckerConfig(bool discard_checked_records,
+                           std::size_t worker_count = 1,
+                           std::size_t target_request_queue_depth = 65536,
+                           std::size_t batch_queue_depth = 65536);
 };
 
 [[nodiscard]] CheckerConfig load_checker_config(const ConfigStore& config);

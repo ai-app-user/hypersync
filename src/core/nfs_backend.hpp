@@ -24,6 +24,8 @@ struct FlatFolderScanBatch {
     FileSpec folder;
     std::vector<FileSpec> files;
     std::vector<FileSpec> directories;
+    std::uint64_t scan_started_unix_ns = 0;
+    std::uint64_t scan_finished_unix_ns = 0;
     bool failed = false;
     std::string error;
 };

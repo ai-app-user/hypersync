@@ -340,6 +340,87 @@ Current conclusion: the NFS metadata reader is capable of the 5M records/s
 target, but DuckDB/parquet export is not yet keeping up. The main cost is in
 writer/export completion after the scan timer, not in libnfs metadata discovery.
 
+### 2026-05-15 Transfer1/Nopo1 Long Scan Calibration
+
+Purpose: verify that scanner-class metadata throughput is restored after
+disabling the aggressive per-directory `nfs_opendir_async` timeout recovery
+path. The timeout path was previously causing one slow directory open to recover
+and requeue an entire worker's pending libnfs batch.
+
+Code/package:
+
+```text
+bundle:
+  /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-no-opendir-timeout-20260515T004750Z
+manifest:
+  hypersync_git_commit=62cd045d987a32170beedd5ae5d28f081f2af82a
+  hypersync_git_dirty=25
+  piper_git_commit=219d453b737b5c26e0918976f4b2468d0633be84
+  piper_git_dirty=17
+runtime libraries:
+  bundled libnfs.so.14, libduckdb.so, libstdc++.so.6, libgcc_s.so.1
+```
+
+Shared settings:
+
+```text
+command:
+  benchmark-meta
+metadata reader:
+  --meta-reader-threads 64
+  --metadata-async-depth 256
+  --record-buffer-slots 10000000
+writer:
+  --metadata-output-format parquet
+  --metadata-records all
+  --metadata-output-partitions 32
+  --metadata-output-partition-mode processes
+  duckdb_memory_limit: 1GB
+  duckdb_threads: 1
+  duckdb_checkpoint_threshold: 2GB
+  parquet_compression: uncompressed
+stats:
+  --metadata-stats-discarder
+  --stats-interval-seconds 10
+  track_unique_folders: false
+duration:
+  --max-duration-seconds 600
+```
+
+Regression check before disabling the per-directory open timeout:
+
+| Pipeline | Threads | Async Depth | Record Slots | Result | Timeout Count |
+|---|---:|---:|---:|---:|---:|
+| reader-only | 64 | 256 | 10M | 1.17M records/s over 63.3s | 27,936 |
+| scan + 32 DuckDB writers | 64 | 256 | 1M | 2.51M records/s over 390s | 110,992 at 325s sample |
+
+Validation after disabling the per-directory open timeout:
+
+| Host | Source | Files Seen | Folders Found | Logical Size | Records/s | Timeout Count | Skipped Folders | Output |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| transfer1 | `nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5` | 3,727,219,286 | 37,599,501 | 3,864,323,502,965,916 B | 6.19M | 0 | 5,130 | 32 parquet parts, 682 GiB run dir |
+| nopo1 | `nfs://172.27.255.2-172.27.255.17/volumes/dfb990b1-bf40-4378-85f1-26f9dfd0cd2c/data` | 4,280,160,904 | 38,512,878 | 4,745,584,050,812,557 B | 7.13M | 0 | 5,105 | 32 parquet parts, 777 GiB run dir |
+
+Run directories:
+
+```text
+transfer1:
+  /mnt/local-nvme/wsync-codex/long-scan-transfer1-20260515T005652Z
+nopo1:
+  /mnt/local-nvme/wsync-codex/long-scan-nopo1-dfb-20260515T005835Z
+```
+
+Notes:
+- The nopo1 `b7ec3b01-0aba-49cc-b3d2-6692504cf6c5` export failed at libnfs
+  mount time from that worker with `MNT3ERR_NOENT / Operation not permitted`;
+  the long nopo scan used the currently mounted/exported `dfb990b1...` volume.
+- The packaged `./hypersync` launcher must be used because it sets
+  `LD_LIBRARY_PATH` and default bundle config. Running `hypersync.bin` directly
+  can miss bundled shared libraries or config.
+- The corrected runs show the scanner and parquet writer path can sustain
+  6M-7M records/s for a 10-minute measurement window with no libnfs timeout
+  churn.
+
 ## Checker And Data Transfer Smokes
 
 Recorded on `2026-05-12 22:44 PDT` from commit `9b5c589`. These are bounded
@@ -731,6 +812,75 @@ notes:
   - The next hot spot is comparison CPU/allocation in very large flat folders.
 ```
 
+Isolated fake-remote checker benchmark on local release build, 2026-05-13:
+
+```text
+note:
+  jobs.checker.worker_count is the default checker parallelism. Use
+  --checker-threads only when the run is intentionally testing a specific
+  checker width.
+
+single-checker baseline command:
+  hypersync benchmark-fake-diff --file-count 1000000 --folder-count 10000 \
+    --source-threads 4 --fake-remote-threads 4 --remote-delay-us 1000 \
+    --checker-threads 1 --request-queue-depth 65536 --batch-queue-depth 65536 \
+    --stats-interval-seconds 1
+
+observed:
+  source generated: 1,000,000 files, 10,000 folders
+  fake target checked: 10,000 folders
+  compared: 1,000,000 files, all same
+  source elapsed: 0.032s, 31.37M records/s
+  total elapsed: 3.136s, 318.9K records/s
+
+notes:
+  - Source generation completed before delayed fake-remote checking drained.
+  - This confirms source-side pipeline progress is independent from remote
+    answers until bounded queues fill.
+  - Fake remote delay is modeled by a separate fake processor job: request
+    receiver workers accept folder requests quickly, then delayed processor
+    workers publish replies later.
+  - The total rate is intentionally dominated by the 1 ms per-folder fake
+    remote delay across four fake remote threads.
+  - The number is a local synthetic sanity check, not a transfer-server NFS
+    release baseline.
+```
+
+The checker bottleneck was then sharded by folder path so 16 checker workers
+can compare independent flat folders in parallel:
+
+```text
+single checker, no fake delay:
+  command:
+    hypersync benchmark-fake-diff --file-count 20000000 --folder-count 100000 \
+      --source-threads 8 --fake-remote-threads 8 --checker-threads 1 \
+      --remote-delay-us 0 --request-queue-depth 8192 --batch-queue-depth 8192
+  observed:
+    total: 2.06M records/s
+    source: 2.24M records/s
+    checker process time: 598.9 thread-s over 614.9s in the 1.3B-record run
+
+16 checker workers, no fake delay:
+  command:
+    hypersync benchmark-fake-diff --file-count 200000000 --folder-count 1000000 \
+      --source-threads 8 --fake-remote-threads 8 --checker-threads 16 \
+      --remote-delay-us 0 --request-queue-depth 8192 --batch-queue-depth 32768 \
+      --stats-interval-seconds 10
+  observed:
+    total: 3.79M records/s
+    source: 4.01M records/s
+    compared: 200M files, all same
+    checker process time: 811.0 thread-s over 52.8s
+    process CPU samples: about 850-1000% on local Mac
+
+notes:
+  - The checker now uses many cores instead of one pegged core.
+  - 16 source and 16 fake-remote workers were slower on this host because they
+    increased queue/scheduler pressure without improving compare throughput.
+  - The best local synthetic shape so far is 8 source workers, 8 fake-remote
+    workers, and 16 checker workers.
+```
+
 Nopo1 self-diff against
 `nfs://172.27.255.2-172.27.255.17/volumes/b7ec3b01-0aba-49cc-b3d2-6692504cf6c5/data`
 with the same summary-only command shape:
@@ -747,4 +897,60 @@ notes:
     skipping those source folders.
   - Timed-run target-only suppression kept self-diff counters stable:
     `target_only=0`.
+```
+
+Distributed transfer1-to-nopo1 metadata diff, 2026-05-13:
+
+```text
+source host:
+  ubuntu@216.86.168.191
+  nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+
+target host:
+  ubuntu@160.211.77.39
+  nfs://172.27.255.2-172.27.255.17/volumes/dfb990b1-bf40-4378-85f1-26f9dfd0cd2c/data
+
+command shape:
+  diff-target --target <target-url> --port 39172 --target-threads 96 \
+    --metadata-async-depth 128 --stats-interval-seconds 5
+  diff-source --source <source-url> --target-host 160.211.77.39 \
+    --port 39172 --folder-report folder-report.csv --compare size \
+    --meta-reader-threads 96 --metadata-async-depth 128 \
+    --max-duration-seconds 60 --stats-interval-seconds 5
+
+observed after target drain:
+  folder reports: 321,264
+  file decisions: 82,898,749
+  same: 82,898,562
+  changed: 0
+  source-only/new: 187
+  target-only: 0 (disabled by timed source run)
+  failed file/folder status rows: present; mostly permission or target NOENT
+  source logical size: 582.27 TB
+  target logical size: 671.40 TB
+  planned bytes: 169.27 GB
+  elapsed: 157.98 s
+  average: 524,745 file decisions/s, 2,034 folder reports/s
+  peak interval in this run: about 608K file decisions/s
+  report: /mnt/local-nvme/diff-transfer1-nopo1-current/folder-report.csv
+
+notable large/hot folders:
+  catbear/video_embeddings/cbembeddings/data:
+    target scan 15.6 s, source scan 31.8 s, no direct files in report row
+  videos/youtube/downloads:
+    target scan 13.8 s, source scan 86.3 s, no direct files in report row
+  user/ryan/video-dataloading-ablation-1-episode/results:
+    target scan 1.45 s, 27,744 target files
+  catbear/run_20260218_042836/talking-head:
+    target scan 1.03 s, 50,000 target files
+
+notes:
+  - The first run aborted at about 330K folder reports because a target-side
+    libnfs worker error killed the process. The implementation now turns that
+    into a failed folder summary and continues.
+  - This distributed implementation proves the two-host flow and per-folder
+    reporting, but it is not scanner-class yet. The current bottlenecks are
+    per-folder frames, one TCP stream/write mutex, and whole-folder compare
+    units. Next work is result batching, source-batch splitting for large flat
+    folders, and multiple transport streams.
 ```

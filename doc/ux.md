@@ -644,8 +644,33 @@ hypersync diff \
   --compare time \
   --meta-reader-threads 32 \
   --metadata-async-depth 16 \
+  --checker-threads 16 \
   --max-duration-seconds 30 \
   --output diff.csv
+```
+
+Distributed live metadata command:
+
+```bash
+# Run on the target-side host, where the target NFS export is reachable.
+hypersync diff-target \
+  --target nfs://target-server/export \
+  --listen-host 0.0.0.0 \
+  --port 39172 \
+  --compare size \
+  --target-threads 96 \
+  --metadata-async-depth 128
+
+# Run on the source-side host, where the source NFS export is reachable.
+hypersync diff-source \
+  --source nfs://source-server/export \
+  --target-host target-worker-host \
+  --port 39172 \
+  --folder-report folder-report.csv \
+  --compare size \
+  --meta-reader-threads 96 \
+  --metadata-async-depth 128 \
+  --max-duration-seconds 60
 ```
 
 The live command compares one flat source folder at a time and reads the
@@ -653,6 +678,23 @@ matching flat target folder for that unit. It does not read file data unless a
 future hash/content mode explicitly requests hashes. `--compare content` uses
 recorded hashes when scan records contain hashes; live metadata-only diff falls
 back to size plus mtime until a content-hash pipeline is enabled.
+
+Distributed diff is for the common case where no single worker can reach both
+NFS exports. The source side sends compact folder batches with the folder path
+once and child names plus metadata. The target side returns one CSV folder
+summary per checked folder; detailed per-file names are intentionally not sent
+back unless a future detail mode asks for them.
+
+Checker concurrency and queue sizing default to `jobs.checker` in the YAML
+config:
+
+```yaml
+jobs:
+  checker:
+    worker_count: 16
+    target_request_queue_depth: 65536
+    batch_queue_depth: 65536
+```
 
 Common options:
 - `--source`
@@ -665,6 +707,9 @@ Common options:
 - `--non-recursive`
 - `--meta-reader-threads`
 - `--metadata-async-depth`
+- `--checker-threads`
+- `--checker-request-queue-depth`
+- `--checker-batch-queue-depth`
 - `--max-duration-seconds`
 
 ### Copy

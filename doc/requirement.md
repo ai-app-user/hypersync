@@ -188,12 +188,22 @@ Current state:
   folders.
 - Diff output reports source-only/new, changed, equal, and target-only file
   records in CSV form.
+- Live diff checker worker count, target-request queue depth, and source/target
+  batch queue depth are configurable in YAML and can be overridden per command.
+- Distributed metadata diff has first source/target roles:
+  `diff-source` scans the source where that NFS export is reachable and sends
+  compact flat-folder batches; `diff-target` reads the target where that export
+  is reachable and returns per-folder summary records.
+- Distributed diff folder reports include source/target scan timestamps,
+  source/target file counts, same/changed/new/target-only counts, logical-size
+  counters, planned bytes, status, and error text.
 
 Remaining:
 - Add data-hash diff mode that reads file content only when requested.
 - Add resumable diff for very large trees.
-- Add diff summaries by folder and change type.
 - Add Parquet diff output.
+- Batch multiple folder-summary replies per transport frame and support
+  multi-frame source batches for extremely large flat folders.
 
 ### NFS Sync and Copy
 

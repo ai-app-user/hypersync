@@ -6,6 +6,158 @@
 
 ---
 
+## 0. Mandatory Architecture Principles
+
+These principles are requirements for all Hypersync production code. They are
+not preferences, optimizations, or optional cleanup goals. If an implementation
+cannot follow one of these rules, the design must be discussed and explicitly
+approved before code is written.
+
+### 0.1 Everything Is a Job Connected by Queues
+
+Hypersync is built from independent Jobs connected only by bounded queues of
+opaque buffer handles.
+
+- Every Job has explicit input queue(s) and output queue(s).
+- A Job must not know which specific Job produced its input.
+- A Job must not know which specific Job consumes its output.
+- A Job may have one or more worker threads, but workers execute the same Job
+  responsibility and must not depend on each other for normal progress.
+- A Job owns its internal settings: thread count, async depth, batching limits,
+  hash mode, transport endpoint, or writer options.
+- Pipeline topology is configured outside the Job. Reusing the same Job in a
+  scan, diff, sync, generator, or benchmark pipeline must not require changing
+  the Job implementation.
+- Combining unrelated responsibilities into one worker because it is convenient
+  is not allowed. For example, an NFS scanner must not write sockets, a differ
+  must not write CSV/Parquet, and a sender/receiver must not understand file
+  metadata.
+
+The only allowed communication between Jobs is ownership transfer of existing
+buffers through queues.
+
+### 0.2 Queues Carry Ownership, Not Bytes
+
+Queues store only buffer handles. A queue does not store file records, paths,
+serialized payloads, `std::string`, `std::vector`, typed records, or data bytes.
+
+Pushing to a queue transfers ownership of an already allocated buffer. Popping
+from a queue transfers ownership to the consuming Job worker. The queue does not
+copy, inspect, allocate, free, parse, or transform the buffer payload.
+
+All production pipeline edges must use bounded queues. Bounded queues are the
+normal flow-control mechanism. If a downstream stage cannot keep up, the output
+queue fills and only then does the upstream producer slow down.
+
+### 0.3 No Payload Memcpy Between Jobs
+
+Large payload buffers must not be copied between Jobs. Hypersync moves ownership
+of buffers, not bytes.
+
+- Metadata and data buffers are preallocated at startup.
+- A Job may modify a buffer only while it owns the handle.
+- A Job forwards work by pushing the same handle to the next queue.
+- A Job discards work by releasing the same handle back to the pool.
+- File data must not be copied from one pipeline buffer into another pipeline
+  buffer.
+- Serialization into temporary strings or vectors is not allowed on hot
+  pipeline paths.
+
+The only acceptable payload copy is one that is unavoidable at an external API
+boundary, such as libnfs copying data into memory it controls or the kernel
+copying data for a non-zero-copy socket write. Even then, the copy must remain
+inside the backend adapter or transport Job. It must not leak into generic Job
+interfaces or become a Job-to-Job handoff mechanism.
+
+### 0.4 No Runtime Allocation on Hot Paths
+
+All buffers, queue cells, batch storage, and transport frame buffers required
+for steady-state operation are allocated during startup. Hot-path code must not
+allocate or free per file, per chunk, per folder, per network frame, or per
+result record.
+
+Small configuration objects, command-line parsing, test fixtures, and
+non-production diagnostics may allocate. Production Jobs must use preallocated
+buffers and reusable scratch state sized by configuration.
+
+### 0.5 Universal Jobs, Domain-Specific Payload Views
+
+Generic infrastructure must stay generic.
+
+- Sender and Receiver Jobs operate on generic buffers only.
+- Buffer pools and queues operate on generic buffers only.
+- Discarder, generator, transport, and monitoring helpers must not depend on
+  NFS, DuckDB, Parquet, hashes, file paths, or sync/diff semantics.
+- Domain-specific code may interpret a buffer through payload view helpers only
+  after a Job owns the handle.
+
+If a Job needs special behavior, that behavior belongs in a domain-specific Job
+or payload view, not in the generic queue, pool, sender, receiver, or monitoring
+layer.
+
+### 0.6 Waiting and Backpressure Rules
+
+Jobs are expected to run at maximum useful speed. A Job must never wait for a
+specific downstream Job or upstream Job. It only interacts with queues.
+
+Allowed waits:
+
+- A consumer worker may wait when its input queue is empty.
+- A producer worker may wait when its output queue is full.
+- An external-I/O Job may wait for the external API it owns, while keeping its
+  configured async depth or transport concurrency full.
+- Shutdown may wait for owned buffers to be forwarded, released, or flushed
+  according to the pipeline's graceful-stop policy.
+
+Not allowed:
+
+- Scanner workers waiting on sockets.
+- Differ/checker workers waiting on report writers.
+- Sender/receiver Jobs interpreting metadata to decide custom behavior.
+- Global mutexes that serialize unrelated workers on hot-path data transfer.
+- Unbounded queues that hide backpressure by growing memory.
+- Side channels where one Job calls another Job directly.
+
+Metrics must make wait reasons visible: empty-input wait, full-output wait,
+external-I/O wait, processing time, records processed, bytes processed, and
+queue depth/high-water marks.
+
+### 0.7 Mandatory Generic Instrumentation
+
+Every production Job must be observable through the shared monitor vocabulary.
+Instrumentation is part of the architecture, not optional debug code.
+
+- Jobs must expose cumulative processed count and byte count where those values
+  are meaningful.
+- Jobs that process domain records must expose the domain unit through monitor
+  snapshots, for example records/s, files/s, folders/s, or logical bytes/s.
+- Generic runtime metrics must classify worker wall time as processing, waiting
+  for input, waiting for output capacity, waiting for free pool buffers, waiting
+  in owned I/O, or stopped.
+- Periodic reports must include cumulative rate, recent/current rate, first
+  observed startup rate, mid-run historical rate, peak observed rate, tail rate
+  after a job stops, queue depth/fullness, and worker wait-state percentages.
+- The same metrics must be usable for live status, performance tests, and final
+  summaries so scan, diff, sync, generator, transport, writer, and checker
+  pipelines can be compared without bespoke reporting code.
+- Instrumentation must avoid hot-path overhead. Queue/pool helpers should take a
+  timestamp only after the non-blocking fast path fails, and domain Jobs should
+  update counters with relaxed atomics or batch-local accumulation.
+
+When a benchmark or real run is slower than expected, the first answer should be
+visible from the generic status: which Jobs are busy, which are starved, which
+are backpressured, which are pool-limited, and which are waiting inside external
+I/O.
+
+### 0.8 Prototypes Must Not Redefine the Architecture
+
+Experimental code is allowed only when it is clearly isolated and documented as
+non-production. Prototype shortcuts must not become the default architecture.
+Before merging a feature into the production pipeline, it must be converted to
+the Job + bounded queue + preallocated buffer ownership model described here.
+
+---
+
 ## 1. Overview
 
 HyperSync is a high-speed, NFS-to-NFS file transfer engine targeting 400 Gbit/s on LAN and 100 Gbit/s sustained throughput over a 60 ms WAN link. It is written in C++20 and built around a pipeline of self-contained Jobs that communicate exclusively through ownership transfer of pre-allocated memory buffer slots. No dynamic memory allocation occurs during operation.
@@ -33,15 +185,42 @@ The core architecture — buffer pool, Job interfaces, pipeline topology, two-ch
 
 ### 1.2 Design Principles
 
-- **No runtime allocation.** All buffers pre-allocated at startup from BufferPool. Jobs transfer slot ownership via atomic index; they never allocate or free.
-- **Pull-only data flow.** Each Job pulls from its upstream. Backpressure is implicit: no free slots means the caller waits. No explicit flow-control protocol between Jobs.
-- **Queues carry ownership, not data.** A queue node contains only a handle to an existing pre-allocated buffer. It never contains `std::string`, `std::vector`, `FileSpec`, serialized payload bytes, or any other dynamically allocated record.
-- **Jobs are connected only by buffer queues.** Every Job has named input and output ports. Each port is a thread-safe queue of buffer handles. A Job does not know which Job produced an input buffer or which Job will consume an output buffer.
-- **Jobs own their threading.** Every Job has its own worker-thread count and internal parameters. Pipeline composition does not change the Job's implementation.
-- **Two-channel network.** A priority TCP channel carries all metadata, ACKs, and control messages. A separate data TCP channel carries bulk DataBuf transfers. A large data chunk can never head-of-line block a metadata message.
-- **One Job, one concern.** Each Job has a narrow interface: `start()`, `stop()`, `pull()`, `push_back()`, `stats()`. All business logic is self-contained.
-- **Self-describing buffers.** Every DataBuf carries a 4 KB metadata trailer with full path, offsets, size, hash, and flags. No separate framing or side-channel needed for reassembly.
-- **Swappable backends.** Transport and NVMe cache implementations are hidden behind thin abstractions. V2 optimizations do not touch Job logic.
+- **Mandatory architecture.** Section 0 is the governing contract for all
+  production implementation. Local shortcuts are not acceptable unless discussed
+  and approved before implementation.
+- **No runtime allocation.** All hot-path buffers are pre-allocated at startup
+  from BufferPool. Jobs transfer slot ownership via opaque handles; they never
+  allocate or free payload memory during steady-state operation.
+- **No Job-to-Job payload copying.** Jobs transfer ownership of existing buffers.
+  They do not copy metadata batches, file data, result records, or transport
+  frames between pipeline stages.
+- **Pull/push data flow through queues.** Each Job pulls owned buffers from input
+  queues and pushes owned buffers to output queues. Backpressure is represented
+  by bounded queues becoming full.
+- **Queues carry ownership, not data.** A queue node contains only a handle to an
+  existing pre-allocated buffer. It never contains `std::string`, `std::vector`,
+  `FileSpec`, serialized payload bytes, or any dynamically allocated record.
+- **Jobs are connected only by buffer queues.** Every Job has named input and
+  output ports. A Job does not know which Job produced an input buffer or which
+  Job will consume an output buffer.
+- **Jobs own their threading.** Every Job has its own worker-thread count and
+  internal parameters. Pipeline composition does not change the Job's
+  implementation.
+- **Generic transport.** Sender and Receiver Jobs move generic buffers. They do
+  not contain NFS, metadata, diff, sync, hash, CSV, DuckDB, or Parquet-specific
+  logic.
+- **Two-channel network where needed.** Priority/control traffic and bulk data
+  traffic use separate transport queues/connections so large data chunks cannot
+  head-of-line block metadata or result messages.
+- **One Job, one concern.** Each Job has a narrow interface and a single
+  responsibility. Business logic is self-contained inside the appropriate Job,
+  not spread across neighboring Jobs.
+- **Self-describing domain payloads.** Domain-specific payload layouts are
+  interpreted only through Hypersync payload view helpers after a Job owns a
+  generic buffer handle.
+- **Swappable backends.** Transport, NFS, DuckDB/Parquet, and NVMe cache
+  implementations are hidden behind Job/backend abstractions. Backend
+  optimizations do not touch generic Job or queue logic.
 
 ---
 
@@ -238,6 +417,13 @@ and releases each buffer. Therefore a Parquet writer process can be assembled as
 BufferReceiverJob -> MetadataRecordWriterJob(part-N.parquet)
 ```
 
+Parquet output is finalized through a temporary output file. DuckDB appends to a
+temporary `.duckdb.tmp` staging database, commits the staging table, copies it to
+`<part>.parquet.tmp`, and only then renames it to `<part>.parquet`. A process
+that exits normally therefore exposes only finalized Parquet files; a killed
+process may leave recoverable `.duckdb.tmp` state or a temporary Parquet file,
+but it should not publish a partial file under the final `.parquet` name.
+
 Metadata batches have two compatible payload shapes:
 
 - **Record batch:** each file or folder record stores its full relative path.
@@ -257,10 +443,25 @@ Live metadata diff uses the same flat-folder unit. The detailed-report path can
 read a target folder directly while processing a source batch, but the
 high-throughput summary/checker path keeps source and target metadata reading as
 separate async jobs. Source workers read flat source folders and enqueue matching
-target-folder work. Target workers read those folders independently. The differ
+target-folder work plus source batches. Target workers read those folders
+independently and emit target batches. A separate sharded joiner/checker job
 rendezvous batches by folder path and compares records with `size`, `time`, or
-available content-hash semantics. This preserves the pipeline rule that scanner
-and target reader are independent jobs with their own parallelism and queues.
+available content-hash semantics. Every folder is assigned to exactly one
+checker shard, so source and target batches for that folder meet on the same
+worker without a shared global rendezvous map. Source scanning does not wait for
+target results; it only waits when a bounded output queue is full, which is
+normal pipeline backpressure. This preserves the rule that scanner, remote
+checker, and differ are independent jobs with their own parallelism and queues.
+Checker worker count, target-request queue depth, and source/target batch queue
+depth are job settings under `jobs.checker`; CLI flags may override them for a
+single run but command code must not hardcode those operational limits.
+
+The synthetic fake-remote benchmark follows the same independence rule. Fake
+remote request receivers dequeue target-folder requests and immediately hand
+them to a bounded fake-processor queue, releasing the request-side pipeline.
+Separate fake processor workers apply `--remote-delay-us` and later publish the
+target batch reply. This models asynchronous request/response latency instead
+of making the sender wait inside the request receiver.
 
 For full, untimed diffs, target-only child folders are scanned as target-only
 subtrees so the report can include files that exist only on the target side
@@ -269,6 +470,18 @@ target-only reporting is disabled because a timeout can stop the source reader
 mid-directory and make the still-complete target batch look falsely ahead of the
 source. This is intentionally checker/differ behavior layered on scanner
 batches; scanner, batcher, sender, receiver, and writer jobs remain reusable.
+
+Distributed live diff splits that same shape across hosts. `diff-source` owns
+the source metadata reader and sends compact flat-folder batches over TCP.
+`diff-target` owns the target metadata reader and compares each received source
+folder against the matching target folder. The reply is a folder-level summary
+record: timestamps for source scan, target scan, result send/receive, direct
+file/folder counts, same/changed/source-only/target-only counts, logical-size
+counters, status, and error text. This keeps the return path small and avoids
+sending full file paths back for every child. Current implementation sends one
+folder summary per frame; the next optimization is batching many summaries into
+one frame and splitting extremely large flat folders across multiple source
+frames with an end-of-folder marker.
 
 ### 3.1 Buffer Types
 

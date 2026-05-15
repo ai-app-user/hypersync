@@ -83,7 +83,7 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
         }
 
         try {
-            publish_file_chunks(reader, *file);
+            publish_file_chunks(reader, *file, worker_index);
             record_file_read();
         } catch (const NfsDataReaderStopped&) {
             break;
@@ -101,7 +101,9 @@ void NfsDataBufferReaderJob::on_all_workers_finished() {
     output_.close();
 }
 
-void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader, const FileSpec& file) {
+void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
+                                                 const FileSpec& file,
+                                                 std::size_t worker_index) {
     const RecBuf record = make_recbuf(file);
     const std::uint64_t logical_size = file_logical_size(file);
 
@@ -113,7 +115,7 @@ void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader, const Fi
                                           const std::uint64_t bytes_read = buffer.trailer.data_len;
                                           complete_trailer(record, logical_size, buffer.trailer, chunk.offset);
 
-                                          if (!output_.push_wait(chunk.handle)) {
+                                          if (!wait_for_output(worker_index, output_, chunk.handle)) {
                                               data_pool_.release(chunk.handle);
                                               throw NfsDataReaderStopped {};
                                           }

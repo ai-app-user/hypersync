@@ -22,6 +22,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -575,6 +576,89 @@ void test_status_monitor_renders_jobs_queues_and_socket_requests() {
     EXPECT_FALSE(fs::exists(socket_path));
 }
 
+void test_threaded_job_runtime_metrics_report_wait_states() {
+    RawBufferPool raw_pool(77U, 1U, 128U);
+    BufferPoolRegistry pool_registry;
+    pool_registry.register_pool(raw_pool);
+    BufQueue input(2U);
+
+    BufferDiscarderJob discarder(BufferDiscarderConfig(1U), input, pool_registry);
+    discarder.start();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    hypersync::RuntimeMetricsSnapshot snapshot;
+    do {
+        snapshot = discarder.runtime_metrics().snapshot();
+        if (snapshot.current_workers[hypersync::runtime_state_index(hypersync::RuntimeState::wait_input_empty)] == 1U) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    EXPECT_EQ(snapshot.current_workers[hypersync::runtime_state_index(hypersync::RuntimeState::wait_input_empty)],
+              1U);
+    EXPECT_TRUE(snapshot.total_wall_ns > 0U);
+
+    hypersync::StatusRegistry status_registry;
+    status_registry.register_job("runtime_wait_job", [&]() {
+        hypersync::MonitorJobSnapshot job;
+        job.name = "runtime_wait_job";
+        job.running = discarder.running();
+        job.worker_count = discarder.worker_count();
+        job.processed_count = discarder.stats().buffers_discarded;
+        job.count_unit = "buffers";
+        job.has_runtime_metrics = true;
+        job.runtime_metrics = discarder.runtime_metrics().snapshot();
+        return job;
+    });
+    const std::string rendered = status_registry.render_human();
+    EXPECT_TRUE(rendered.find("process_cpu=") != std::string::npos);
+    EXPECT_TRUE(rendered.find("current=") != std::string::npos);
+    EXPECT_TRUE(rendered.find("start=") != std::string::npos);
+    EXPECT_TRUE(rendered.find("peak=") != std::string::npos);
+    EXPECT_TRUE(rendered.find("wait_in=") != std::string::npos);
+    EXPECT_TRUE(rendered.find("now=wait_input:1") != std::string::npos);
+
+    discarder.stop();
+}
+
+void test_periodic_status_reporter_reuses_status_registry() {
+    std::atomic<std::uint64_t> processed {0};
+    std::atomic<std::uint64_t> reports {0};
+
+    hypersync::StatusRegistry status_registry;
+    status_registry.register_job("periodic_job", [&]() {
+        hypersync::MonitorJobSnapshot job;
+        job.name = "periodic_job";
+        job.running = true;
+        job.worker_count = 1;
+        job.processed_count = processed.fetch_add(1, std::memory_order_relaxed);
+        job.count_unit = "records";
+        return job;
+    });
+
+    hypersync::PeriodicStatusReporter reporter(
+        status_registry,
+        std::chrono::milliseconds(5),
+        [&](std::string text) {
+            if (text.find("periodic_job") != std::string::npos &&
+                text.find("current=") != std::string::npos) {
+                reports.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    reporter.start();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (reports.load(std::memory_order_acquire) == 0U &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    reporter.stop();
+
+    EXPECT_FALSE(reporter.running());
+    EXPECT_TRUE(reports.load(std::memory_order_acquire) > 0U);
+}
+
 void test_raw_buffer_pool_allocates_byte_slots_and_registry_discards_any_handle() {
     RawBufferPool raw_pool(77U, 2U, 128U);
     EXPECT_EQ(raw_pool.pool_id(), 77U);
@@ -1049,6 +1133,146 @@ void test_compact_folder_metadata_batch_round_trip() {
     EXPECT_EQ(files.front().rel_path, input_files.front().rel_path);
 }
 
+void test_flat_folder_and_diff_result_buffer_codecs_round_trip() {
+    FileSpec folder;
+    folder.rel_path = "root/folder";
+    folder.mtime = 123;
+    folder.mode = 0755;
+    folder.uid = 1000;
+    folder.gid = 1001;
+
+    FileSpec file;
+    file.rel_path = "root/folder/file.dat";
+    file.declared_size = 4096;
+    file.mtime = 456;
+    file.mode = 0644;
+    file.uid = 2000;
+    file.gid = 2001;
+
+    FileSpec child_folder;
+    child_folder.rel_path = "root/folder/child";
+    child_folder.mtime = 789;
+    child_folder.mode = 0750;
+
+    hypersync::MetadataBatchBuffer folder_buffer;
+    hypersync::reset_flat_folder_buffer(folder_buffer,
+                                        folder,
+                                        7,
+                                        false,
+                                        false,
+                                        {},
+                                        1,
+                                        1,
+                                        4096,
+                                        0x1234,
+                                        11,
+                                        22);
+    EXPECT_TRUE(hypersync::append_flat_folder_file(folder_buffer, file, "time"));
+    EXPECT_TRUE(hypersync::append_flat_folder_folder(folder_buffer, child_folder, "time"));
+    hypersync::set_flat_folder_buffer_final(folder_buffer, true);
+
+    const auto info = hypersync::flat_folder_buffer_info(folder_buffer);
+    EXPECT_TRUE(info.final_batch);
+    EXPECT_EQ(info.sequence, 7U);
+    EXPECT_EQ(info.folder_path, "root/folder");
+    EXPECT_EQ(info.total_file_count, 1ULL);
+    EXPECT_EQ(info.total_folder_count, 1ULL);
+    EXPECT_EQ(info.total_logical_size_bytes, 4096ULL);
+    EXPECT_EQ(info.metadata_hash, 0x1234ULL);
+
+    std::size_t files = 0;
+    std::size_t folders = 0;
+    hypersync::visit_flat_folder_children(folder_buffer, [&](hypersync::FlatFolderChildView child) {
+        if (child.is_file) {
+            ++files;
+            EXPECT_EQ(child.name, "file.dat");
+            EXPECT_EQ(child.logical_size, 4096ULL);
+        } else {
+            ++folders;
+            EXPECT_EQ(child.name, "child");
+        }
+    });
+    EXPECT_EQ(files, 1U);
+    EXPECT_EQ(folders, 1U);
+
+    hypersync::MetadataBatchBuffer result_buffer;
+    hypersync::reset_diff_result_buffer(result_buffer);
+    hypersync::FolderDiffSummary summary;
+    summary.rel_path = info.folder_path;
+    summary.source_file_count = 2;
+    summary.target_file_count = 2;
+    summary.files_same = 1;
+    summary.files_changed = 1;
+    summary.bytes_planned = 4096;
+    EXPECT_TRUE(hypersync::append_diff_result(result_buffer, summary));
+
+    std::size_t result_count = 0;
+    hypersync::visit_diff_results(result_buffer, [&](hypersync::FolderDiffSummary decoded) {
+        ++result_count;
+        EXPECT_EQ(decoded.rel_path, "root/folder");
+        EXPECT_EQ(decoded.files_same, 1ULL);
+        EXPECT_EQ(decoded.files_changed, 1ULL);
+        EXPECT_EQ(decoded.bytes_planned, 4096ULL);
+    });
+    EXPECT_EQ(result_count, 1U);
+}
+
+void test_buffer_stream_transport_moves_raw_buffers_over_existing_fd() {
+    int sockets[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
+        throw std::runtime_error("socketpair failed");
+    }
+    hypersync::ScopedFd left(sockets[0]);
+    hypersync::ScopedFd right(sockets[1]);
+
+    RawBufferPool sender_pool(hypersync::kMetadataBufferPoolId,
+                              8U,
+                              sizeof(hypersync::MetadataBuffer),
+                              alignof(hypersync::MetadataBuffer));
+    RawBufferPool receiver_pool(77U,
+                                8U,
+                                sizeof(hypersync::MetadataBuffer),
+                                alignof(hypersync::MetadataBuffer));
+    BufferPoolRegistry sender_registry;
+    sender_registry.register_pool(sender_pool);
+    BufQueue sender_queue(8U);
+    BufQueue receiver_queue(8U);
+
+    hypersync::BufferStreamReceiverJob receiver(1U, receiver_pool, receiver_queue, right.get());
+    hypersync::BufferStreamSenderJob sender(1U, sender_queue, sender_registry, left.get());
+    receiver.start();
+    sender.start();
+
+    for (std::size_t index = 0; index < 2U; ++index) {
+        const BufferHandle handle = *sender_pool.try_acquire();
+        FileSpec file;
+        file.rel_path = "stream/file_" + std::to_string(index);
+        file.declared_size = 10 + index;
+        EXPECT_TRUE(hypersync::encode_metadata_file_record(hypersync::metadata_buffer(sender_pool, handle), file));
+        EXPECT_TRUE(sender_queue.push_wait(handle));
+    }
+    sender_queue.close();
+    sender.wait();
+    left.reset();
+    receiver.wait();
+
+    EXPECT_EQ(sender_pool.available(), sender_pool.capacity());
+    EXPECT_EQ(sender.stats().buffers, 2ULL);
+    EXPECT_EQ(receiver.stats().buffers, 2ULL);
+    EXPECT_EQ(receiver_queue.size(), 2U);
+
+    BufferHandle received;
+    std::size_t decoded = 0;
+    while (receiver_queue.try_pop(received)) {
+        const FileSpec file = hypersync::decode_metadata_file_record(hypersync::metadata_buffer(receiver_pool, received));
+        EXPECT_TRUE(file.rel_path == "stream/file_0" || file.rel_path == "stream/file_1");
+        receiver_pool.release(received);
+        ++decoded;
+    }
+    EXPECT_EQ(decoded, 2U);
+    EXPECT_EQ(receiver_pool.available(), receiver_pool.capacity());
+}
+
 void test_buffer_transport_feeds_metadata_writer_job() {
     TempDir output("hypersync_transport_metadata_writer");
     const fs::path socket_path =
@@ -1225,9 +1449,19 @@ void test_buffer_transport_feeds_metadata_writer_job() {
     parquet_writer.wait();
 
     EXPECT_TRUE(fs::exists(parquet_path));
+    EXPECT_FALSE(fs::exists(fs::path(parquet_path.string() + ".tmp")));
+    EXPECT_FALSE(fs::exists(fs::path(parquet_path.string() + ".duckdb.tmp")));
     EXPECT_EQ(parquet_writer.writer_stats().files_written, 1ULL);
     EXPECT_EQ(sender_pool.available(), sender_pool.capacity());
     EXPECT_EQ(receiver_pool.available(), receiver_pool.capacity());
+
+    MetadataRecordWriter append_writer(parquet_writer_config);
+    append_writer.write_batch({}, {folder});
+    append_writer.close();
+    EXPECT_TRUE(fs::exists(parquet_path));
+    EXPECT_FALSE(fs::exists(fs::path(parquet_path.string() + ".tmp")));
+    EXPECT_FALSE(fs::exists(fs::path(parquet_path.string() + ".duckdb.tmp")));
+    EXPECT_EQ(append_writer.folders_written(), 1ULL);
     fs::remove(parquet_socket_path, ignored);
 #endif
 }
@@ -1928,6 +2162,10 @@ void test_config_store_reads_sections_merges_defaults_and_reloads() {
         output << "    async_directory_depth: 256\n";
         output << "  nfs_data_reader:\n";
         output << "    data_reader_worker_count: 3\n";
+        output << "  checker:\n";
+        output << "    worker_count: 9\n";
+        output << "    target_request_queue_depth: 1234\n";
+        output << "    batch_queue_depth: 5678\n";
         output << "  input_provider:\n";
         output << "    max_queue_entries: 44\n";
         output << "    refill_threshold: 5\n";
@@ -1965,6 +2203,11 @@ void test_config_store_reads_sections_merges_defaults_and_reloads() {
 
     const auto data_reader_config = hypersync::load_nfs_data_reader_config(config);
     EXPECT_EQ(data_reader_config.data_reader_worker_count, 3U);
+
+    const auto checker_config = hypersync::load_checker_config(config);
+    EXPECT_EQ(checker_config.worker_count, 9U);
+    EXPECT_EQ(checker_config.target_request_queue_depth, 1234U);
+    EXPECT_EQ(checker_config.batch_queue_depth, 5678U);
 
     {
         std::ofstream output(config_path);
@@ -3526,6 +3769,32 @@ void test_live_metadata_diff_summary_only_counts_without_records() {
     EXPECT_TRUE(report.diff_csv.empty());
 }
 
+void test_fake_remote_diff_benchmark_keeps_source_pipeline_independent() {
+    EngineConfig config;
+    config.mode = Mode::dry_run;
+    const TransferEngine engine(config);
+
+    const auto report = engine.benchmark_fake_remote_diff_pipeline(1000,
+                                                                   20,
+                                                                   4096,
+                                                                   2,
+                                                                   2,
+                                                                   100,
+                                                                   128,
+                                                                   128,
+                                                                   0);
+
+    EXPECT_EQ(report.source_files_generated, 1000U);
+    EXPECT_EQ(report.source_folders_generated, 20U);
+    EXPECT_EQ(report.target_folders_checked, 20U);
+    EXPECT_EQ(report.files_compared, 1000U);
+    EXPECT_EQ(report.files_same, 1000U);
+    EXPECT_TRUE(report.source_records_per_second > 0.0);
+    EXPECT_TRUE(report.total_records_per_second > 0.0);
+    EXPECT_TRUE(report.source_elapsed_seconds < report.total_elapsed_seconds);
+    EXPECT_TRUE(report.fake_remote_delay_seconds > 0.0);
+}
+
 void test_scan_mode_builds_source_scan_rows() {
     EngineConfig config;
     config.mode = Mode::scan;
@@ -3713,12 +3982,24 @@ int main(int argc, char** argv) {
         {"compact_folder_metadata_batch_round_trip",
          TestSuite::unit,
          test_compact_folder_metadata_batch_round_trip},
+        {"flat_folder_and_diff_result_buffer_codecs_round_trip",
+         TestSuite::unit,
+         test_flat_folder_and_diff_result_buffer_codecs_round_trip},
+        {"buffer_stream_transport_moves_raw_buffers_over_existing_fd",
+         TestSuite::unit,
+         test_buffer_stream_transport_moves_raw_buffers_over_existing_fd},
         {"buffer_transport_feeds_metadata_writer_job",
          TestSuite::unit,
          test_buffer_transport_feeds_metadata_writer_job},
         {"status_monitor_renders_jobs_queues_and_socket_requests",
          TestSuite::unit,
          test_status_monitor_renders_jobs_queues_and_socket_requests},
+        {"threaded_job_runtime_metrics_report_wait_states",
+         TestSuite::unit,
+         test_threaded_job_runtime_metrics_report_wait_states},
+        {"periodic_status_reporter_reuses_status_registry",
+         TestSuite::unit,
+         test_periodic_status_reporter_reuses_status_registry},
         {"data_hasher_hashes_and_forwards_raw_buffers",
          TestSuite::unit,
          test_data_hasher_hashes_and_forwards_raw_buffers},
@@ -3813,6 +4094,9 @@ int main(int argc, char** argv) {
         {"live_metadata_diff_summary_only_counts_without_records",
          TestSuite::unit,
          test_live_metadata_diff_summary_only_counts_without_records},
+        {"fake_remote_diff_benchmark_keeps_source_pipeline_independent",
+         TestSuite::unit,
+         test_fake_remote_diff_benchmark_keeps_source_pipeline_independent},
         {"scan_mode_builds_source_scan_rows", TestSuite::unit, test_scan_mode_builds_source_scan_rows},
         {"main_cli_scan_and_dry_run_smoke", TestSuite::integration, test_main_cli_scan_and_dry_run_smoke},
         {"main_cli_benchmark_meta_smoke", TestSuite::integration, test_main_cli_benchmark_meta_smoke},

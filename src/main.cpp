@@ -62,13 +62,16 @@ void print_usage() {
         << "  hypersync status --socket <path>\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
-        << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--checker-threads <n>] [--checker-request-queue-depth <n>] [--checker-batch-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff-target --target <dir|nfs-url> [--listen-host <host>] --port <port> [--compare size|time|content] [--non-recursive] [--target-threads <n>] [--metadata-async-depth <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff-source --source <dir|nfs-url> --target-host <host> --port <port> --folder-report <report.csv> [--compare size|time|content] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-fake-diff [--file-count <n>] [--folder-count <n>] [--average-file-size <bytes>] [--source-threads <n>] [--fake-remote-threads <n>] [--checker-threads <n>] [--remote-delay-us <n>] [--request-queue-depth <n>] [--batch-queue-depth <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-metadata-writer --output <records.parquet|dataset-dir|csv|txt> [--output-format text|csv|parquet] [--file-count <n>] [--folder-count <n>] [--batch-size <n>] [--average-file-size <bytes>] [--duckdb-memory-limit <value>] [--duckdb-threads <n>] [--duckdb-checkpoint-threshold <value>] [--parquet-compression zstd|snappy|uncompressed] [--partitions <n>] [--partition-mode threads|processes|transport-processes|generate-discard|generate-hash-discard|pack-discard|folder-pack-discard|transport-discard]\n"
         << "  hypersync [--config <config.yaml>] hash --source <dir|nfs-url> --output <records.csv|txt|parquet> [--output-format text|csv|parquet] [--records all|files|folders] [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--hash-mode file|blocks] [--hash-block-size <bytes>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--hash-threads <n>] [--max-files-queued <n>] [--max-hash-chunks-queued <n>] [--max-duration-seconds <n>]\n"
         << '\n';
@@ -373,6 +376,140 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (command == "diff-target") {
+            std::filesystem::path target_root;
+            std::string listen_host = "0.0.0.0";
+            std::uint16_t port = 0;
+            std::string compare_mode = "size";
+            bool recursive = true;
+            std::size_t target_threads = 0;
+            std::size_t metadata_async_depth = 0;
+            std::uint32_t stats_interval_seconds = 5;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--target") {
+                    target_root = require_option(args, i, "--target");
+                } else if (args[i] == "--listen-host" || args[i] == "--bind-host") {
+                    listen_host = require_option(args, i, args[i]);
+                } else if (args[i] == "--port") {
+                    port = parse_port(require_option(args, i, "--port"), "--port");
+                } else if (args[i] == "--compare" || args[i] == "--mode") {
+                    compare_mode = require_option(args, i, args[i]);
+                } else if (args[i] == "--non-recursive") {
+                    recursive = false;
+                } else if (args[i] == "--target-threads" || args[i] == "--threads") {
+                    target_threads = parse_size_t_option(require_option(args, i, args[i]), args[i]);
+                } else if (args[i] == "--metadata-async-depth") {
+                    metadata_async_depth = parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
+                                                               "--metadata-async-depth");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            if (target_root.empty()) {
+                throw std::runtime_error("--target is required");
+            }
+            if (port == 0U) {
+                throw std::runtime_error("--port is required");
+            }
+            engine.run_distributed_diff_target(target_root,
+                                               listen_host,
+                                               port,
+                                               compare_mode,
+                                               recursive,
+                                               target_threads,
+                                               metadata_async_depth,
+                                               stats_interval_seconds);
+            return 0;
+        }
+
+        if (command == "diff-source") {
+            std::filesystem::path source_root;
+            std::string target_host;
+            std::uint16_t port = 0;
+            std::filesystem::path folder_report_path;
+            std::string compare_mode = "size";
+            bool recursive = true;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
+            double max_duration_seconds = 0.0;
+            std::uint32_t stats_interval_seconds = 5;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--source") {
+                    source_root = require_option(args, i, "--source");
+                } else if (args[i] == "--target-host" || args[i] == "--host") {
+                    target_host = require_option(args, i, args[i]);
+                } else if (args[i] == "--port") {
+                    port = parse_port(require_option(args, i, "--port"), "--port");
+                } else if (args[i] == "--folder-report" || args[i] == "--output") {
+                    folder_report_path = require_option(args, i, args[i]);
+                } else if (args[i] == "--compare" || args[i] == "--mode") {
+                    compare_mode = require_option(args, i, args[i]);
+                } else if (args[i] == "--non-recursive") {
+                    recursive = false;
+                } else if (args[i] == "--meta-reader-threads") {
+                    meta_reader_threads = parse_size_t_option(require_option(args, i, "--meta-reader-threads"),
+                                                              "--meta-reader-threads");
+                } else if (args[i] == "--metadata-async-depth") {
+                    metadata_async_depth = parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
+                                                               "--metadata-async-depth");
+                } else if (args[i] == "--max-duration-seconds") {
+                    max_duration_seconds = parse_positive_double_option(
+                        require_option(args, i, "--max-duration-seconds"),
+                        "--max-duration-seconds");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            if (source_root.empty()) {
+                throw std::runtime_error("--source is required");
+            }
+            if (target_host.empty()) {
+                throw std::runtime_error("--target-host is required");
+            }
+            if (port == 0U) {
+                throw std::runtime_error("--port is required");
+            }
+            if (folder_report_path.empty()) {
+                throw std::runtime_error("--folder-report is required");
+            }
+            const auto report = engine.run_distributed_diff_source(source_root,
+                                                                   target_host,
+                                                                   port,
+                                                                   folder_report_path,
+                                                                   compare_mode,
+                                                                   recursive,
+                                                                   meta_reader_threads,
+                                                                   metadata_async_depth,
+                                                                   max_duration_seconds,
+                                                                   stats_interval_seconds);
+            std::cout << "distributed_diff"
+                      << " folders_sent=" << report.folders_sent
+                      << " folders_reported=" << report.folders_reported
+                      << " files_compared=" << report.files_compared
+                      << " same=" << report.files_same
+                      << " changed=" << report.files_changed
+                      << " new=" << report.files_new
+                      << " target_only=" << report.files_target_only
+                      << " failed=" << report.files_failed
+                      << " source_logical_size_bytes=" << report.source_logical_size_bytes
+                      << " target_logical_size_bytes=" << report.target_logical_size_bytes
+                      << " bytes_planned=" << report.bytes_planned
+                      << " folders_per_second=" << report.folders_per_second
+                      << " files_per_second=" << report.files_per_second
+                      << " elapsed_s=" << report.elapsed_seconds << '\n';
+            return 0;
+        }
+
         if (command == "diff") {
             std::filesystem::path source_root;
             std::filesystem::path target_root;
@@ -384,6 +521,9 @@ int main(int argc, char** argv) {
             bool summary_only = false;
             std::size_t meta_reader_threads = 0;
             std::size_t metadata_async_depth = 0;
+            std::size_t checker_threads = 0;
+            std::size_t checker_request_queue_depth = 0;
+            std::size_t checker_batch_queue_depth = 0;
             double max_duration_seconds = 0.0;
             std::uint32_t stats_interval_seconds = 0;
 
@@ -410,6 +550,15 @@ int main(int argc, char** argv) {
                 } else if (args[i] == "--metadata-async-depth") {
                     metadata_async_depth = parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
                                                                "--metadata-async-depth");
+                } else if (args[i] == "--checker-threads") {
+                    checker_threads = parse_size_t_option(require_option(args, i, "--checker-threads"),
+                                                          "--checker-threads");
+                } else if (args[i] == "--checker-request-queue-depth" || args[i] == "--request-queue-depth") {
+                    checker_request_queue_depth =
+                        parse_size_t_option(require_option(args, i, args[i]), args[i]);
+                } else if (args[i] == "--checker-batch-queue-depth" || args[i] == "--batch-queue-depth") {
+                    checker_batch_queue_depth =
+                        parse_size_t_option(require_option(args, i, args[i]), args[i]);
                 } else if (args[i] == "--max-duration-seconds") {
                     max_duration_seconds = parse_positive_double_option(
                         require_option(args, i, "--max-duration-seconds"),
@@ -447,7 +596,10 @@ int main(int argc, char** argv) {
                                                     metadata_async_depth,
                                                     max_duration_seconds,
                                                     !summary_only,
-                                                    stats_interval_seconds);
+                                                    stats_interval_seconds,
+                                                    checker_threads,
+                                                    checker_request_queue_depth,
+                                                    checker_batch_queue_depth);
             } else {
                 if (source_scan_path.empty()) {
                     throw std::runtime_error("--source-scan is required");
@@ -632,6 +784,95 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        if (command == "benchmark-fake-diff") {
+            std::uint64_t file_count = 1'000'000;
+            std::uint64_t folder_count = 1'000;
+            std::uint64_t average_file_size = 32U * 1024U;
+            std::size_t source_threads = 1;
+            std::size_t fake_remote_threads = 1;
+            std::size_t checker_threads = 0;
+            std::uint64_t remote_delay_microseconds = 0;
+            std::size_t request_queue_depth = 0;
+            std::size_t batch_queue_depth = 0;
+            std::uint32_t stats_interval_seconds = 0;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--file-count" || args[i] == "--files") {
+                    file_count = parse_u64_option(require_option(args, i, args[i]), args[i]);
+                } else if (args[i] == "--folder-count" || args[i] == "--folders") {
+                    folder_count = parse_u64_option(require_option(args, i, args[i]), args[i]);
+                } else if (args[i] == "--average-file-size") {
+                    average_file_size = parse_u64_option(require_option(args, i, "--average-file-size"),
+                                                         "--average-file-size");
+                } else if (args[i] == "--source-threads") {
+                    source_threads =
+                        parse_size_t_option(require_option(args, i, "--source-threads"), "--source-threads");
+                } else if (args[i] == "--fake-remote-threads") {
+                    fake_remote_threads =
+                        parse_size_t_option(require_option(args, i, "--fake-remote-threads"),
+                                            "--fake-remote-threads");
+                } else if (args[i] == "--checker-threads") {
+                    checker_threads =
+                        parse_size_t_option(require_option(args, i, "--checker-threads"),
+                                            "--checker-threads");
+                } else if (args[i] == "--remote-delay-us") {
+                    remote_delay_microseconds =
+                        parse_u64_option(require_option(args, i, "--remote-delay-us"), "--remote-delay-us");
+                } else if (args[i] == "--request-queue-depth") {
+                    request_queue_depth =
+                        parse_size_t_option(require_option(args, i, "--request-queue-depth"),
+                                            "--request-queue-depth");
+                } else if (args[i] == "--batch-queue-depth") {
+                    batch_queue_depth =
+                        parse_size_t_option(require_option(args, i, "--batch-queue-depth"),
+                                            "--batch-queue-depth");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+
+            const auto report = engine.benchmark_fake_remote_diff_pipeline(file_count,
+                                                                           folder_count,
+                                                                           average_file_size,
+                                                                           source_threads,
+                                                                           fake_remote_threads,
+                                                                           remote_delay_microseconds,
+                                                                           request_queue_depth,
+                                                                           batch_queue_depth,
+                                                                           stats_interval_seconds,
+                                                                           checker_threads);
+            std::cout << "fake_diff_benchmark"
+                      << " source_files_generated=" << report.source_files_generated
+                      << " source_folders_generated=" << report.source_folders_generated
+                      << " target_folders_checked=" << report.target_folders_checked
+                      << " files_compared=" << report.files_compared
+                      << " files_same=" << report.files_same
+                      << " bytes_compared=" << report.bytes_compared
+                      << " source_records_per_second=" << report.source_records_per_second
+                      << " total_records_per_second=" << report.total_records_per_second
+                      << " source_threads=" << report.source_threads
+                      << " fake_remote_threads=" << report.fake_remote_threads
+                      << " checker_threads=" << report.checker_threads
+                      << " remote_delay_us=" << report.remote_delay_microseconds
+                      << " request_queue_depth=" << report.request_queue_depth
+                      << " batch_queue_depth=" << report.batch_queue_depth
+                      << " source_wait_target_queue_s=" << report.source_wait_target_queue_seconds
+                      << " source_wait_batch_queue_s=" << report.source_wait_batch_queue_seconds
+                      << " fake_remote_wait_request_s=" << report.fake_remote_wait_request_seconds
+                      << " fake_remote_wait_processor_queue_s=" << report.fake_remote_wait_processor_queue_seconds
+                      << " fake_remote_delay_s=" << report.fake_remote_delay_seconds
+                      << " fake_remote_wait_batch_queue_s=" << report.fake_remote_wait_batch_queue_seconds
+                      << " joiner_idle_s=" << report.joiner_idle_seconds
+                      << " joiner_process_s=" << report.joiner_process_seconds
+                      << " source_elapsed_s=" << report.source_elapsed_seconds
+                      << " total_elapsed_s=" << report.total_elapsed_seconds << '\n';
+            return 0;
+        }
+
         if (command == "benchmark-metadata-writer" || command == "benchmark-parquet") {
             std::filesystem::path output_path;
             std::string output_format = "parquet";
@@ -714,11 +955,11 @@ int main(int argc, char** argv) {
             std::filesystem::path output_path;
             std::string output_format;
             std::string records = "all";
-            std::string hash_algorithm = "xxh64";
+            std::string hash_algorithm;
             std::string hash_mode = "file";
             bool recursive = true;
-            std::size_t meta_reader_threads = 1;
-            std::size_t metadata_async_depth = 16;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
             std::size_t data_reader_threads = 0;
             std::size_t data_outstanding_requests = 0;
             std::size_t hash_worker_threads = 0;
@@ -945,8 +1186,8 @@ int main(int argc, char** argv) {
         if (command == "benchmark-data") {
             std::filesystem::path source_root;
             bool recursive = true;
-            std::size_t meta_reader_threads = 1;
-            std::size_t metadata_async_depth = 16;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
             std::size_t data_reader_threads = 0;
             std::size_t data_outstanding_requests = 0;
             std::size_t max_files_queued = 1024;
@@ -1049,13 +1290,13 @@ int main(int argc, char** argv) {
         if (command == "benchmark-data-hash") {
             std::filesystem::path source_root;
             bool recursive = true;
-            std::string hash_algorithm = "xxh64";
-            std::size_t meta_reader_threads = 1;
-            std::size_t metadata_async_depth = 16;
+            std::string hash_algorithm;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
             std::size_t data_reader_threads = 0;
             std::size_t data_outstanding_requests = 0;
             std::size_t hash_worker_threads = 0;
-            std::size_t hash_work_factor = 1;
+            std::size_t hash_work_factor = 0;
             std::size_t max_files_queued = 1024;
             std::size_t data_buffer_slots = 0;
             std::size_t data_queue_depth = 0;

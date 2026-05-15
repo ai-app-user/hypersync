@@ -56,7 +56,7 @@ protected:
     void on_all_workers_finished() override;
 
 private:
-    void publish_file_chunks(NfsDataReader& reader, const FileSpec& file);
+    void publish_file_chunks(NfsDataReader& reader, const FileSpec& file, std::size_t worker_index);
     void complete_trailer(const RecBuf& record,
                           std::uint64_t logical_size,
                           DataBufTrailer& trailer,

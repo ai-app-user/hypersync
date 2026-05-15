@@ -24,6 +24,7 @@ runtime:
 jobs:
   defaults:
     connection_count: 8
+    worker_count: 1
   input_provider:
     max_queue_entries: 1000000
     refill_threshold: 100
@@ -40,6 +41,9 @@ jobs:
     recursive: true
   checker:
     discard_checked_records: false
+    worker_count: 16
+    target_request_queue_depth: 65536
+    batch_queue_depth: 65536
   metadata_stats_discarder:
     enabled: false
     print_interval_seconds: 5

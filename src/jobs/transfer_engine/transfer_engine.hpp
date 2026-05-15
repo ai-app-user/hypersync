@@ -203,6 +203,50 @@ struct BufferTransportBenchmarkReport {
     std::string transport_kind;
 };
 
+struct FakeRemoteDiffBenchmarkReport {
+    std::uint64_t source_files_generated = 0;
+    std::uint64_t source_folders_generated = 0;
+    std::uint64_t target_folders_checked = 0;
+    std::uint64_t files_compared = 0;
+    std::uint64_t files_same = 0;
+    std::uint64_t bytes_compared = 0;
+    double source_elapsed_seconds = 0.0;
+    double total_elapsed_seconds = 0.0;
+    double source_records_per_second = 0.0;
+    double total_records_per_second = 0.0;
+    std::size_t source_threads = 1;
+    std::size_t fake_remote_threads = 1;
+    std::uint64_t remote_delay_microseconds = 0;
+    std::size_t request_queue_depth = 0;
+    std::size_t batch_queue_depth = 0;
+    double source_wait_target_queue_seconds = 0.0;
+    double source_wait_batch_queue_seconds = 0.0;
+    double fake_remote_wait_request_seconds = 0.0;
+    double fake_remote_wait_processor_queue_seconds = 0.0;
+    double fake_remote_delay_seconds = 0.0;
+    double fake_remote_wait_batch_queue_seconds = 0.0;
+    double joiner_idle_seconds = 0.0;
+    double joiner_process_seconds = 0.0;
+    std::size_t checker_threads = 1;
+};
+
+struct DistributedDiffRunReport {
+    std::uint64_t folders_sent = 0;
+    std::uint64_t folders_reported = 0;
+    std::uint64_t files_compared = 0;
+    std::uint64_t files_same = 0;
+    std::uint64_t files_changed = 0;
+    std::uint64_t files_new = 0;
+    std::uint64_t files_target_only = 0;
+    std::uint64_t files_failed = 0;
+    std::uint64_t source_logical_size_bytes = 0;
+    std::uint64_t target_logical_size_bytes = 0;
+    std::uint64_t bytes_planned = 0;
+    double elapsed_seconds = 0.0;
+    double folders_per_second = 0.0;
+    double files_per_second = 0.0;
+};
+
 [[nodiscard]] SenderRuntimeConfig load_sender_runtime_config(const ConfigStore& config);
 [[nodiscard]] ReceiverRuntimeConfig load_receiver_runtime_config(const ConfigStore& config);
 
@@ -230,7 +274,10 @@ public:
                                                      std::size_t metadata_async_depth = 0,
                                                      double max_duration_seconds = 0.0,
                                                      bool collect_detailed_records = true,
-                                                     std::uint32_t stats_interval_seconds = 0) const;
+                                                     std::uint32_t stats_interval_seconds = 0,
+                                                     std::size_t checker_threads = 0,
+                                                     std::size_t checker_request_queue_depth = 0,
+                                                     std::size_t checker_batch_queue_depth = 0) const;
     [[nodiscard]] ScanIndex build_scan_index(const std::filesystem::path& source_root,
                                              char scan_side = 'S',
                                              bool recursive = true) const;
@@ -251,8 +298,8 @@ public:
                                                                      const std::filesystem::path& status_socket_path = {}) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_data_read_pipeline(const std::filesystem::path& source_root,
                                                                        bool recursive = true,
-                                                                       std::size_t meta_reader_threads = 1,
-                                                                       std::size_t metadata_async_depth = 16,
+                                                                       std::size_t meta_reader_threads = 0,
+                                                                       std::size_t metadata_async_depth = 0,
                                                                        std::size_t data_reader_threads = 0,
                                                                        std::size_t data_outstanding_requests = 0,
                                                                        std::size_t max_files_queued = 1024,
@@ -264,24 +311,24 @@ public:
                                                                        const std::filesystem::path& status_socket_path = {}) const;
     [[nodiscard]] DataHashBenchmarkReport benchmark_data_hash_pipeline(const std::filesystem::path& source_root,
                                                                        bool recursive = true,
-                                                                       const std::string& hash_algorithm = "xxh64",
-                                                                       std::size_t meta_reader_threads = 1,
-                                                                       std::size_t metadata_async_depth = 16,
+                                                                       const std::string& hash_algorithm = {},
+                                                                       std::size_t meta_reader_threads = 0,
+                                                                       std::size_t metadata_async_depth = 0,
                                                                        std::size_t data_reader_threads = 0,
                                                                        std::size_t data_outstanding_requests = 0,
                                                                        std::size_t hash_worker_threads = 0,
                                                                        std::size_t max_files_queued = 1024,
                                                                        std::size_t data_buffer_slots = 0,
                                                                        std::size_t data_queue_depth = 0,
-                                                                       std::size_t hash_work_factor = 1,
+                                                                       std::size_t hash_work_factor = 0,
                                                                        double max_duration_seconds = 0.0,
                                                                        std::uint32_t stats_interval_seconds = 5,
                                                                        const std::filesystem::path& status_socket_path = {}) const;
     [[nodiscard]] HashInventoryReport hash_inventory_pipeline(const std::filesystem::path& source_root,
                                                               bool recursive = true,
-                                                              const std::string& hash_algorithm = "xxh64",
-                                                              std::size_t meta_reader_threads = 1,
-                                                              std::size_t metadata_async_depth = 16,
+                                                              const std::string& hash_algorithm = {},
+                                                              std::size_t meta_reader_threads = 0,
+                                                              std::size_t metadata_async_depth = 0,
                                                               std::size_t data_reader_threads = 0,
                                                               std::size_t data_outstanding_requests = 0,
                                                               std::size_t hash_worker_threads = 0,
@@ -325,6 +372,36 @@ public:
         std::uint16_t base_port = 39000,
         const std::filesystem::path& socket_dir = {},
         bool shared_input_queue = false) const;
+    [[nodiscard]] FakeRemoteDiffBenchmarkReport benchmark_fake_remote_diff_pipeline(
+        std::uint64_t file_count = 1'000'000,
+        std::uint64_t folder_count = 1'000,
+        std::uint64_t average_file_size = 32 * 1024,
+        std::size_t source_threads = 1,
+        std::size_t fake_remote_threads = 1,
+        std::uint64_t remote_delay_microseconds = 0,
+        std::size_t request_queue_depth = 0,
+        std::size_t batch_queue_depth = 0,
+        std::uint32_t stats_interval_seconds = 0,
+        std::size_t checker_threads = 0) const;
+    [[nodiscard]] DistributedDiffRunReport run_distributed_diff_source(
+        const std::filesystem::path& source_root,
+        const std::string& target_host,
+        std::uint16_t target_port,
+        const std::filesystem::path& folder_report_path,
+        const std::string& compare_mode = "size",
+        bool recursive = true,
+        std::size_t meta_reader_threads = 0,
+        std::size_t metadata_async_depth = 0,
+        double max_duration_seconds = 0.0,
+        std::uint32_t stats_interval_seconds = 5) const;
+    void run_distributed_diff_target(const std::filesystem::path& target_root,
+                                     const std::string& listen_host,
+                                     std::uint16_t listen_port,
+                                     const std::string& compare_mode = "size",
+                                     bool recursive = true,
+                                     std::size_t target_threads = 0,
+                                     std::size_t metadata_async_depth = 0,
+                                     std::uint32_t stats_interval_seconds = 5) const;
     [[nodiscard]] TransferReport transfer_directory(const SenderRuntimeConfig& runtime) const;
     void run_receiver(const ReceiverRuntimeConfig& runtime) const;
     [[nodiscard]] static std::vector<FileSpec> scan_directory(const std::filesystem::path& source_root, bool recursive = true);

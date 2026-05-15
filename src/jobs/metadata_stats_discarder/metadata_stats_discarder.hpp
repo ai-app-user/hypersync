@@ -21,9 +21,13 @@ struct MetadataStatsDiscarderConfig {
     bool enabled;
     std::uint32_t print_interval_seconds;
     std::string output;
+    bool track_unique_folders;
 
     MetadataStatsDiscarderConfig();
-    MetadataStatsDiscarderConfig(bool enabled, std::uint32_t print_interval_seconds, std::string output);
+    MetadataStatsDiscarderConfig(bool enabled,
+                                 std::uint32_t print_interval_seconds,
+                                 std::string output,
+                                 bool track_unique_folders = true);
 };
 
 struct MetadataStatsSnapshot {
@@ -52,6 +56,9 @@ public:
     void record_batch(std::size_t files_found,
                       std::uint64_t logical_size_bytes,
                       const std::vector<std::string>& folders_found);
+    void record_batch(std::size_t files_found,
+                      std::uint64_t logical_size_bytes,
+                      std::size_t folders_found);
     void maybe_print();
     void print_snapshot() const;
 
@@ -66,6 +73,7 @@ private:
     bool running_ = false;
     std::size_t accepted_ = 0;
     std::size_t discarded_ = 0;
+    std::size_t folders_found_ = 0;
     std::uint64_t logical_size_bytes_ = 0;
     std::unordered_set<std::string> folders_;
     std::chrono::steady_clock::time_point started_at_ {};

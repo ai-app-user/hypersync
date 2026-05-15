@@ -260,6 +260,7 @@ struct DuckDbParquetState {
     idx_t chunk_capacity = 0;
 #endif
     std::filesystem::path temp_database_path;
+    std::filesystem::path temp_output_path;
     std::filesystem::path output_path;
     bool appender_closed = false;
 };
@@ -384,7 +385,10 @@ MetadataRecordWriter::MetadataRecordWriter(MetadataRecordWriterConfig config)
         parquet_->output_path = config_.output_path;
         parquet_->temp_database_path = config_.output_path;
         parquet_->temp_database_path += ".duckdb.tmp";
+        parquet_->temp_output_path = config_.output_path;
+        parquet_->temp_output_path += ".tmp";
         std::filesystem::remove(parquet_->temp_database_path);
+        std::filesystem::remove(parquet_->temp_output_path);
 
         if (duckdb_open(parquet_->temp_database_path.string().c_str(), &parquet_->database) == DuckDBError) {
             throw std::runtime_error("failed to open temporary DuckDB database for parquet output");
@@ -546,10 +550,12 @@ void MetadataRecordWriter::close() {
     execute_duckdb_query(parquet_->connection, "COMMIT", "failed to commit DuckDB bulk transaction");
 
     const std::string compression = config_.parquet_compression.empty() ? "zstd" : config_.parquet_compression;
+    std::filesystem::remove(parquet_->temp_output_path);
     const std::string copy_sql =
-        "COPY metadata_records TO " + sql_quote(parquet_->output_path.string()) +
+        "COPY metadata_records TO " + sql_quote(parquet_->temp_output_path.string()) +
         " (FORMAT parquet, COMPRESSION " + compression + ")";
     execute_duckdb_query(parquet_->connection, copy_sql, "failed to write parquet metadata output");
+    std::filesystem::rename(parquet_->temp_output_path, parquet_->output_path);
 
     duckdb_disconnect(&parquet_->connection);
     duckdb_close(&parquet_->database);

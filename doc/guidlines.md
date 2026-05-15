@@ -102,6 +102,11 @@ Project files should stay predictable:
 ## Configuration Rules
 
 - Every operationally important limit should be configurable.
+- Every job should expose its operational concurrency, queue depths, batching,
+  rate limits, and backpressure limits through config when those knobs affect
+  throughput, memory, or fairness.
+- Commands must not bake in job parallelism or queue-size defaults. They should
+  load job config first and let command-line options override it for that run.
 - Command-line values should override config file values.
 - Config names should be consistent across tools.
 - Defaults should be conservative and safe.
@@ -183,6 +188,12 @@ Rules:
 - Performance-sensitive paths must expose their concurrency settings.
 - Final summaries must include the settings used for the run.
 - Progress stats should be printed periodically during long runs.
+- Generic job monitoring should report cumulative rate, recent/current rate,
+  first observed startup rate, mid-run historical rate, peak observed rate, tail
+  rate after a job stops, queue fullness, and worker wait-state percentages.
+- Instrumentation should be low overhead: avoid per-buffer timestamps when a
+  non-blocking queue or pool fast path succeeds; enter timed states only for
+  actual waits or owned external I/O.
 - A timer should stop new work gracefully and still print a final summary.
 - Timer expiry should stop new input and new backend requests first, then drain bounded in-flight work before final stats.
 - Benchmarks should count work as it completes, not only after large batches finish.
