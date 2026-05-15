@@ -9497,8 +9497,14 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     const std::size_t worker_count = std::max<std::size_t>(1U, reader_config.worker_count);
     const std::size_t async_depth = std::max<std::size_t>(1U, reader_config.async_directory_depth);
 
-    const std::size_t pool_slots =
-        std::max<std::size_t>(64U, std::min<std::size_t>(2048U, worker_count * async_depth));
+    // Distributed diff can hold many 1 MiB flat-folder buffers until both
+    // source and target have delivered the final batch for a large directory.
+    // Capping this at 2K buffers deadlocks the stream on very large flat
+    // folders: the receiver waits for a free source buffer while the final
+    // source batch needed to release earlier buffers is still unread on the
+    // socket. Keep the pool preallocated, but size it from the configured
+    // parallelism instead of applying the scanner-oriented cap.
+    const std::size_t pool_slots = std::max<std::size_t>(64U, worker_count * async_depth);
     RawBufferPool send_pool = make_metadata_batch_buffer_pool(pool_slots);
     RawBufferPool result_pool = make_metadata_batch_buffer_pool(pool_slots);
     BufQueue send_queue(pool_slots);
@@ -9699,8 +9705,11 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
 
     (void)recursive;
     const std::size_t shard_count = std::max<std::size_t>(1U, std::min<std::size_t>(worker_count, 128U));
-    const std::size_t pool_slots =
-        std::max<std::size_t>(64U, std::min<std::size_t>(2048U, worker_count * async_depth));
+    // Distributed diff must be able to receive a large flat folder's source
+    // batches before that folder can be compared and release ownership. Using
+    // the full configured work window avoids a pool starvation cycle where the
+    // receiver cannot read the final batch that would unblock diff shards.
+    const std::size_t pool_slots = std::max<std::size_t>(64U, worker_count * async_depth);
     const std::size_t queue_depth = std::max<std::size_t>(64U, pool_slots);
     const std::size_t shard_depth = std::max<std::size_t>(64U, (queue_depth + shard_count - 1U) / shard_count);
 

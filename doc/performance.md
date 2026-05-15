@@ -954,3 +954,58 @@ notes:
     units. Next work is result batching, source-batch splitting for large flat
     folders, and multiple transport streams.
 ```
+
+Distributed transfer1-to-nopo1 metadata diff, 2026-05-15, after fixing
+distributed diff source-pool starvation:
+
+```text
+code:
+  hypersync commit: 7d6f202a0e8308dab43065f3204130ced9976e17
+  piper commit: a8b2b5c9f73b1a62d95441018aaf622d8b88b82d
+  deploy bundle:
+    /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-diffpool-20260515T021459Z
+
+source host:
+  ubuntu@216.86.168.191
+  nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+
+target host:
+  ubuntu@160.211.77.39
+  nfs://172.27.255.2-172.27.255.17/volumes/dfb990b1-bf40-4378-85f1-26f9dfd0cd2c/data
+
+command shape:
+  diff-target --target <target-url> --listen-host 0.0.0.0 --port 39174 \
+    --compare size --target-threads 64 --metadata-async-depth 256 \
+    --stats-interval-seconds 10
+  diff-source --source <source-url> --target-host 160.211.77.39 \
+    --port 39174 --folder-report folder-report.csv --compare size \
+    --meta-reader-threads 64 --metadata-async-depth 256 \
+    --max-duration-seconds 240 --stats-interval-seconds 10
+
+final observed result, including drain:
+  folders sent/reported: 7,498,305 / 7,498,305
+  source buffers sent: 7,505,674
+  target result buffers sent: 33,649
+  files compared: 1,480,818,403
+  same: 1,425,520,157
+  changed: 267
+  source-only/new: 55,213,674
+  target-only: 84,305
+  failed folder rows: 5,215, mostly NFS3ERR_PERM permission-denied folders
+  source logical size: 1,814,417,688,970,220 bytes
+  target logical size: 1,819,626,621,592,633 bytes
+  planned bytes: 14,246,266,287,859 bytes
+  elapsed: 296.611 s
+  average: 25,279.9 folders/s, 4.992M files/s
+  hot interval examples: 5.82M files/s at 116 s, 5.77M files/s at 126 s
+  source report:
+    /mnt/local-nvme/wsync-codex/diff-source-transfer1-to-nopo1-diffpool-20260515T021730Z/folder-report.csv
+
+job/queue notes:
+  source_send_queue high watermark: 3,580 / 16,384
+  result_queue high watermark: 40 / 16,384 on source, 45 / 16,384 on target
+  previous deadlock signature disappeared: source/target queues drained and
+    closed, and both processes exited without manual kill.
+  target source_receiver accumulated about 3% wait_pool near tail only; it did
+    not block progress and all source buffers were received.
+```
