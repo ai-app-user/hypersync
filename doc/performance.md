@@ -1825,3 +1825,83 @@ raised metadata page latency, so 128 is the better default for this profile.
 This validates the asymmetric reservoir approach: let fast metadata branches
 stockpile file handles so slow READDIRPLUS branches do not immediately starve
 the data readers.
+
+Dual scanner split read test, 2026-05-16
+----------------------------------------
+
+Purpose: test independent small/large metadata scanner fleets. This avoids
+coupling where one shared scanner pauses because one downstream reservoir is
+full while the other stream still needs records.
+
+Build/deploy:
+
+```text
+build host      transfer1
+deploy path     /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-transfer1-20260516T200710Z
+hypersync git   db08cb5
+piper git       f1aecb4
+```
+
+Common settings:
+
+```text
+source                         nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+taskset                        0-79
+metadata_async_depth           256
+readdirplus_page_bytes         262144
+small_file_threshold_bytes     131072
+small_data_reader_threads      96
+large_data_reader_threads      64
+large_data_outstanding_requests 2
+small_file_async_window        1
+small_max_files_queued         5000000
+large_max_files_queued         50000
+data_buffer_slots              24576
+data_queue_depth               12288
+```
+
+Useful interval results, before shutdown/tail dilution:
+
+```text
+mode / scanner threads     sample  total Gbit/s  small files/s  large Gbit/s  queued small  queued large
+single scanner 128         60s     196.8         680            196.6         0             50000
+single scanner 128         90s     197.2         477            197.1         0             0
+dual small64 / large16     60s     194.0         21639          179.6         3196527       50000
+dual small64 / large16     90s     194.0         22202          180.2         4226640       0
+dual small96 / large16     30s     191.1         33668          179.8         5000000       50000
+dual small96 / large16     60s     194.5         32726          183.7         5000000       50000
+dual small96 / large16     90s     195.7         32326          184.9         0             0
+dual small128 / large8     30s     188.2         27708          173.3         5000000       50000
+dual small128 / large8     60s     193.0         29006          178.3         0             0
+```
+
+Interpretation:
+
+- The dual-scanner design works: the small scanner can stockpile millions of
+  small file handles while the large scanner keeps the large reservoir full.
+- `small96 / large16` is the best measured mixed profile so far. It preserved
+  near-line-rate total bandwidth while raising small-file processing from
+  hundreds/s in the single-scanner mixed run to about 32K/s.
+- `small128 / large8` did not improve the mix. It put more pressure on small
+  metadata and reduced large bandwidth, so fewer large metadata threads went
+  too far for this source shape.
+- `small64 / large16` is viable when the goal is to minimize metadata threads,
+  but it did not feed small readers as aggressively as `small96 / large16`.
+
+Current recommendation for mixed small/large read tests on transfer1:
+
+```text
+--dual-scan-small-large
+--small-meta-reader-threads 96
+--large-meta-reader-threads 16
+--small-data-reader-threads 96
+--large-data-reader-threads 64
+--large-data-outstanding-requests 2
+--small-max-files-queued 5000000
+--large-max-files-queued 50000
+```
+
+Note: the benchmark stop timer currently clears the data queues at
+`max_duration_seconds`, so post-stop/tail samples show queue depth dropping to
+zero and should not be used as steady-state performance. Use the last interval
+before stop for throughput comparisons.

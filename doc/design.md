@@ -217,6 +217,19 @@ Required pattern:
 
 `Scanner -> FileClassifier -> LargeDataReader -> large data queue`
 
+For very high-rate data read pipelines, the scanner/classifier may be split
+into two independent scanner fleets over the same source namespace:
+
+`SmallScanner(filter <= threshold) -> small reservoir -> SmallDataReader`
+
+`LargeScanner(filter > threshold) -> large reservoir -> LargeDataReader`
+
+This is allowed only when the queues remain bounded and each scanner fleet is
+independently backpressured by its own reservoir. The purpose is to avoid a
+full large-file queue pausing small-file discovery, or a full small-file
+reservoir pausing large-file discovery. Classification boundaries must be
+gapless: small is `size <= threshold`, large is `size > threshold`.
+
 The transport sender drains the small-file data queue first and drains the
 large-file queue only when the small queue is empty or below its configured low
 watermark. This gives small files maximum operation rate while allowing large
