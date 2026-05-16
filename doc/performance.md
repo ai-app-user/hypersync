@@ -1681,3 +1681,85 @@ Interpretation: this tree segment was large-file dominated, so bandwidth came
 mostly from the large stream. The small queue stayed drained while large work
 backlogged, which confirms the stream split and small-first priority shape. The
 run is a smoke test, not a final tuning result.
+
+READDIRPLUS feed telemetry, 2026-05-16
+--------------------------------------
+
+Purpose: explain why the zero-open small-file reader sometimes fell below the
+previous 50K+ files/s result even though raw READ latency stayed near 1 ms.
+
+Build/deploy:
+
+```text
+build host      transfer1
+deploy path     /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-transfer1-20260516T181124Z
+hypersync git   dca0bdfe72ba5482100c8c40deb553a4e7b424b3
+piper git       f1aecb4b5025b410082c572e894ba55ac95abea8
+libnfs          5.0.2
+```
+
+Source:
+`/catbear/run_20260218_042836/talking-head`, 50,000 files, same flat-folder
+small-file test used for earlier reader tuning.
+
+Telemetry added:
+
+```text
+readdirplus_pages
+readdirplus_entries/files/directories
+readdirplus_avg_entries_per_page
+readdirplus_avg_page_latency_ms / max
+readdirplus_avg_decode_ms / max
+optional HYPERSYNC_NFS_PAGE_TRACE=1 per-page endpoint/folder/page line
+```
+
+Key result with `readdirplus_page_bytes=262144`, one metadata reader, 96 data
+readers:
+
+```text
+files_read                         50,000
+elapsed_s                          4.57
+files_per_second                   10,939
+async_read_avg_latency_ms          1.64
+async_open_completed               0
+readdirplus_pages                  84
+readdirplus_avg_entries_per_page   ~595
+readdirplus_avg_page_latency_ms    ~34 ms
+readdirplus_max_page_latency_ms    ~50 ms
+readdirplus_avg_decode_ms          ~0.1 ms
+queued_files                       ~0 during samples
+```
+
+Interpretation: the data path was not the limiter. The reader stayed zero-open,
+and data-read latency remained near 1 ms. The bottleneck was sequential
+READDIRPLUS page supply for this one wide folder: most page time was server/RPC
+latency, not client decode.
+
+Direct endpoint sweep for the same flat folder, same settings:
+
+```text
+endpoint        files/s   Gbit/s   elapsed_s
+172.27.255.18   15,068    3.27     3.32
+172.27.255.19   24,966    5.41     2.00
+172.27.255.20   28,573    6.20     1.75
+172.27.255.21   11,062    2.40     4.52
+172.27.255.22   27,972    6.07     1.79
+172.27.255.23   10,822    2.35     4.62
+172.27.255.24   10,667    2.31     4.69
+172.27.255.25   24,698    5.36     2.02
+172.27.255.26   12,698    2.75     3.94
+172.27.255.27   10,485    2.27     4.77
+172.27.255.28   11,782    2.55     4.24
+172.27.255.29    9,706    2.10     5.15
+172.27.255.30   10,607    2.30     4.71
+172.27.255.31   10,454    2.27     4.78
+172.27.255.32    9,614    2.08     5.20
+172.27.255.33   10,409    2.26     4.80
+```
+
+Conclusion: endpoint/backend choice changes the flat-folder feed rate by about
+3x while raw read latency stays close to 1 ms. For very wide folders, the
+metadata stream is sequential by cookie and tied to the chosen endpoint/backend
+owner. The next optimization should choose or rotate metadata endpoints for
+wide-folder streaming, and for large recursive scans record per-endpoint
+READDIRPLUS latency so slow metadata lanes are visible.
