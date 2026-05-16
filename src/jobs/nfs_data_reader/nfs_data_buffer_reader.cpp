@@ -80,6 +80,9 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
     NfsDataReader reader(std::move(worker_config));
     std::optional<FileSpec> carried_file;
     while (!should_stop_now()) {
+        if (!wait_until_worker_active(worker_index)) {
+            break;
+        }
         std::optional<FileSpec> file;
         if (carried_file.has_value()) {
             file = std::move(carried_file);

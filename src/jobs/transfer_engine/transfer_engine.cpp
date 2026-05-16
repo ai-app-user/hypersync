@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <cstring>
 #include <deque>
@@ -72,6 +73,7 @@
 #include "jobs/nfs_data_reader/nfs_data_buffer_reader.hpp"
 #include "jobs/nfs_data_reader/nfs_data_reader.hpp"
 #include "jobs/nfs_meta_reader/nfs_meta_reader.hpp"
+#include "monitoring/autoscaler.hpp"
 #include "monitoring/status_monitor.hpp"
 
 namespace hypersync {
@@ -266,6 +268,34 @@ struct DataReadFileQueue {
     bool stop = false;
     std::exception_ptr error;
 };
+
+struct SplitDataReadFileQueues {
+    DataReadFileQueue small;
+    DataReadFileQueue large;
+    std::uint64_t small_file_threshold = 128U * 1024U;
+};
+
+struct SplitDataReadAutoscaleConfig {
+    bool pipeline_enabled = false;
+    bool large_enabled = false;
+    std::size_t large_initial_workers = 0;
+    std::size_t large_min_workers = 1;
+    std::uint64_t interval_ms = 1000;
+    std::string profile_name;
+    std::filesystem::path settings_path;
+};
+
+std::filesystem::path default_autoscale_settings_path() {
+    const char* env_path = std::getenv("HYPERSYNC_AUTOSCALE_SETTINGS");
+    if (env_path != nullptr && *env_path != '\0') {
+        return std::filesystem::path(env_path);
+    }
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && *home != '\0') {
+        return std::filesystem::path(home) / ".config" / "hypersync" / "autoscale.yaml";
+    }
+    return std::filesystem::path("hypersync-autoscale.yaml");
+}
 
 std::string metadata_part_suffix(std::size_t index) {
     std::ostringstream out;
@@ -657,6 +687,17 @@ struct DataReadBenchmarkSnapshot {
     double elapsed_seconds = 0.0;
     double bytes_per_second = 0.0;
     double gigabits_per_second = 0.0;
+    double files_per_second = 0.0;
+    double small_files_per_second = 0.0;
+    double large_files_per_second = 0.0;
+    double small_gigabits_per_second = 0.0;
+    double large_gigabits_per_second = 0.0;
+    std::size_t small_files_found = 0;
+    std::size_t large_files_found = 0;
+    std::size_t small_files_read = 0;
+    std::size_t large_files_read = 0;
+    std::uint64_t small_bytes_read = 0;
+    std::uint64_t large_bytes_read = 0;
 };
 
 struct DataReadBenchmarkStats {
@@ -666,6 +707,12 @@ struct DataReadBenchmarkStats {
     std::atomic<std::size_t> files_failed {0};
     std::atomic<std::uint64_t> logical_size_bytes {0};
     std::atomic<std::uint64_t> bytes_read {0};
+    std::atomic<std::size_t> small_files_found {0};
+    std::atomic<std::size_t> large_files_found {0};
+    std::atomic<std::size_t> small_files_read {0};
+    std::atomic<std::size_t> large_files_read {0};
+    std::atomic<std::uint64_t> small_bytes_read {0};
+    std::atomic<std::uint64_t> large_bytes_read {0};
     std::uint32_t print_interval_seconds = 5;
     std::chrono::steady_clock::time_point started_at {};
     std::chrono::steady_clock::time_point last_print_at {};
@@ -1719,9 +1766,26 @@ DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats&
     snapshot.files_failed = stats.files_failed.load(std::memory_order_relaxed);
     snapshot.logical_size_bytes = stats.logical_size_bytes.load(std::memory_order_relaxed);
     snapshot.bytes_read = stats.bytes_read.load(std::memory_order_relaxed);
+    snapshot.small_files_found = stats.small_files_found.load(std::memory_order_relaxed);
+    snapshot.large_files_found = stats.large_files_found.load(std::memory_order_relaxed);
+    snapshot.small_files_read = stats.small_files_read.load(std::memory_order_relaxed);
+    snapshot.large_files_read = stats.large_files_read.load(std::memory_order_relaxed);
+    snapshot.small_bytes_read = stats.small_bytes_read.load(std::memory_order_relaxed);
+    snapshot.large_bytes_read = stats.large_bytes_read.load(std::memory_order_relaxed);
     snapshot.elapsed_seconds = elapsed;
     snapshot.bytes_per_second = elapsed > 0.0 ? static_cast<double>(snapshot.bytes_read) / elapsed : 0.0;
     snapshot.gigabits_per_second = snapshot.bytes_per_second * 8.0 / 1'000'000'000.0;
+    snapshot.files_per_second = elapsed > 0.0 ? static_cast<double>(snapshot.files_read) / elapsed : 0.0;
+    snapshot.small_files_per_second =
+        elapsed > 0.0 ? static_cast<double>(snapshot.small_files_read) / elapsed : 0.0;
+    snapshot.large_files_per_second =
+        elapsed > 0.0 ? static_cast<double>(snapshot.large_files_read) / elapsed : 0.0;
+    snapshot.small_gigabits_per_second =
+        elapsed > 0.0 ? static_cast<double>(snapshot.small_bytes_read) * 8.0 / elapsed / 1'000'000'000.0
+                      : 0.0;
+    snapshot.large_gigabits_per_second =
+        elapsed > 0.0 ? static_cast<double>(snapshot.large_bytes_read) * 8.0 / elapsed / 1'000'000'000.0
+                      : 0.0;
     return snapshot;
 }
 
@@ -3491,22 +3555,28 @@ void write_folder_diff_csv_header(std::ostream& out) {
 void print_distributed_diff_source_stats(const DistributedDiffRunReport& report,
                                          std::chrono::steady_clock::time_point started_at,
                                          std::uint64_t last_folders,
+                                         std::uint64_t last_files,
                                          std::chrono::steady_clock::time_point last_at) {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed = std::chrono::duration<double>(now - started_at).count();
     const double interval_elapsed = std::chrono::duration<double>(now - last_at).count();
     const std::uint64_t interval_folders =
         report.folders_reported >= last_folders ? report.folders_reported - last_folders : 0U;
+    const std::uint64_t interval_files =
+        report.files_compared >= last_files ? report.files_compared - last_files : 0U;
     const double folders_per_second = elapsed > 0.0 ? static_cast<double>(report.folders_reported) / elapsed : 0.0;
     const double interval_folders_per_second =
         interval_elapsed > 0.0 ? static_cast<double>(interval_folders) / interval_elapsed : 0.0;
     const double files_per_second = elapsed > 0.0 ? static_cast<double>(report.files_compared) / elapsed : 0.0;
+    const double interval_files_per_second =
+        interval_elapsed > 0.0 ? static_cast<double>(interval_files) / interval_elapsed : 0.0;
     std::cout << "distributed_diff_source_stats"
               << " folders_sent=" << report.folders_sent
               << " folders_reported=" << report.folders_reported
               << " folders_per_second=" << folders_per_second
               << " interval_folders_per_second=" << interval_folders_per_second
               << " files_per_second=" << files_per_second
+              << " interval_files_per_second=" << interval_files_per_second
               << " files_compared=" << report.files_compared
               << " same=" << report.files_same
               << " changed=" << report.files_changed
@@ -3691,7 +3761,10 @@ protected:
         auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
         backend->scan_flat_folders(
             async_depth_,
-            [this](bool wait_for_work) {
+            [this, worker_index](bool wait_for_work) {
+                if (!wait_until_worker_active(worker_index)) {
+                    return std::optional<FileSpec> {};
+                }
                 return take_flat_folder_work(queue_, wait_for_work);
             },
             [this] {
@@ -3766,9 +3839,21 @@ inline constexpr BufferPoolId kDistributedDiffTargetPoolId = 32;
 inline constexpr BufferPoolId kDistributedDiffResultPoolId = 33;
 inline constexpr std::uint32_t kDistributedDiffResultFlushRecords = 512;
 inline constexpr auto kDistributedDiffResultFlushInterval = std::chrono::milliseconds(500);
+inline constexpr std::size_t kDistributedDiffFlatBufferSlotCap = 8192;
+inline constexpr std::size_t kDistributedDiffControlBufferSlotCap = 1024;
 
 RawBufferPool make_distributed_diff_metadata_pool(BufferPoolId pool_id, std::size_t capacity) {
     return RawBufferPool(pool_id, capacity, sizeof(MetadataBatchBuffer), alignof(MetadataBatchBuffer));
+}
+
+std::size_t distributed_diff_flat_slots(std::size_t worker_count, std::size_t async_depth) {
+    const std::size_t requested = std::max<std::size_t>(64U, worker_count * async_depth);
+    return std::min<std::size_t>(requested, kDistributedDiffFlatBufferSlotCap);
+}
+
+std::size_t distributed_diff_control_slots(std::size_t worker_count) {
+    const std::size_t requested = std::max<std::size_t>(64U, worker_count * 4U);
+    return std::min<std::size_t>(requested, kDistributedDiffControlBufferSlotCap);
 }
 
 class SourceBatchRouterJob final : public ThreadedJob {
@@ -3899,6 +3984,9 @@ protected:
         backend->scan_flat_folders(
             async_depth_,
             [this, worker_index](bool wait_for_work) -> std::optional<FileSpec> {
+                if (!wait_until_worker_active(worker_index)) {
+                    return std::nullopt;
+                }
                 BufferHandle request;
                 const bool got_request =
                     wait_for_work ? wait_for_input(worker_index, requests_, request) : requests_.try_pop(request);
@@ -4547,8 +4635,28 @@ void record_data_read_bytes(DataReadBenchmarkStats& stats, std::uint64_t bytes_r
     stats.bytes_read.fetch_add(bytes_read, std::memory_order_relaxed);
 }
 
+void record_small_data_read_bytes(DataReadBenchmarkStats& stats, std::uint64_t bytes_read) {
+    record_data_read_bytes(stats, bytes_read);
+    stats.small_bytes_read.fetch_add(bytes_read, std::memory_order_relaxed);
+}
+
+void record_large_data_read_bytes(DataReadBenchmarkStats& stats, std::uint64_t bytes_read) {
+    record_data_read_bytes(stats, bytes_read);
+    stats.large_bytes_read.fetch_add(bytes_read, std::memory_order_relaxed);
+}
+
 void record_data_read_file(DataReadBenchmarkStats& stats) {
     stats.files_read.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_small_data_read_file(DataReadBenchmarkStats& stats) {
+    record_data_read_file(stats);
+    stats.small_files_read.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_large_data_read_file(DataReadBenchmarkStats& stats) {
+    record_data_read_file(stats);
+    stats.large_files_read.fetch_add(1, std::memory_order_relaxed);
 }
 
 void print_data_buffer_read_stats(const DataReadBenchmarkStats& stats,
@@ -4557,6 +4665,7 @@ void print_data_buffer_read_stats(const DataReadBenchmarkStats& stats,
     const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
     const NfsAsyncReadLatencySnapshot read_latency = snapshot_nfs_async_read_latency_metrics();
     const NfsAsyncCommandLatencySnapshot command_latency = snapshot_nfs_async_command_latency_metrics();
+    const NfsReaddirplusPageSnapshot readdirplus = snapshot_nfs_readdirplus_page_metrics();
     const double avg_latency_ms = read_latency.completed != 0U
                                       ? static_cast<double>(read_latency.latency_ns) /
                                             static_cast<double>(read_latency.completed) / 1'000'000.0
@@ -4574,11 +4683,30 @@ void print_data_buffer_read_stats(const DataReadBenchmarkStats& stats,
                                     ? static_cast<double>(command_latency.close_latency_ns) /
                                           static_cast<double>(command_latency.close_completed) / 1'000'000.0
                                     : 0.0;
+    const double avg_readdirplus_page_ms = readdirplus.pages != 0U
+                                               ? static_cast<double>(readdirplus.page_latency_ns) /
+                                                     static_cast<double>(readdirplus.pages) / 1'000'000.0
+                                               : 0.0;
+    const double avg_readdirplus_decode_ms = readdirplus.pages != 0U
+                                                 ? static_cast<double>(readdirplus.decode_latency_ns) /
+                                                       static_cast<double>(readdirplus.pages) / 1'000'000.0
+                                                 : 0.0;
+    const double avg_readdirplus_entries = readdirplus.pages != 0U
+                                               ? static_cast<double>(readdirplus.entries) /
+                                                     static_cast<double>(readdirplus.pages)
+                                               : 0.0;
     std::cerr << "data_read_stats bytes_per_second=" << snapshot.bytes_per_second
               << " gigabits_per_second=" << snapshot.gigabits_per_second
+              << " files_per_second=" << snapshot.files_per_second
               << " bytes_read=" << snapshot.bytes_read
               << " files_read=" << snapshot.files_read
               << " files_found=" << snapshot.files_found
+              << " small_files_read=" << snapshot.small_files_read
+              << " large_files_read=" << snapshot.large_files_read
+              << " small_files_found=" << snapshot.small_files_found
+              << " large_files_found=" << snapshot.large_files_found
+              << " small_bytes_read=" << snapshot.small_bytes_read
+              << " large_bytes_read=" << snapshot.large_bytes_read
               << " folders_found=" << snapshot.folders_found
               << " logical_size_bytes=" << snapshot.logical_size_bytes
               << " async_reads_queued=" << read_latency.queued
@@ -4597,6 +4725,19 @@ void print_data_buffer_read_stats(const DataReadBenchmarkStats& stats,
               << " async_close_failed=" << command_latency.close_failed
               << " async_close_avg_latency_ms=" << avg_close_ms
               << " async_close_max_latency_ms=" << static_cast<double>(command_latency.close_max_latency_ns) / 1'000'000.0
+              << " readdirplus_pages=" << readdirplus.pages
+              << " readdirplus_failed_pages=" << readdirplus.failed_pages
+              << " readdirplus_entries=" << readdirplus.entries
+              << " readdirplus_files=" << readdirplus.files
+              << " readdirplus_directories=" << readdirplus.directories
+              << " readdirplus_avg_entries_per_page=" << avg_readdirplus_entries
+              << " readdirplus_requested_bytes=" << readdirplus.requested_bytes
+              << " readdirplus_avg_page_latency_ms=" << avg_readdirplus_page_ms
+              << " readdirplus_max_page_latency_ms="
+              << static_cast<double>(readdirplus.max_page_latency_ns) / 1'000'000.0
+              << " readdirplus_avg_decode_ms=" << avg_readdirplus_decode_ms
+              << " readdirplus_max_decode_ms="
+              << static_cast<double>(readdirplus.max_decode_latency_ns) / 1'000'000.0
               << " async_read_buckets_lt100us=" << read_latency.latency_buckets[0]
               << " lt500us=" << read_latency.latency_buckets[1]
               << " lt1ms=" << read_latency.latency_buckets[2]
@@ -4869,8 +5010,11 @@ void record_flat_metadata_batch(bool recursive,
         logical_size_bytes += file.declared_size != 0 ? file.declared_size : file.content.size();
     }
 
+    const bool track_unique_folders = stats_discarder.config().track_unique_folders;
     std::vector<std::string> folders_found;
-    folders_found.reserve(batch.directories.size());
+    if (track_unique_folders) {
+        folders_found.reserve(batch.directories.size());
+    }
     std::vector<FileSpec> child_work;
     if (recursive && !flat_metadata_scan_should_stop(queue)) {
         child_work.reserve(batch.directories.size());
@@ -4878,13 +5022,19 @@ void record_flat_metadata_batch(bool recursive,
 
     for (auto& directory : batch.directories) {
         directory.rel_path = normalize_path(directory.rel_path);
-        folders_found.push_back(directory.rel_path);
+        if (track_unique_folders) {
+            folders_found.push_back(directory.rel_path);
+        }
         if (recursive && !flat_metadata_scan_should_stop(queue)) {
             child_work.push_back(directory);
         }
     }
 
-    stats_discarder.record_batch(batch.files.size(), logical_size_bytes, folders_found);
+    if (track_unique_folders) {
+        stats_discarder.record_batch(batch.files.size(), logical_size_bytes, folders_found);
+    } else {
+        stats_discarder.record_batch(batch.files.size(), logical_size_bytes, batch.directories.size());
+    }
     if (record_writer != nullptr) {
         MetadataFolderRecord folder_record;
         folder_record.spec = std::move(batch.folder);
@@ -4902,45 +5052,75 @@ void record_flat_metadata_batch(bool recursive,
     finish_flat_folder_work(queue);
 }
 
-void scan_flat_metadata_worker(const std::string& source_root,
-                               bool recursive,
-                               std::size_t async_directory_depth,
-                               FlatMetadataWorkQueue& queue,
-                               MetadataStatsDiscarder& stats_discarder,
-                               MetadataRecordWriter* record_writer,
-                               PartitionedMetadataWriter* partitioned_writer) {
-    auto backend = make_nfs_backend(source_root);
-    try {
+class FlatMetadataScanJob final : public ThreadedJob {
+public:
+    FlatMetadataScanJob(const NfsMetaReaderConfig& reader_config,
+                        FlatMetadataWorkQueue& queue,
+                        MetadataStatsDiscarder& stats_discarder,
+                        MetadataRecordWriter* record_writer,
+                        PartitionedMetadataWriter* partitioned_writer)
+        : ThreadedJob(std::max<std::size_t>(1U, reader_config.worker_count)),
+          source_root_(reader_config.source_root),
+          recursive_(reader_config.recursive),
+          async_directory_depth_(std::max<std::size_t>(1U, reader_config.async_directory_depth)),
+          queue_(queue),
+          stats_discarder_(stats_discarder),
+          record_writer_(record_writer),
+          partitioned_writer_(partitioned_writer) {}
+
+protected:
+    void run_worker(std::size_t worker_index) override {
+        auto backend = make_nfs_backend(source_root_);
+        auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
         backend->scan_flat_folders(
-            async_directory_depth,
-            [&queue](bool wait_for_work) {
-                return take_flat_folder_work(queue, wait_for_work);
+            async_directory_depth_,
+            [this, worker_index](bool wait_for_work) {
+                if (!wait_until_worker_active(worker_index)) {
+                    return std::optional<FileSpec> {};
+                }
+                return take_flat_folder_work(queue_, wait_for_work);
             },
-            [&queue] {
-                return flat_metadata_scan_should_stop(queue);
+            [this] {
+                return stop_requested() || flat_metadata_scan_should_stop(queue_);
             },
-            [recursive, &queue, &stats_discarder, record_writer, partitioned_writer](FlatFolderScanBatch batch) {
-                record_flat_metadata_batch(recursive,
-                                           queue,
-                                           stats_discarder,
-                                           record_writer,
-                                           partitioned_writer,
+            [this](FlatFolderScanBatch batch) {
+                record_flat_metadata_batch(recursive_,
+                                           queue_,
+                                           stats_discarder_,
+                                           record_writer_,
+                                           partitioned_writer_,
                                            std::move(batch));
             });
-        if (flat_metadata_scan_should_stop(queue)) {
-            request_flat_folder_stop(queue);
+        if (flat_metadata_scan_should_stop(queue_)) {
+            request_flat_folder_stop(queue_);
         }
-    } catch (...) {
-        fail_flat_folder_work(queue);
     }
-}
+
+    void on_stop_requested() override {
+        request_flat_folder_stop(queue_);
+    }
+
+private:
+    std::string source_root_;
+    bool recursive_ = true;
+    std::size_t async_directory_depth_ = 1;
+    FlatMetadataWorkQueue& queue_;
+    MetadataStatsDiscarder& stats_discarder_;
+    MetadataRecordWriter* record_writer_ = nullptr;
+    PartitionedMetadataWriter* partitioned_writer_ = nullptr;
+};
 
 void run_parallel_flat_metadata_scan(const NfsMetaReaderConfig& reader_config,
                                      MetadataStatsDiscarder& stats_discarder,
                                      MetadataRecordWriter* record_writer,
                                      PartitionedMetadataWriter* partitioned_writer,
                                      double max_duration_seconds,
-                                     const std::filesystem::path& status_socket_path) {
+                                     const std::filesystem::path& status_socket_path,
+                                     bool pipeline_autoscale,
+                                     const std::string& autoscale_profile,
+                                     const std::filesystem::path& autoscale_settings_path,
+                                     std::uint64_t autoscale_interval_ms,
+                                     std::size_t* learned_workers_out) {
     FlatMetadataWorkQueue queue;
     queue.folders.push_back(FileSpec{});
     if (max_duration_seconds > 0.0) {
@@ -4951,18 +5131,110 @@ void run_parallel_flat_metadata_scan(const NfsMetaReaderConfig& reader_config,
     stats_discarder.record_folder("");
 
     const std::size_t thread_count = std::max<std::size_t>(1, reader_config.worker_count);
+    FlatMetadataScanJob scanner(reader_config,
+                                queue,
+                                stats_discarder,
+                                record_writer,
+                                partitioned_writer);
+    std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
+    std::unique_ptr<JobAutoScaleRunner> scanner_autoscaler;
+    auto learned_workers = std::make_shared<std::atomic<std::size_t>>(scanner.active_worker_limit());
+    std::shared_ptr<std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>> autoscale_samples;
+    if (pipeline_autoscale) {
+        autoscale_profile_store = std::make_unique<AutoScaleProfileStore>(autoscale_settings_path);
+        AutoScalePolicy policy = autoscale_profile_store->job_policy(autoscale_profile,
+                                                                     "nfs_meta_reader",
+                                                                     scanner.worker_count());
+        policy.scale_up_input_fullness = 0.0;
+        policy.scale_down_input_fullness = 0.01;
+        policy.output_blocked_fullness = 0.95;
+        policy.scale_up_output_fullness_limit = 0.95;
+        policy.busy_scale_up = 0.20;
+        policy.idle_scale_down = 0.80;
+        policy.min_improvement_ratio = 0.02;
+        policy.cooldown_samples = 1;
+        policy.max_cooldown_samples = std::max<std::uint64_t>(
+            1U,
+            (5000U + std::max<std::uint64_t>(1U, autoscale_interval_ms) - 1U) /
+                std::max<std::uint64_t>(1U, autoscale_interval_ms));
+        autoscale_samples =
+            std::make_shared<std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>>();
+        scanner_autoscaler = std::make_unique<JobAutoScaleRunner>(
+            scanner,
+            policy,
+            [&scanner, &queue, &stats_discarder, autoscale_samples] {
+                const auto now = std::chrono::steady_clock::now();
+                const MetadataStatsSnapshot stats = stats_discarder.snapshot();
+                const std::uint64_t records = stats.files_found + stats.folders_found;
+                autoscale_samples->emplace_back(now, records);
+                while (autoscale_samples->size() > 2U &&
+                       std::chrono::duration<double>(now - autoscale_samples->front().first).count() > 5.0) {
+                    autoscale_samples->pop_front();
+                }
+
+                std::size_t queued = 0;
+                std::size_t active = 0;
+                bool done = false;
+                {
+                    std::lock_guard<std::mutex> lock(queue.mutex);
+                    queued = queue.folders.size();
+                    active = queue.active;
+                    done = queue.done;
+                }
+
+                AutoScaleMetrics metrics;
+                const std::size_t active_limit = std::max<std::size_t>(1U, scanner.active_worker_limit());
+                metrics.input_fullness = done ? 0.0 : 1.0;
+                metrics.input_available_ratio =
+                    (queued + active) >= active_limit
+                        ? 1.0
+                        : static_cast<double>(queued + active) / static_cast<double>(active_limit);
+                metrics.output_fullness = 0.0;
+                const RuntimeMetricsSnapshot runtime = scanner.runtime_metrics().snapshot();
+                if (runtime.total_wall_ns != 0U) {
+                    metrics.busy_ratio = done ? 0.0 : 1.0;
+                    metrics.wait_output_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_output_full)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                    metrics.wait_input_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_input_empty)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                }
+                if (autoscale_samples->size() >= 2U) {
+                    const auto& oldest = autoscale_samples->front();
+                    const double elapsed = std::chrono::duration<double>(now - oldest.first).count();
+                    metrics.throughput_per_second =
+                        elapsed > 0.0 ? static_cast<double>(records - oldest.second) / elapsed : 0.0;
+                }
+                return metrics;
+            },
+            std::chrono::milliseconds(std::max<std::uint64_t>(100U, autoscale_interval_ms)));
+        learned_workers->store(scanner_autoscaler->active_workers(), std::memory_order_relaxed);
+        scanner_autoscaler->set_decision_callback([learned_workers](const AutoScaleDecision& decision) {
+            if (std::string_view(decision.reason) != "shutdown") {
+                learned_workers->store(decision.active_workers, std::memory_order_relaxed);
+            }
+            if (decision.changed) {
+                std::cerr << "autoscale job=nfs_meta_reader active_workers="
+                          << decision.active_workers
+                          << " reason=" << decision.reason << '\n';
+            }
+        });
+    }
     StatusRegistry status_registry;
     std::unique_ptr<StatusServer> status_server;
     if (!status_socket_path.empty()) {
-        status_registry.register_job("nfs_meta_reader", [&stats_discarder, thread_count]() {
+        status_registry.register_job("nfs_meta_reader", [&stats_discarder, &scanner]() {
             const MetadataStatsSnapshot stats = stats_discarder.snapshot();
             MonitorJobSnapshot snapshot;
             snapshot.name = "nfs_meta_reader";
-            snapshot.running = true;
-            snapshot.worker_count = thread_count;
+            snapshot.running = scanner.running();
+            snapshot.worker_count = scanner.worker_count();
             snapshot.processed_count = stats.files_found + stats.folders_found;
             snapshot.byte_count = stats.logical_size_bytes;
             snapshot.count_unit = "records";
+            snapshot.has_runtime_metrics = true;
+            snapshot.runtime_metrics = scanner.runtime_metrics().snapshot();
             snapshot.detail = "files=" + std::to_string(stats.files_found) +
                               " folders=" + std::to_string(stats.folders_found);
             return snapshot;
@@ -5001,21 +5273,25 @@ void run_parallel_flat_metadata_scan(const NfsMetaReaderConfig& reader_config,
         status_server->start();
     }
 
-    std::vector<std::thread> workers;
-    workers.reserve(thread_count);
-    for (std::size_t index = 0; index < thread_count; ++index) {
-        workers.emplace_back(scan_flat_metadata_worker,
-                             reader_config.source_root,
-                             reader_config.recursive,
-                             std::max<std::size_t>(1, reader_config.async_directory_depth),
-                             std::ref(queue),
-                             std::ref(stats_discarder),
-                             record_writer,
-                             partitioned_writer);
+    scanner.start();
+    if (scanner_autoscaler) {
+        scanner_autoscaler->start();
     }
-
-    for (auto& worker : workers) {
-        worker.join();
+    scanner.wait();
+    if (scanner_autoscaler) {
+        scanner_autoscaler->stop();
+        const std::size_t learned = learned_workers->load(std::memory_order_relaxed);
+        if (autoscale_profile_store) {
+            autoscale_profile_store->update_learned_workers(autoscale_profile,
+                                                            "nfs_meta_reader",
+                                                            learned);
+            autoscale_profile_store->save();
+        }
+        if (learned_workers_out != nullptr) {
+            *learned_workers_out = learned;
+        }
+    } else if (learned_workers_out != nullptr) {
+        *learned_workers_out = thread_count;
     }
     if (queue.error) {
         std::rethrow_exception(queue.error);
@@ -5083,6 +5359,72 @@ void record_data_read_metadata_batch(bool recursive,
     }
 }
 
+void record_split_data_read_metadata_batch(bool recursive,
+                                           FlatMetadataWorkQueue& folder_queue,
+                                           SplitDataReadFileQueues& file_queues,
+                                           DataReadBenchmarkStats& stats,
+                                           FlatFolderScanBatch batch) {
+    if (batch.failed) {
+        std::cerr << "metadata scan skipped folder '"
+                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+        if (batch.folder.rel_path.empty()) {
+            const std::string message =
+                batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
+            const auto error = std::make_exception_ptr(std::runtime_error(message));
+            fail_flat_folder_work(folder_queue, error);
+            fail_data_file_work(file_queues.small, error);
+            fail_data_file_work(file_queues.large, error);
+            return;
+        }
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        return;
+    }
+
+    std::vector<FileSpec> small_files;
+    std::vector<FileSpec> large_files;
+    small_files.reserve(batch.files.size());
+    large_files.reserve(batch.files.size());
+    std::uint64_t logical_size_bytes = 0;
+    for (auto& file : batch.files) {
+        const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
+        logical_size_bytes += logical_size;
+        if (logical_size <= file_queues.small_file_threshold) {
+            small_files.push_back(std::move(file));
+        } else {
+            large_files.push_back(std::move(file));
+        }
+    }
+
+    std::vector<FileSpec> child_work;
+    if (recursive && !flat_metadata_scan_should_stop(folder_queue)) {
+        child_work.reserve(batch.directories.size());
+        for (auto& directory : batch.directories) {
+            directory.rel_path = normalize_path(directory.rel_path);
+            child_work.push_back(directory);
+        }
+    }
+
+    record_data_read_metadata(stats, small_files.size() + large_files.size(),
+                              batch.directories.size(), logical_size_bytes);
+    stats.small_files_found.fetch_add(small_files.size(), std::memory_order_relaxed);
+    stats.large_files_found.fetch_add(large_files.size(), std::memory_order_relaxed);
+
+    if (!enqueue_data_read_files(file_queues.small, std::move(small_files)) ||
+        !enqueue_data_read_files(file_queues.large, std::move(large_files))) {
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        return;
+    }
+    enqueue_flat_folder_work(folder_queue, std::move(child_work));
+    if (batch.complete) {
+        finish_flat_folder_work(folder_queue);
+    }
+}
+
 void scan_data_read_metadata_worker(const std::string& source_root,
                                     bool recursive,
                                     std::size_t async_directory_depth,
@@ -5113,6 +5455,40 @@ void scan_data_read_metadata_worker(const std::string& source_root,
         const std::exception_ptr error = std::current_exception();
         fail_flat_folder_work(folder_queue, error);
         fail_data_file_work(file_queue, error);
+    }
+}
+
+void scan_split_data_read_metadata_worker(const std::string& source_root,
+                                          bool recursive,
+                                          std::size_t async_directory_depth,
+                                          std::size_t readdirplus_page_bytes,
+                                          FlatMetadataWorkQueue& folder_queue,
+                                          SplitDataReadFileQueues& file_queues,
+                                          DataReadBenchmarkStats& stats) {
+    auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
+    try {
+        backend->scan_flat_folders_streaming(
+            async_directory_depth,
+            [&folder_queue](bool wait_for_work) {
+                return take_flat_folder_work(folder_queue, wait_for_work);
+            },
+            [&folder_queue, &file_queues] {
+                return flat_metadata_scan_should_stop(folder_queue) ||
+                       data_read_timer_expired(file_queues.small) ||
+                       data_read_timer_expired(file_queues.large);
+            },
+            [recursive, &folder_queue, &file_queues, &stats](FlatFolderScanBatch batch) {
+                record_split_data_read_metadata_batch(recursive,
+                                                      folder_queue,
+                                                      file_queues,
+                                                      stats,
+                                                      std::move(batch));
+            });
+    } catch (...) {
+        const std::exception_ptr error = std::current_exception();
+        fail_flat_folder_work(folder_queue, error);
+        fail_data_file_work(file_queues.small, error);
+        fail_data_file_work(file_queues.large, error);
     }
 }
 
@@ -5441,6 +5817,443 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
     }
     if (file_queue.error) {
         std::rethrow_exception(file_queue.error);
+    }
+
+    DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+    snapshot.data_buffer_slots = pool_slots;
+    snapshot.data_queue_depth = queue_depth;
+    return snapshot;
+}
+
+DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderConfig& meta_config,
+                                                            NfsDataReaderConfig small_data_config,
+                                                            NfsDataReaderConfig large_data_config,
+                                                            std::uint64_t small_file_threshold,
+                                                            std::size_t max_files_queued,
+                                                            std::size_t data_buffer_slots,
+                                                            std::size_t data_queue_depth,
+                                                            double max_duration_seconds,
+                                                            std::uint32_t stats_interval_seconds,
+                                                            const SplitDataReadAutoscaleConfig& autoscale_config,
+                                                            const std::filesystem::path& status_socket_path) {
+    FlatMetadataWorkQueue folder_queue;
+    folder_queue.folders.push_back(FileSpec{});
+    SplitDataReadFileQueues file_queues;
+    file_queues.small.max_entries = std::max<std::size_t>(1, max_files_queued);
+    file_queues.large.max_entries = std::max<std::size_t>(1, max_files_queued);
+    file_queues.small_file_threshold = small_file_threshold == 0U ? 128U * 1024U : small_file_threshold;
+
+    DataReadBenchmarkStats stats;
+    stats.print_interval_seconds = std::max<std::uint32_t>(1, stats_interval_seconds);
+    stats.folders_found.store(1, std::memory_order_relaxed);
+    reset_nfs_async_read_latency_metrics();
+
+    const std::size_t small_threads = std::max<std::size_t>(1, small_data_config.data_reader_worker_count);
+    const std::size_t large_threads = std::max<std::size_t>(1, large_data_config.data_reader_worker_count);
+    const std::size_t outstanding = std::max<std::size_t>(1, small_data_config.outstanding_requests) +
+                                    std::max<std::size_t>(1, large_data_config.outstanding_requests);
+    const std::size_t metadata_threads = std::max<std::size_t>(1, meta_config.worker_count);
+    const std::size_t total_reader_threads = small_threads + large_threads;
+    const std::size_t queue_depth =
+        std::max<std::size_t>(1, data_queue_depth == 0 ? total_reader_threads * outstanding * 2U
+                                                       : data_queue_depth);
+    const std::size_t pool_slots =
+        std::max<std::size_t>(total_reader_threads * outstanding + queue_depth * 2U + 1U,
+                              data_buffer_slots == 0 ? total_reader_threads * outstanding * 3U + 1U
+                                                     : data_buffer_slots);
+
+    RawBufferPool data_pool = make_data_buffer_pool(pool_slots);
+    BufferPoolRegistry registry;
+    registry.register_pool(data_pool);
+    BufQueue small_reader_to_discard(queue_depth);
+    BufQueue large_reader_to_discard(queue_depth);
+
+    small_data_config.small_file_threshold = file_queues.small_file_threshold;
+    large_data_config.small_file_threshold = 0U;
+    large_data_config.pack_small_files = false;
+    large_data_config.small_file_async_window = 1U;
+
+    auto make_file_provider = [](DataReadFileQueue& queue) {
+        return [&queue]() {
+            thread_local std::deque<FileSpec> worker_file_batch;
+            if (worker_file_batch.empty()) {
+                std::vector<FileSpec> next_batch = take_data_file_work_batch(queue, 128);
+                for (auto& file : next_batch) {
+                    worker_file_batch.push_back(std::move(file));
+                }
+            }
+            if (worker_file_batch.empty()) {
+                return std::optional<FileSpec> {};
+            }
+            FileSpec file = std::move(worker_file_batch.front());
+            worker_file_batch.pop_front();
+            return std::optional<FileSpec> {std::move(file)};
+        };
+    };
+
+    NfsDataBufferReaderJob small_reader_job(
+        small_data_config,
+        data_pool,
+        small_reader_to_discard,
+        make_file_provider(file_queues.small),
+        [&file_queues]() {
+            return data_read_timer_expired(file_queues.small);
+        });
+    small_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
+        record_small_data_read_bytes(stats, bytes_read);
+    });
+    small_reader_job.set_file_read_callback([&stats]() {
+        record_small_data_read_file(stats);
+    });
+    small_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
+        stats.files_failed.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    NfsDataBufferReaderJob large_reader_job(
+        large_data_config,
+        data_pool,
+        large_reader_to_discard,
+        make_file_provider(file_queues.large),
+        [&file_queues]() {
+            return data_read_timer_expired(file_queues.large);
+        });
+    large_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
+        record_large_data_read_bytes(stats, bytes_read);
+    });
+    large_reader_job.set_file_read_callback([&stats]() {
+        record_large_data_read_file(stats);
+    });
+    large_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
+        stats.files_failed.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    BufferDiscarderJob small_discarder(BufferDiscarderConfig(1), small_reader_to_discard, registry);
+    BufferDiscarderJob large_discarder(BufferDiscarderConfig(1), large_reader_to_discard, registry);
+
+    const bool persist_autoscale_profile =
+        (autoscale_config.pipeline_enabled || autoscale_config.large_enabled) &&
+        !autoscale_config.settings_path.empty() &&
+        !autoscale_config.profile_name.empty();
+    std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
+    if (persist_autoscale_profile) {
+        autoscale_profile_store = std::make_unique<AutoScaleProfileStore>(autoscale_config.settings_path);
+    }
+
+    auto make_reader_policy =
+        [&autoscale_config, &autoscale_profile_store](const std::string& job_name,
+                                                      std::size_t worker_count,
+                                                      std::size_t initial_workers) {
+        AutoScalePolicy policy;
+        if (autoscale_profile_store) {
+            policy = autoscale_profile_store->job_policy(autoscale_config.profile_name,
+                                                         job_name,
+                                                         std::max<std::size_t>(1, worker_count));
+        } else {
+            policy.enabled = true;
+            policy.min_workers = 1U;
+            policy.max_workers = std::max<std::size_t>(1, worker_count);
+            policy.initial_workers = std::max<std::size_t>(1, initial_workers);
+            policy.cooldown_samples = 1U;
+            policy.max_cooldown_samples = std::max<std::uint64_t>(
+                1U,
+                (5000U + std::max<std::uint64_t>(1U, autoscale_config.interval_ms) - 1U) /
+                    std::max<std::uint64_t>(1U, autoscale_config.interval_ms));
+        }
+        policy.cooldown_samples = 1;
+        policy.max_cooldown_samples = std::max<std::uint64_t>(
+            1U,
+            (5000U + std::max<std::uint64_t>(1U, autoscale_config.interval_ms) - 1U) /
+                std::max<std::uint64_t>(1U, autoscale_config.interval_ms));
+        policy.scale_up_input_fullness = 0.25;
+        policy.scale_down_input_fullness = 0.02;
+        policy.output_blocked_fullness = 0.95;
+        policy.scale_up_output_fullness_limit = 0.80;
+        policy.busy_scale_up = 0.20;
+        policy.idle_scale_down = 0.75;
+        policy.min_improvement_ratio = 0.02;
+        return policy;
+    };
+
+    auto make_reader_metrics_provider =
+        [&file_queues](DataReadFileQueue& file_queue,
+                       BufQueue& output_queue,
+                       NfsDataBufferReaderJob& reader_job,
+                       std::atomic<std::uint64_t>& bytes_counter) {
+            std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>> byte_samples;
+            bool saw_backlog = false;
+            return [&file_queues, &file_queue, &output_queue, &reader_job, &bytes_counter,
+                    byte_samples, saw_backlog]() mutable {
+                (void)file_queues;
+                const auto now = std::chrono::steady_clock::now();
+                const std::uint64_t bytes = bytes_counter.load(std::memory_order_relaxed);
+                byte_samples.emplace_back(now, bytes);
+                while (byte_samples.size() > 2U &&
+                       std::chrono::duration<double>(now - byte_samples.front().first).count() > 5.0) {
+                    byte_samples.pop_front();
+                }
+                AutoScaleMetrics metrics;
+                const std::size_t queued_files = queued_data_read_files(file_queue);
+                const double input_fullness = static_cast<double>(queued_files) /
+                    static_cast<double>(std::max<std::size_t>(1, file_queue.max_entries));
+                const std::size_t active_workers = std::max<std::size_t>(1, reader_job.active_worker_limit());
+                saw_backlog = saw_backlog || queued_files != 0U;
+                metrics.input_fullness = saw_backlog ? input_fullness : 0.50;
+                metrics.input_available_ratio =
+                    queued_files >= active_workers ? 1.0 : static_cast<double>(queued_files) /
+                                                        static_cast<double>(active_workers);
+                metrics.output_fullness = static_cast<double>(output_queue.size()) /
+                    static_cast<double>(std::max<std::size_t>(1, output_queue.capacity()));
+                const RuntimeMetricsSnapshot runtime = reader_job.runtime_metrics().snapshot();
+                if (runtime.total_wall_ns != 0U) {
+                    const bool has_backlog = queued_files != 0U;
+                    if (has_backlog && metrics.output_fullness < 0.95) {
+                        metrics.busy_ratio = 1.0;
+                    } else {
+                        const std::uint64_t useful_ns =
+                            runtime.state_wall_ns[runtime_state_index(RuntimeState::processing)] +
+                            runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_io)];
+                        metrics.busy_ratio =
+                            static_cast<double>(useful_ns) / static_cast<double>(runtime.total_wall_ns);
+                    }
+                    metrics.wait_input_ratio =
+                        saw_backlog
+                            ? static_cast<double>(
+                                  runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_input_empty)]) /
+                                  static_cast<double>(runtime.total_wall_ns)
+                            : 0.0;
+                    metrics.wait_output_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_output_full)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                }
+                if (byte_samples.size() >= 2U) {
+                    const auto& oldest = byte_samples.front();
+                    const double elapsed = std::chrono::duration<double>(now - oldest.first).count();
+                    metrics.throughput_per_second =
+                        elapsed > 0.0 ? static_cast<double>(bytes - oldest.second) / elapsed : 0.0;
+                }
+                return metrics;
+            };
+        };
+
+    std::unique_ptr<JobAutoScaleRunner> large_autoscaler;
+    std::unique_ptr<PipelineAutoScaleRunner> pipeline_autoscaler;
+    if (autoscale_config.pipeline_enabled) {
+        pipeline_autoscaler = std::make_unique<PipelineAutoScaleRunner>(
+            std::vector<PipelineAutoScaleRunner::Stage> {
+                PipelineAutoScaleRunner::Stage {
+                    "small_data_reader",
+                    &small_reader_job,
+                    make_reader_policy("small_data_reader", small_reader_job.worker_count(), 1U),
+                    make_reader_metrics_provider(file_queues.small,
+                                                 small_reader_to_discard,
+                                                 small_reader_job,
+                                                 stats.small_bytes_read),
+                },
+                PipelineAutoScaleRunner::Stage {
+                    "large_data_reader",
+                    &large_reader_job,
+                    make_reader_policy("large_data_reader", large_reader_job.worker_count(), 1U),
+                    make_reader_metrics_provider(file_queues.large,
+                                                 large_reader_to_discard,
+                                                 large_reader_job,
+                                                 stats.large_bytes_read),
+                },
+            },
+            std::chrono::milliseconds(std::max<std::uint64_t>(100, autoscale_config.interval_ms)));
+        pipeline_autoscaler->set_decision_callback([](const PipelineAutoScaleRunner::StageDecision& decision) {
+            if (decision.decision.changed || decision.stage_advanced) {
+                std::cerr << "pipeline_autoscale stage=" << decision.stage_name
+                          << " active_workers=" << decision.decision.active_workers
+                          << " reason=" << decision.decision.reason
+                          << " advanced=" << (decision.stage_advanced ? "true" : "false") << '\n';
+            }
+        });
+    } else if (autoscale_config.large_enabled) {
+        large_autoscaler = std::make_unique<JobAutoScaleRunner>(
+            large_reader_job,
+            make_reader_policy(
+                "large_data_reader",
+                large_reader_job.worker_count(),
+                autoscale_config.large_initial_workers == 0U
+                    ? std::max<std::size_t>(1, large_reader_job.worker_count() / 2U)
+                    : autoscale_config.large_initial_workers),
+            make_reader_metrics_provider(file_queues.large,
+                                         large_reader_to_discard,
+                                         large_reader_job,
+                                         stats.large_bytes_read),
+            std::chrono::milliseconds(std::max<std::uint64_t>(100, autoscale_config.interval_ms)));
+        large_autoscaler->set_decision_callback([&large_reader_job](const AutoScaleDecision& decision) {
+            if (decision.changed) {
+                std::cerr << "autoscale job=large_data_reader active_workers="
+                          << decision.active_workers
+                          << " max_workers=" << large_reader_job.worker_count()
+                          << " reason=" << decision.reason << '\n';
+            }
+        });
+    }
+
+    StatusRegistry status_registry;
+    std::unique_ptr<StatusServer> status_server;
+    if (!status_socket_path.empty()) {
+        status_registry.register_queue("small_file_work_queue", [&file_queues]() {
+            return monitor_data_file_queue("small_file_work_queue", file_queues.small);
+        });
+        status_registry.register_queue("large_file_work_queue", [&file_queues]() {
+            return monitor_data_file_queue("large_file_work_queue", file_queues.large);
+        });
+        status_registry.register_queue("small_reader_output", [&small_reader_to_discard]() {
+            return monitor_buf_queue("small_reader_output", small_reader_to_discard);
+        });
+        status_registry.register_queue("large_reader_output", [&large_reader_to_discard]() {
+            return monitor_buf_queue("large_reader_output", large_reader_to_discard);
+        });
+        status_server = std::make_unique<StatusServer>(status_socket_path, status_registry);
+        status_server->start();
+    }
+
+    const auto benchmark_started_at = std::chrono::steady_clock::now();
+    stats.started_at = benchmark_started_at;
+    stats.last_print_at = benchmark_started_at;
+    if (max_duration_seconds > 0.0) {
+        const auto stop_at = benchmark_started_at +
+                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                 std::chrono::duration<double>(max_duration_seconds));
+        folder_queue.stop_at = stop_at;
+        file_queues.small.stop_at = stop_at;
+        file_queues.large.stop_at = stop_at;
+    }
+
+    std::mutex stop_timer_mutex;
+    std::condition_variable stop_timer_cv;
+    bool cancel_stop_timer = false;
+    std::thread stop_timer;
+    if (folder_queue.stop_at.has_value()) {
+        const auto stop_at = *folder_queue.stop_at;
+        stop_timer = std::thread([&]() {
+            std::unique_lock<std::mutex> lock(stop_timer_mutex);
+            const bool cancelled = stop_timer_cv.wait_until(lock, stop_at, [&]() {
+                return cancel_stop_timer;
+            });
+            if (!cancelled) {
+                request_flat_folder_stop(folder_queue);
+                request_data_file_stop(file_queues.small);
+                request_data_file_stop(file_queues.large);
+            }
+        });
+    }
+
+    std::thread stats_printer([&]() {
+        const auto interval = std::chrono::seconds(stats.print_interval_seconds);
+        std::unique_lock<std::mutex> lock(stats.printer_mutex);
+        while (true) {
+            if (stats.printer_cv.wait_for(lock, interval, [&stats] {
+                    return stats.printer_done.load(std::memory_order_relaxed);
+                })) {
+                break;
+            }
+            std::lock_guard<std::mutex> print_lock(stats.print_mutex);
+            stats.last_print_at = std::chrono::steady_clock::now();
+            const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+            std::cerr << "split_data_read_stats gigabits_per_second=" << snapshot.gigabits_per_second
+                      << " small_gigabits_per_second=" << snapshot.small_gigabits_per_second
+                      << " large_gigabits_per_second=" << snapshot.large_gigabits_per_second
+                      << " files_per_second=" << snapshot.files_per_second
+                      << " small_files_per_second=" << snapshot.small_files_per_second
+                      << " large_files_per_second=" << snapshot.large_files_per_second
+                      << " bytes_read=" << snapshot.bytes_read
+                      << " small_bytes_read=" << snapshot.small_bytes_read
+                      << " large_bytes_read=" << snapshot.large_bytes_read
+                      << " files_read=" << snapshot.files_read
+                      << " small_files_read=" << snapshot.small_files_read
+                      << " large_files_read=" << snapshot.large_files_read
+                      << " small_files_found=" << snapshot.small_files_found
+                      << " large_files_found=" << snapshot.large_files_found
+                      << " queued_small_files=" << queued_data_read_files(file_queues.small)
+                      << " queued_large_files=" << queued_data_read_files(file_queues.large)
+                      << " small_output_depth=" << small_reader_to_discard.size()
+                      << " large_output_depth=" << large_reader_to_discard.size()
+                      << " elapsed_seconds=" << snapshot.elapsed_seconds << '\n';
+        }
+    });
+
+    small_discarder.start();
+    large_discarder.start();
+    large_reader_job.start();
+    small_reader_job.start();
+    if (large_autoscaler) {
+        large_autoscaler->start();
+    }
+    if (pipeline_autoscaler) {
+        pipeline_autoscaler->start();
+    }
+
+    std::vector<std::thread> metadata_workers;
+    metadata_workers.reserve(metadata_threads);
+    for (std::size_t index = 0; index < metadata_threads; ++index) {
+        metadata_workers.emplace_back(scan_split_data_read_metadata_worker,
+                                      meta_config.source_root,
+                                      meta_config.recursive,
+                                      std::max<std::size_t>(1, meta_config.async_directory_depth),
+                                      meta_config.readdirplus_page_bytes,
+                                      std::ref(folder_queue),
+                                      std::ref(file_queues),
+                                      std::ref(stats));
+    }
+
+    for (auto& worker : metadata_workers) {
+        worker.join();
+    }
+    mark_data_file_input_done(file_queues.small);
+    mark_data_file_input_done(file_queues.large);
+
+    if (large_autoscaler) {
+        large_autoscaler->stop();
+    }
+    if (pipeline_autoscaler) {
+        pipeline_autoscaler->stop();
+    }
+    if (autoscale_profile_store) {
+        autoscale_profile_store->update_learned_workers(autoscale_config.profile_name,
+                                                        "small_data_reader",
+                                                        small_reader_job.active_worker_limit());
+        autoscale_profile_store->update_learned_workers(autoscale_config.profile_name,
+                                                        "large_data_reader",
+                                                        large_reader_job.active_worker_limit());
+        autoscale_profile_store->save();
+    }
+    small_reader_job.set_active_worker_limit(small_reader_job.worker_count());
+    large_reader_job.set_active_worker_limit(large_reader_job.worker_count());
+    small_reader_job.wait();
+    large_reader_job.wait();
+    small_discarder.wait();
+    large_discarder.wait();
+
+    stats.printer_done.store(true, std::memory_order_relaxed);
+    stats.printer_cv.notify_all();
+    if (stats_printer.joinable()) {
+        stats_printer.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stop_timer_mutex);
+        cancel_stop_timer = true;
+    }
+    stop_timer_cv.notify_all();
+    if (stop_timer.joinable()) {
+        stop_timer.join();
+    }
+    if (status_server) {
+        status_server->stop();
+    }
+
+    if (folder_queue.error) {
+        std::rethrow_exception(folder_queue.error);
+    }
+    if (file_queues.small.error) {
+        std::rethrow_exception(file_queues.small.error);
+    }
+    if (file_queues.large.error) {
+        std::rethrow_exception(file_queues.large.error);
     }
 
     DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
@@ -8033,7 +8846,11 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                                                     std::size_t record_buffer_slots,
                                                                     std::size_t metadata_output_partitions,
                                                                     const std::string& metadata_output_partition_mode,
-                                                                    const std::filesystem::path& status_socket_path) const {
+                                                                    const std::filesystem::path& status_socket_path,
+                                                                    bool pipeline_autoscale,
+                                                                    std::string autoscale_profile,
+                                                                    std::filesystem::path autoscale_settings_path,
+                                                                    std::uint64_t autoscale_interval_ms) const {
     NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
     reader_config.source_root = source_root.string();
     reader_config.recursive = recursive;
@@ -8046,6 +8863,19 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
     }
     if (record_buffer_slots != 0) {
         reader_config.recbuf_window = record_buffer_slots;
+    }
+    if (pipeline_autoscale) {
+        if (meta_reader_threads == 0U) {
+            reader_config.worker_count = default_autoscale_max_workers();
+            reader_config.thread_count = reader_config.worker_count;
+        }
+        if (autoscale_profile.empty()) {
+            autoscale_profile = "scan_metadata";
+        }
+        if (autoscale_settings_path.empty()) {
+            autoscale_settings_path = default_autoscale_settings_path();
+        }
+        autoscale_interval_ms = std::max<std::uint64_t>(100U, autoscale_interval_ms);
     }
     NfsMetaReader reader(reader_config);
 
@@ -8060,6 +8890,10 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
     report.record_buffer_slots = reader_config.recbuf_window;
     report.stats_interval_seconds = std::max<std::uint32_t>(1, stats_interval_seconds);
     report.metadata_output_partitions = std::max<std::size_t>(1U, metadata_output_partitions);
+    report.pipeline_autoscale = pipeline_autoscale;
+    report.autoscale_interval_ms = pipeline_autoscale ? autoscale_interval_ms : 0U;
+    report.autoscale_profile = pipeline_autoscale ? autoscale_profile : std::string {};
+    report.autoscale_settings_path = pipeline_autoscale ? autoscale_settings_path : std::filesystem::path {};
     if (metadata_output_partition_mode != "single" && metadata_output_partition_mode != "processes") {
         throw std::invalid_argument("metadata output partition mode must be single or processes");
     }
@@ -8126,12 +8960,19 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
             record_writer.emplace(writer_config);
         }
         stats_discarder.start();
+        std::size_t learned_workers = report.meta_reader_threads;
         run_parallel_flat_metadata_scan(reader_config,
                                         stats_discarder,
                                         record_writer.has_value() ? &*record_writer : nullptr,
                                         partitioned_writer.get(),
                                         max_duration_seconds,
-                                        status_socket_path);
+                                        status_socket_path,
+                                        pipeline_autoscale,
+                                        autoscale_profile,
+                                        autoscale_settings_path,
+                                        autoscale_interval_ms,
+                                        &learned_workers);
+        report.learned_meta_reader_threads = learned_workers;
         stats_discarder.stop();
         const MetadataStatsSnapshot stats = stats_discarder.snapshot();
         report.files_seen = stats.files_found;
@@ -8181,6 +9022,17 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                                      std::size_t data_reader_threads,
                                                                      std::size_t data_outstanding_requests,
                                                                      std::size_t small_file_async_window,
+                                                                     bool split_small_large,
+                                                                     std::uint64_t split_small_file_threshold,
+                                                                     std::size_t small_data_reader_threads,
+                                                                     std::size_t large_data_reader_threads,
+                                                                     std::size_t large_data_outstanding_requests,
+                                                                     bool pipeline_autoscale,
+                                                                     bool large_reader_autoscale,
+                                                                     std::size_t large_reader_initial_threads,
+                                                                     std::uint64_t autoscale_interval_ms,
+                                                                     std::string autoscale_profile,
+                                                                     std::filesystem::path autoscale_settings_path,
                                                                      std::uint64_t max_file_size_bytes,
                                                                      std::size_t max_files_queued,
                                                                      std::size_t data_buffer_slots,
@@ -8234,29 +9086,97 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     report.small_file_async_window = data_config.small_file_async_window != 0U
                                          ? data_config.small_file_async_window
                                          : report.data_outstanding_requests;
+    report.split_small_large = split_small_large;
+    report.split_small_file_threshold = split_small_file_threshold == 0U ? config_.small_file_threshold
+                                                                         : split_small_file_threshold;
+    const bool data_pipeline_autoscale = split_small_large && (pipeline_autoscale || large_reader_autoscale);
+    const std::size_t auto_worker_capacity = default_autoscale_max_workers();
+    report.small_data_reader_threads =
+        small_data_reader_threads == 0U
+            ? (data_pipeline_autoscale ? auto_worker_capacity : report.data_reader_threads)
+            : small_data_reader_threads;
+    report.large_data_reader_threads =
+        large_data_reader_threads == 0U
+            ? (data_pipeline_autoscale ? auto_worker_capacity : std::max<std::size_t>(1, report.data_reader_threads / 2U))
+            : large_data_reader_threads;
+    report.large_data_outstanding_requests =
+        large_data_outstanding_requests == 0U ? report.data_outstanding_requests
+                                              : large_data_outstanding_requests;
+    report.pipeline_autoscale = pipeline_autoscale;
+    report.large_reader_autoscale = large_reader_autoscale;
+    report.large_reader_initial_threads = large_reader_initial_threads == 0U
+                                              ? std::max<std::size_t>(1, report.large_data_reader_threads / 2U)
+                                              : large_reader_initial_threads;
+    report.autoscale_interval_ms = autoscale_interval_ms;
+    report.autoscale_profile = autoscale_profile.empty() ? "benchmark_data_split_small_large"
+                                                         : std::move(autoscale_profile);
+    report.autoscale_settings_path =
+        autoscale_settings_path.empty() ? default_autoscale_settings_path()
+                                        : std::move(autoscale_settings_path);
     report.max_file_size_bytes = max_file_size_bytes;
     report.max_files_queued = std::max<std::size_t>(1, max_files_queued);
     report.data_copy_mode = data_copy_mode_name(data_config.copy_data_from_nfs);
     report.pack_small_files = data_config.pack_small_files;
 
-    const DataReadBenchmarkSnapshot snapshot =
-        run_parallel_data_read_scan(meta_config,
-                                    data_config,
-                                    max_file_size_bytes,
-                                    report.max_files_queued,
-                                    data_buffer_slots,
-                                    data_queue_depth,
-                                    max_duration_seconds,
-                                    stats_interval_seconds,
-                                    status_socket_path);
+    DataReadBenchmarkSnapshot snapshot;
+    if (split_small_large) {
+        NfsDataReaderConfig small_data_config = data_config;
+        NfsDataReaderConfig large_data_config = data_config;
+        small_data_config.data_reader_worker_count = report.small_data_reader_threads;
+        small_data_config.outstanding_requests = 1U;
+        small_data_config.small_file_async_window = report.small_file_async_window;
+        small_data_config.pack_small_files = data_config.pack_small_files;
+        large_data_config.data_reader_worker_count = report.large_data_reader_threads;
+        large_data_config.outstanding_requests = report.large_data_outstanding_requests;
+        snapshot = run_parallel_split_data_read_scan(meta_config,
+                                                     small_data_config,
+                                                     large_data_config,
+                                                     report.split_small_file_threshold,
+                                                     report.max_files_queued,
+                                                     data_buffer_slots,
+                                                     data_queue_depth,
+                                                     max_duration_seconds,
+                                                     stats_interval_seconds,
+                                                     SplitDataReadAutoscaleConfig {
+                                                         pipeline_autoscale,
+                                                         large_reader_autoscale,
+                                                         large_reader_initial_threads,
+                                                         std::size_t {1},
+                                                         autoscale_interval_ms,
+                                                         report.autoscale_profile,
+                                                         report.autoscale_settings_path,
+                                                     },
+                                                     status_socket_path);
+    } else {
+        snapshot = run_parallel_data_read_scan(meta_config,
+                                               data_config,
+                                               max_file_size_bytes,
+                                               report.max_files_queued,
+                                               data_buffer_slots,
+                                               data_queue_depth,
+                                               max_duration_seconds,
+                                               stats_interval_seconds,
+                                               status_socket_path);
+    }
     report.files_found = snapshot.files_found;
     report.folders_found = snapshot.folders_found;
     report.files_read = snapshot.files_read;
     report.files_failed = snapshot.files_failed;
     report.logical_size_bytes = snapshot.logical_size_bytes;
     report.bytes_read = snapshot.bytes_read;
+    report.small_files_found = snapshot.small_files_found;
+    report.large_files_found = snapshot.large_files_found;
+    report.small_files_read = snapshot.small_files_read;
+    report.large_files_read = snapshot.large_files_read;
+    report.small_bytes_read = snapshot.small_bytes_read;
+    report.large_bytes_read = snapshot.large_bytes_read;
     report.bytes_per_second = snapshot.bytes_per_second;
     report.gigabits_per_second = snapshot.gigabits_per_second;
+    report.files_per_second = snapshot.files_per_second;
+    report.small_files_per_second = snapshot.small_files_per_second;
+    report.large_files_per_second = snapshot.large_files_per_second;
+    report.small_gigabits_per_second = snapshot.small_gigabits_per_second;
+    report.large_gigabits_per_second = snapshot.large_gigabits_per_second;
     report.elapsed_seconds = snapshot.elapsed_seconds;
     report.data_buffer_slots = snapshot.data_buffer_slots;
     report.data_queue_depth = snapshot.data_queue_depth;
@@ -9901,7 +10821,11 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     std::size_t meta_reader_threads,
     std::size_t metadata_async_depth,
     double max_duration_seconds,
-    std::uint32_t stats_interval_seconds) const {
+    std::uint32_t stats_interval_seconds,
+    bool pipeline_autoscale,
+    std::string autoscale_profile,
+    std::filesystem::path autoscale_settings_path,
+    std::uint64_t autoscale_interval_ms) const {
     const auto started_at = std::chrono::steady_clock::now();
     NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
     if (meta_reader_threads != 0U) {
@@ -9913,18 +10837,16 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     const std::size_t worker_count = std::max<std::size_t>(1U, reader_config.worker_count);
     const std::size_t async_depth = std::max<std::size_t>(1U, reader_config.async_directory_depth);
 
-    // Distributed diff can hold many 1 MiB flat-folder buffers until both
-    // source and target have delivered the final batch for a large directory.
-    // Capping this at 2K buffers deadlocks the stream on very large flat
-    // folders: the receiver waits for a free source buffer while the final
-    // source batch needed to release earlier buffers is still unread on the
-    // socket. Keep the pool preallocated, but size it from the configured
-    // parallelism instead of applying the scanner-oriented cap.
-    const std::size_t pool_slots = std::max<std::size_t>(64U, worker_count * async_depth);
-    RawBufferPool send_pool = make_metadata_batch_buffer_pool(pool_slots);
-    RawBufferPool result_pool = make_metadata_batch_buffer_pool(pool_slots);
-    BufQueue send_queue(pool_slots);
-    BufQueue result_queue(pool_slots);
+    // Flat-folder payloads may need thousands of 1 MiB batches for a single
+    // huge directory, so keep that window large. Result/control buffers are
+    // intentionally smaller; they are not on the large-folder completion path
+    // and they should apply backpressure before the process hoards memory.
+    const std::size_t flat_slots = distributed_diff_flat_slots(worker_count, async_depth);
+    const std::size_t control_slots = distributed_diff_control_slots(worker_count);
+    RawBufferPool send_pool = make_metadata_batch_buffer_pool(flat_slots);
+    RawBufferPool result_pool = make_metadata_batch_buffer_pool(control_slots);
+    BufQueue send_queue(flat_slots);
+    BufQueue result_queue(control_slots);
     BufferPoolRegistry send_registry;
     send_registry.register_pool(send_pool);
 
@@ -9944,6 +10866,88 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
                                        send_pool,
                                        send_queue,
                                        max_duration_seconds);
+
+    std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
+    std::unique_ptr<JobAutoScaleRunner> scanner_autoscaler;
+    auto source_scanner_learned_workers = std::make_shared<std::atomic<std::size_t>>(scanner.active_worker_limit());
+    if (pipeline_autoscale) {
+        if (autoscale_profile.empty()) {
+            autoscale_profile = "distributed_diff_source";
+        }
+        if (autoscale_settings_path.empty()) {
+            autoscale_settings_path = default_autoscale_settings_path();
+        }
+        autoscale_profile_store = std::make_unique<AutoScaleProfileStore>(autoscale_settings_path);
+        AutoScalePolicy policy = autoscale_profile_store->job_policy(autoscale_profile,
+                                                                     "source_scanner",
+                                                                     scanner.worker_count());
+        policy.scale_up_input_fullness = 0.0;
+        policy.scale_down_input_fullness = 0.01;
+        policy.output_blocked_fullness = 0.95;
+        policy.scale_up_output_fullness_limit = 0.80;
+        policy.busy_scale_up = 0.20;
+        policy.idle_scale_down = 0.80;
+        policy.min_improvement_ratio = 0.02;
+        policy.cooldown_samples = 1;
+        policy.max_cooldown_samples = std::max<std::uint64_t>(
+            1U,
+            (5000U + std::max<std::uint64_t>(1U, autoscale_interval_ms) - 1U) /
+                std::max<std::uint64_t>(1U, autoscale_interval_ms));
+        auto scanner_samples =
+            std::make_shared<std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>>();
+        scanner_autoscaler = std::make_unique<JobAutoScaleRunner>(
+            scanner,
+            policy,
+            [&scanner, &send_queue, scanner_samples] {
+                const auto now = std::chrono::steady_clock::now();
+                const DistributedDiffRunReport stats = scanner.stats();
+                scanner_samples->emplace_back(now, stats.source_logical_size_bytes);
+                while (scanner_samples->size() > 2U &&
+                       std::chrono::duration<double>(now - scanner_samples->front().first).count() > 5.0) {
+                    scanner_samples->pop_front();
+                }
+                AutoScaleMetrics metrics;
+                metrics.input_fullness = 1.0;
+                metrics.input_available_ratio = 1.0;
+                metrics.output_fullness = static_cast<double>(send_queue.size()) /
+                    static_cast<double>(std::max<std::size_t>(1U, send_queue.capacity()));
+                const RuntimeMetricsSnapshot runtime = scanner.runtime_metrics().snapshot();
+                if (runtime.total_wall_ns != 0U) {
+                    if (metrics.output_fullness < 0.95) {
+                        metrics.busy_ratio = 1.0;
+                    } else {
+                        const std::uint64_t useful_ns =
+                            runtime.state_wall_ns[runtime_state_index(RuntimeState::processing)] +
+                            runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_io)];
+                        metrics.busy_ratio = static_cast<double>(useful_ns) / static_cast<double>(runtime.total_wall_ns);
+                    }
+                    metrics.wait_output_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_output_full)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                    metrics.wait_input_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_input_empty)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                }
+                if (scanner_samples->size() >= 2U) {
+                    const auto& oldest = scanner_samples->front();
+                    const double elapsed = std::chrono::duration<double>(now - oldest.first).count();
+                    metrics.throughput_per_second =
+                        elapsed > 0.0 ? static_cast<double>(stats.source_logical_size_bytes - oldest.second) / elapsed
+                                      : 0.0;
+                }
+                return metrics;
+            },
+            std::chrono::milliseconds(std::max<std::uint64_t>(100U, autoscale_interval_ms)));
+        source_scanner_learned_workers->store(scanner_autoscaler->active_workers(), std::memory_order_relaxed);
+        scanner_autoscaler->set_decision_callback([source_scanner_learned_workers](const AutoScaleDecision& decision) {
+            source_scanner_learned_workers->store(decision.active_workers, std::memory_order_relaxed);
+            if (decision.changed) {
+                std::cerr << "autoscale job=source_scanner active_workers="
+                          << decision.active_workers
+                          << " reason=" << decision.reason << '\n';
+            }
+        });
+    }
 
     StatusRegistry status_registry;
     std::unique_ptr<PeriodicStatusReporter> status_reporter;
@@ -10025,6 +11029,7 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     if (stats_interval_seconds != 0U) {
         stats_thread = std::thread([&] {
             std::uint64_t last_folders = 0;
+            std::uint64_t last_files = 0;
             auto last_at = started_at;
             while (!stats_done.load(std::memory_order_relaxed)) {
                 for (std::uint32_t tick = 0; tick < stats_interval_seconds * 10U; ++tick) {
@@ -10038,17 +11043,41 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
                 }
                 DistributedDiffRunReport snapshot = result_writer.report();
                 snapshot.folders_sent = scanner.stats().folders_sent;
-                print_distributed_diff_source_stats(snapshot, started_at, last_folders, last_at);
+                print_distributed_diff_source_stats(snapshot, started_at, last_folders, last_files, last_at);
                 last_folders = snapshot.folders_reported;
+                last_files = snapshot.files_compared;
                 last_at = std::chrono::steady_clock::now();
             }
         });
     }
 
+    bool scanner_autoscale_saved = false;
+    auto finish_scanner_autoscale = [&] {
+        if (!scanner_autoscaler || scanner_autoscale_saved) {
+            return;
+        }
+        scanner_autoscaler->stop();
+        const std::size_t learned_workers = source_scanner_learned_workers->load(std::memory_order_relaxed);
+        if (autoscale_profile_store) {
+            autoscale_profile_store->update_learned_workers(autoscale_profile,
+                                                            "source_scanner",
+                                                            learned_workers);
+            autoscale_profile_store->save();
+        }
+        scanner_autoscale_saved = true;
+        // Autoscaling can park workers that are waiting on empty input queues.
+        // Wake every worker before wait() so normal shutdown never depends on
+        // the currently learned active-worker limit.
+        scanner.set_active_worker_limit(scanner.worker_count());
+    };
+
     result_receiver.start();
     result_writer.start();
     source_sender.start();
     scanner.start();
+    if (scanner_autoscaler) {
+        scanner_autoscaler->start();
+    }
     if (status_reporter) {
         status_reporter->start();
     }
@@ -10062,6 +11091,7 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     } catch (...) {
         wait_error = std::current_exception();
         try {
+            finish_scanner_autoscale();
             scanner.stop();
         } catch (...) {}
         try {
@@ -10074,6 +11104,7 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
             result_writer.stop();
         } catch (...) {}
     }
+    finish_scanner_autoscale();
 
     stats_done.store(true, std::memory_order_relaxed);
     if (stats_thread.joinable()) {
@@ -10104,7 +11135,11 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
                                                  bool recursive,
                                                  std::size_t target_threads,
                                                  std::size_t metadata_async_depth,
-                                                 std::uint32_t stats_interval_seconds) const {
+                                                 std::uint32_t stats_interval_seconds,
+                                                 bool pipeline_autoscale,
+                                                 std::string autoscale_profile,
+                                                 std::filesystem::path autoscale_settings_path,
+                                                 std::uint64_t autoscale_interval_ms) const {
     NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
     const std::size_t worker_count =
         std::max<std::size_t>(1U, target_threads != 0U ? target_threads : reader_config.worker_count);
@@ -10121,21 +11156,21 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
 
     (void)recursive;
     const std::size_t shard_count = std::max<std::size_t>(1U, std::min<std::size_t>(worker_count, 128U));
-    // Distributed diff must be able to receive a large flat folder's source
-    // batches before that folder can be compared and release ownership. Using
-    // the full configured work window avoids a pool starvation cycle where the
-    // receiver cannot read the final batch that would unblock diff shards.
-    const std::size_t pool_slots = std::max<std::size_t>(64U, worker_count * async_depth);
-    const std::size_t queue_depth = std::max<std::size_t>(64U, pool_slots);
-    const std::size_t shard_depth = std::max<std::size_t>(64U, (queue_depth + shard_count - 1U) / shard_count);
+    // Source/target flat-folder payloads are the only buffers that may need a
+    // large completion window for very wide directories. Request/result buffers
+    // are control-plane traffic, so keep them smaller to force backpressure to
+    // the socket instead of retaining tens of GiB in userspace.
+    const std::size_t flat_slots = distributed_diff_flat_slots(worker_count, async_depth);
+    const std::size_t control_slots = distributed_diff_control_slots(worker_count);
+    const std::size_t shard_depth = std::max<std::size_t>(64U, (flat_slots + shard_count - 1U) / shard_count);
 
-    RawBufferPool source_pool = make_distributed_diff_metadata_pool(kDistributedDiffSourcePoolId, pool_slots);
-    RawBufferPool request_pool = make_distributed_diff_metadata_pool(kDistributedDiffRequestPoolId, pool_slots);
-    RawBufferPool target_pool = make_distributed_diff_metadata_pool(kDistributedDiffTargetPoolId, pool_slots);
-    RawBufferPool result_pool = make_distributed_diff_metadata_pool(kDistributedDiffResultPoolId, pool_slots);
-    BufQueue received_source_queue(queue_depth);
-    BufQueue target_request_queue(queue_depth);
-    BufQueue result_queue(queue_depth);
+    RawBufferPool source_pool = make_distributed_diff_metadata_pool(kDistributedDiffSourcePoolId, flat_slots);
+    RawBufferPool request_pool = make_distributed_diff_metadata_pool(kDistributedDiffRequestPoolId, control_slots);
+    RawBufferPool target_pool = make_distributed_diff_metadata_pool(kDistributedDiffTargetPoolId, flat_slots);
+    RawBufferPool result_pool = make_distributed_diff_metadata_pool(kDistributedDiffResultPoolId, control_slots);
+    BufQueue received_source_queue(flat_slots);
+    BufQueue target_request_queue(control_slots);
+    BufQueue result_queue(control_slots);
     std::vector<std::unique_ptr<BufQueue>> diff_shard_queues;
     diff_shard_queues.reserve(shard_count);
     for (std::size_t index = 0; index < shard_count; ++index) {
@@ -10158,6 +11193,99 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
                                                 request_pool,
                                                 target_pool,
                                                 diff_shard_queues);
+    std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
+    std::unique_ptr<JobAutoScaleRunner> target_scanner_autoscaler;
+    auto target_scanner_learned_workers = std::make_shared<std::atomic<std::size_t>>(target_scanner.active_worker_limit());
+    if (pipeline_autoscale) {
+        if (autoscale_profile.empty()) {
+            autoscale_profile = "distributed_diff_target";
+        }
+        if (autoscale_settings_path.empty()) {
+            autoscale_settings_path = default_autoscale_settings_path();
+        }
+        autoscale_profile_store = std::make_unique<AutoScaleProfileStore>(autoscale_settings_path);
+        AutoScalePolicy policy = autoscale_profile_store->job_policy(autoscale_profile,
+                                                                     "target_scanner",
+                                                                     target_scanner.worker_count());
+        policy.scale_up_input_fullness = 0.10;
+        policy.scale_down_input_fullness = 0.02;
+        policy.output_blocked_fullness = 0.95;
+        policy.scale_up_output_fullness_limit = 0.80;
+        policy.busy_scale_up = 0.20;
+        policy.idle_scale_down = 0.80;
+        policy.min_improvement_ratio = 0.02;
+        policy.cooldown_samples = 1;
+        policy.max_cooldown_samples = std::max<std::uint64_t>(
+            1U,
+            (5000U + std::max<std::uint64_t>(1U, autoscale_interval_ms) - 1U) /
+                std::max<std::uint64_t>(1U, autoscale_interval_ms));
+        auto target_scanner_samples =
+            std::make_shared<std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>>();
+        target_scanner_autoscaler = std::make_unique<JobAutoScaleRunner>(
+            target_scanner,
+            policy,
+            [&target_scanner, &target_request_queue, &diff_shard_queues, target_scanner_samples] {
+                const auto now = std::chrono::steady_clock::now();
+                const TargetFolderScannerBufferJob::Stats stats = target_scanner.stats();
+                target_scanner_samples->emplace_back(now, stats.logical_size_bytes);
+                while (target_scanner_samples->size() > 2U &&
+                       std::chrono::duration<double>(now - target_scanner_samples->front().first).count() > 5.0) {
+                    target_scanner_samples->pop_front();
+                }
+                AutoScaleMetrics metrics;
+                const double input_fullness = static_cast<double>(target_request_queue.size()) /
+                    static_cast<double>(std::max<std::size_t>(1U, target_request_queue.capacity()));
+                metrics.input_fullness = input_fullness;
+                metrics.input_available_ratio =
+                    target_request_queue.size() >= target_scanner.active_worker_limit()
+                        ? 1.0
+                        : static_cast<double>(target_request_queue.size()) /
+                              static_cast<double>(std::max<std::size_t>(1U, target_scanner.active_worker_limit()));
+                std::size_t output_size = 0;
+                std::size_t output_capacity = 0;
+                for (const auto& queue : diff_shard_queues) {
+                    output_size += queue->size();
+                    output_capacity += queue->capacity();
+                }
+                metrics.output_fullness = static_cast<double>(output_size) /
+                    static_cast<double>(std::max<std::size_t>(1U, output_capacity));
+                const RuntimeMetricsSnapshot runtime = target_scanner.runtime_metrics().snapshot();
+                if (runtime.total_wall_ns != 0U) {
+                    const bool has_backlog = target_request_queue.size() != 0U;
+                    if (has_backlog && metrics.output_fullness < 0.95) {
+                        metrics.busy_ratio = 1.0;
+                    } else {
+                        const std::uint64_t useful_ns =
+                            runtime.state_wall_ns[runtime_state_index(RuntimeState::processing)] +
+                            runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_io)];
+                        metrics.busy_ratio = static_cast<double>(useful_ns) / static_cast<double>(runtime.total_wall_ns);
+                    }
+                    metrics.wait_output_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_output_full)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                    metrics.wait_input_ratio =
+                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_input_empty)]) /
+                        static_cast<double>(runtime.total_wall_ns);
+                }
+                if (target_scanner_samples->size() >= 2U) {
+                    const auto& oldest = target_scanner_samples->front();
+                    const double elapsed = std::chrono::duration<double>(now - oldest.first).count();
+                    metrics.throughput_per_second =
+                        elapsed > 0.0 ? static_cast<double>(stats.logical_size_bytes - oldest.second) / elapsed : 0.0;
+                }
+                return metrics;
+            },
+            std::chrono::milliseconds(std::max<std::uint64_t>(100U, autoscale_interval_ms)));
+        target_scanner_learned_workers->store(target_scanner_autoscaler->active_workers(), std::memory_order_relaxed);
+        target_scanner_autoscaler->set_decision_callback([target_scanner_learned_workers](const AutoScaleDecision& decision) {
+            target_scanner_learned_workers->store(decision.active_workers, std::memory_order_relaxed);
+            if (decision.changed) {
+                std::cerr << "autoscale job=target_scanner active_workers="
+                          << decision.active_workers
+                          << " reason=" << decision.reason << '\n';
+            }
+        });
+    }
     std::vector<std::unique_ptr<FolderDiffShardJob>> diff_shards;
     diff_shards.reserve(shard_count);
     for (std::size_t index = 0; index < shard_count; ++index) {
@@ -10283,6 +11411,7 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
     if (stats_interval_seconds != 0U) {
         stats_thread = std::thread([&] {
             std::uint64_t last_folders = 0;
+            std::uint64_t last_files = 0;
             auto last_at = started_at;
             while (!stats_done.load(std::memory_order_relaxed)) {
                 for (std::uint32_t tick = 0; tick < stats_interval_seconds * 10U; ++tick) {
@@ -10297,33 +11426,65 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
                 const BufferTransportStats rx = source_receiver.stats();
                 const BufferTransportStats tx = result_sender.stats();
                 std::uint64_t folders_compared = 0;
+                std::uint64_t files_compared = 0;
                 for (const auto& shard : diff_shards) {
-                    folders_compared += shard->stats().folders_compared;
+                    const FolderDiffShardJob::Stats shard_stats = shard->stats();
+                    folders_compared += shard_stats.folders_compared;
+                    files_compared += shard_stats.files_compared;
                 }
                 const auto now = std::chrono::steady_clock::now();
                 const double elapsed = std::chrono::duration<double>(now - started_at).count();
                 const double interval_elapsed = std::chrono::duration<double>(now - last_at).count();
                 const std::uint64_t interval_folders =
                     folders_compared >= last_folders ? folders_compared - last_folders : 0U;
+                const std::uint64_t interval_files =
+                    files_compared >= last_files ? files_compared - last_files : 0U;
                 std::cout << "distributed_diff_target_stats"
                           << " source_buffers_received=" << rx.buffers
                           << " result_buffers_sent=" << tx.buffers
                           << " folders_compared=" << folders_compared
                           << " interval_folders_per_second="
                           << (interval_elapsed > 0.0 ? static_cast<double>(interval_folders) / interval_elapsed : 0.0)
+                          << " files_compared=" << files_compared
+                          << " files_per_second="
+                          << (elapsed > 0.0 ? static_cast<double>(files_compared) / elapsed : 0.0)
+                          << " interval_files_per_second="
+                          << (interval_elapsed > 0.0 ? static_cast<double>(interval_files) / interval_elapsed : 0.0)
                           << " receive_queue_depth=" << received_source_queue.size()
                           << " request_queue_depth=" << target_request_queue.size()
                           << " result_queue_depth=" << result_queue.size()
                           << " elapsed_seconds=" << elapsed << std::endl;
                 last_folders = folders_compared;
+                last_files = files_compared;
                 last_at = now;
             }
         });
     }
 
+    bool target_scanner_autoscale_saved = false;
+    auto finish_target_scanner_autoscale = [&] {
+        if (!target_scanner_autoscaler || target_scanner_autoscale_saved) {
+            return;
+        }
+        target_scanner_autoscaler->stop();
+        const std::size_t learned_workers = target_scanner_learned_workers->load(std::memory_order_relaxed);
+        if (autoscale_profile_store) {
+            autoscale_profile_store->update_learned_workers(autoscale_profile,
+                                                            "target_scanner",
+                                                            learned_workers);
+            autoscale_profile_store->save();
+        }
+        target_scanner_autoscale_saved = true;
+        // See source-side shutdown: parked workers must be woken before wait().
+        target_scanner.set_active_worker_limit(target_scanner.worker_count());
+    };
+
     source_receiver.start();
     router.start();
     target_scanner.start();
+    if (target_scanner_autoscaler) {
+        target_scanner_autoscaler->start();
+    }
     for (auto& shard : diff_shards) {
         shard->start();
     }
@@ -10336,7 +11497,11 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
     try {
         source_receiver.wait();
         router.wait();
+        finish_target_scanner_autoscale();
         target_scanner.wait();
+        for (auto& queue : diff_shard_queues) {
+            queue->close();
+        }
         for (auto& shard : diff_shards) {
             shard->wait();
         }
@@ -10351,8 +11516,12 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
             router.stop();
         } catch (...) {}
         try {
+            finish_target_scanner_autoscale();
             target_scanner.stop();
         } catch (...) {}
+        for (auto& queue : diff_shard_queues) {
+            queue->close();
+        }
         for (auto& shard : diff_shards) {
             try {
                 shard->stop();
@@ -10363,6 +11532,7 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
             result_sender.stop();
         } catch (...) {}
     }
+    finish_target_scanner_autoscale();
 
     stats_done.store(true, std::memory_order_relaxed);
     if (stats_thread.joinable()) {

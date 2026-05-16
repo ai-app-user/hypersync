@@ -87,9 +87,23 @@ struct NfsAsyncCommandLatencySnapshot {
     std::uint64_t close_max_latency_ns = 0;
 };
 
+struct NfsReaddirplusPageSnapshot {
+    std::uint64_t pages = 0;
+    std::uint64_t failed_pages = 0;
+    std::uint64_t entries = 0;
+    std::uint64_t files = 0;
+    std::uint64_t directories = 0;
+    std::uint64_t requested_bytes = 0;
+    std::uint64_t page_latency_ns = 0;
+    std::uint64_t max_page_latency_ns = 0;
+    std::uint64_t decode_latency_ns = 0;
+    std::uint64_t max_decode_latency_ns = 0;
+};
+
 void reset_nfs_async_read_latency_metrics();
 [[nodiscard]] NfsAsyncReadLatencySnapshot snapshot_nfs_async_read_latency_metrics();
 [[nodiscard]] NfsAsyncCommandLatencySnapshot snapshot_nfs_async_command_latency_metrics();
+[[nodiscard]] NfsReaddirplusPageSnapshot snapshot_nfs_readdirplus_page_metrics();
 
 class NfsBackend {
 public:

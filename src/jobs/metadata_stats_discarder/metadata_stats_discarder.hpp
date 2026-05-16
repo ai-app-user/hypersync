@@ -27,7 +27,7 @@ struct MetadataStatsDiscarderConfig {
     MetadataStatsDiscarderConfig(bool enabled,
                                  std::uint32_t print_interval_seconds,
                                  std::string output,
-                                 bool track_unique_folders = true);
+                                 bool track_unique_folders = false);
 };
 
 struct MetadataStatsSnapshot {
@@ -37,6 +37,7 @@ struct MetadataStatsSnapshot {
     std::uint64_t logical_size_bytes = 0;
     double elapsed_seconds = 0.0;
     double records_per_second = 0.0;
+    double files_per_second = 0.0;
 };
 
 [[nodiscard]] MetadataStatsDiscarderConfig load_metadata_stats_discarder_config(const ConfigStore& config);

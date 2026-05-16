@@ -131,7 +131,29 @@ Metrics must make wait reasons visible: empty-input wait, full-output wait,
 external-I/O wait, processing time, records processed, bytes processed, and
 queue depth/high-water marks.
 
-### 0.7 Mandatory Generic Instrumentation
+### 0.7 Remote Deployment Is Package-Only
+
+Remote hosts must run Hypersync from the supported deploy bundle only.
+
+- Do not copy individual source files to remote hosts for normal testing,
+  benchmarking, production scans, diffs, or sync runs.
+- Do not rebuild from an ad-hoc remote source tree as part of operational
+  verification.
+- The only supported remote artifact is the flat deployment folder or tarball
+  produced by `hypersync/deploy/package-linux.sh`.
+- Remote commands must use the bundle launcher `./hypersync`, not a source-tree
+  binary path, so bundled libraries and `default.yaml` are the ones under test.
+- Each remote test or production run should use a timestamped deployment
+  directory under the host's deployment root. Reusing a mutable source checkout
+  hides what version was actually tested.
+- If a remote issue requires debugging with source, pause and discuss it first.
+  Source-level remote debugging is an exception, not the deployment model.
+
+The manifest and checksum files shipped in the bundle are part of the
+reproducibility contract. Performance results must record the deployment path
+and, when available, the manifest git commit/dirty state.
+
+### 0.8 Mandatory Generic Instrumentation
 
 Every production Job must be observable through the shared monitor vocabulary.
 Instrumentation is part of the architecture, not optional debug code.
@@ -164,6 +186,55 @@ Experimental code is allowed only when it is clearly isolated and documented as
 non-production. Prototype shortcuts must not become the default architecture.
 Before merging a feature into the production pipeline, it must be converted to
 the Job + bounded queue + preallocated buffer ownership model described here.
+
+### 0.9 Priority Streams and Autoscaling
+
+Small-file and large-file data paths must be independent streams when they have
+different performance goals.
+
+Required pattern:
+
+`Scanner -> FileClassifier -> SmallDataReader -> small data queue`
+
+`Scanner -> FileClassifier -> LargeDataReader -> large data queue`
+
+The transport sender drains the small-file data queue first and drains the
+large-file queue only when the small queue is empty or below its configured low
+watermark. This gives small files maximum operation rate while allowing large
+files to consume all otherwise-idle bandwidth. A separate bandwidth throttle is
+not the default control mechanism; bounded queues and priority selection are.
+
+Thread-count autoscaling must be generic. Piper may adjust a Job's active worker
+limit using queue fullness, worker wait-state percentages, and throughput
+trends. Domain Jobs may expose extra metrics, but they must not embed custom
+cross-Job scaling logic or call neighboring Jobs directly. Scale-down is
+cooperative: workers park between file/buffer batches and are never interrupted
+while owning a buffer or waiting inside libnfs.
+
+Pipeline autoscaling must tune one Job at a time in pipeline order. The first
+stage is tuned by measuring how quickly it pushes to its output queue(s). When
+that stage reaches its configured limit or added workers fail to improve output
+throughput, the controller backs off and moves to the next stage. A failed probe
+also reduces the next probe step: 100%, 50%, 25%, then 12.5% by default. All
+autoscaling must obey each Job's configured min/max bounds.
+
+Autoscale defaults are persisted per pipeline profile. If a Job is not present
+in the selected profile, it is auto-added with:
+
+- `autoscale: true`
+- `min_workers: 1`
+- `initial_workers: 1`
+- `max_workers: auto`
+
+`max_workers: auto` means `cpu_count * 2`, capped by any Job-specific safe
+capacity configured by the pipeline. First runs may therefore start unknown
+autoscalable Jobs at one active worker, discover steady state, and write learned
+values to the profile. Later runs should start from the learned values for that
+specific pipeline profile, while still allowing live correction if the host,
+storage backend, or workload mix changes. Different pipelines, such as metadata
+scan, small/large data read, diff, sync, and writer pipelines, must keep
+separate learned profiles because the same Job can need different settings in
+different contexts.
 
 ---
 

@@ -34,3 +34,9 @@ Feature: CLI performance smoke tests
       | sha256  | 1       | 65536      | 0.1              |
     Then all benchmark commands should succeed
     And each benchmark should report at least 0.001 Gbit/s
+
+  Scenario: Pipeline autoscale data benchmark starts tiny and completes
+    Given a generated source tree with 128 files of 8192 bytes each
+    When I run a pipeline autoscale data benchmark
+    Then the latest command should succeed
+    And the latest command should finish within 15.0 seconds

@@ -63,6 +63,11 @@ struct MetadataBenchmarkReport {
     std::size_t record_buffer_slots = 0;
     std::uint32_t stats_interval_seconds = 0;
     std::string scan_run_id;
+    bool pipeline_autoscale = false;
+    std::uint64_t autoscale_interval_ms = 0;
+    std::string autoscale_profile;
+    std::filesystem::path autoscale_settings_path;
+    std::size_t learned_meta_reader_threads = 0;
     bool meta_reader_async = false;
     double elapsed_seconds = 0.0;
 };
@@ -74,8 +79,19 @@ struct DataReadBenchmarkReport {
     std::size_t files_failed = 0;
     std::uint64_t logical_size_bytes = 0;
     std::uint64_t bytes_read = 0;
+    std::size_t small_files_found = 0;
+    std::size_t large_files_found = 0;
+    std::size_t small_files_read = 0;
+    std::size_t large_files_read = 0;
+    std::uint64_t small_bytes_read = 0;
+    std::uint64_t large_bytes_read = 0;
     double bytes_per_second = 0.0;
     double gigabits_per_second = 0.0;
+    double files_per_second = 0.0;
+    double small_files_per_second = 0.0;
+    double large_files_per_second = 0.0;
+    double small_gigabits_per_second = 0.0;
+    double large_gigabits_per_second = 0.0;
     double elapsed_seconds = 0.0;
     std::size_t meta_reader_threads = 0;
     std::size_t metadata_async_depth = 0;
@@ -83,6 +99,17 @@ struct DataReadBenchmarkReport {
     std::size_t data_reader_threads = 0;
     std::size_t data_outstanding_requests = 0;
     std::size_t small_file_async_window = 0;
+    bool split_small_large = false;
+    std::uint64_t split_small_file_threshold = 0;
+    std::size_t small_data_reader_threads = 0;
+    std::size_t large_data_reader_threads = 0;
+    std::size_t large_data_outstanding_requests = 0;
+    bool pipeline_autoscale = false;
+    bool large_reader_autoscale = false;
+    std::size_t large_reader_initial_threads = 0;
+    std::uint64_t autoscale_interval_ms = 0;
+    std::string autoscale_profile;
+    std::filesystem::path autoscale_settings_path;
     std::uint64_t max_file_size_bytes = 0;
     std::size_t max_files_queued = 0;
     std::size_t data_buffer_slots = 0;
@@ -318,7 +345,11 @@ public:
                                                                      std::size_t record_buffer_slots = 0,
                                                                      std::size_t metadata_output_partitions = 1,
                                                                      const std::string& metadata_output_partition_mode = "single",
-                                                                     const std::filesystem::path& status_socket_path = {}) const;
+                                                                     const std::filesystem::path& status_socket_path = {},
+                                                                     bool pipeline_autoscale = false,
+                                                                     std::string autoscale_profile = {},
+                                                                     std::filesystem::path autoscale_settings_path = {},
+                                                                     std::uint64_t autoscale_interval_ms = 1000) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_data_read_pipeline(const std::filesystem::path& source_root,
                                                                        bool recursive = true,
                                                                        std::size_t meta_reader_threads = 0,
@@ -327,7 +358,18 @@ public:
                                                                        std::size_t data_reader_threads = 0,
                                                                        std::size_t data_outstanding_requests = 0,
                                                                        std::size_t small_file_async_window = 0,
-                                                                       std::uint64_t max_file_size_bytes = 0,
+                                                                       bool split_small_large = false,
+                                                                       std::uint64_t split_small_file_threshold = 0,
+                                                                       std::size_t small_data_reader_threads = 0,
+                                                                       std::size_t large_data_reader_threads = 0,
+                                                                       std::size_t large_data_outstanding_requests = 0,
+                                                                       bool pipeline_autoscale = false,
+                                                                     bool large_reader_autoscale = false,
+                                                                     std::size_t large_reader_initial_threads = 0,
+                                                                     std::uint64_t autoscale_interval_ms = 1000,
+                                                                     std::string autoscale_profile = {},
+                                                                     std::filesystem::path autoscale_settings_path = {},
+                                                                     std::uint64_t max_file_size_bytes = 0,
                                                                        std::size_t max_files_queued = 1024,
                                                                        std::size_t data_buffer_slots = 0,
                                                                        std::size_t data_queue_depth = 0,
@@ -430,7 +472,11 @@ public:
         std::size_t meta_reader_threads = 0,
         std::size_t metadata_async_depth = 0,
         double max_duration_seconds = 0.0,
-        std::uint32_t stats_interval_seconds = 5) const;
+        std::uint32_t stats_interval_seconds = 5,
+        bool pipeline_autoscale = false,
+        std::string autoscale_profile = {},
+        std::filesystem::path autoscale_settings_path = {},
+        std::uint64_t autoscale_interval_ms = 1000) const;
     void run_distributed_diff_target(const std::filesystem::path& target_root,
                                      const std::string& listen_host,
                                      std::uint16_t listen_port,
@@ -438,7 +484,11 @@ public:
                                      bool recursive = true,
                                      std::size_t target_threads = 0,
                                      std::size_t metadata_async_depth = 0,
-                                     std::uint32_t stats_interval_seconds = 5) const;
+                                     std::uint32_t stats_interval_seconds = 5,
+                                     bool pipeline_autoscale = false,
+                                     std::string autoscale_profile = {},
+                                     std::filesystem::path autoscale_settings_path = {},
+                                     std::uint64_t autoscale_interval_ms = 1000) const;
     [[nodiscard]] TransferReport transfer_directory(const SenderRuntimeConfig& runtime) const;
     void run_receiver(const ReceiverRuntimeConfig& runtime) const;
     [[nodiscard]] static std::vector<FileSpec> scan_directory(const std::filesystem::path& source_root, bool recursive = true);

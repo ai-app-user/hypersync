@@ -34,7 +34,7 @@ struct NfsMetaReaderConfig {
                         bool async_readdir,
                         std::string source_root,
                         bool recursive,
-                        std::size_t async_directory_depth = 1,
+                        std::size_t async_directory_depth = 256U,
                         std::size_t readdirplus_page_bytes = 256U * 1024U);
 };
 

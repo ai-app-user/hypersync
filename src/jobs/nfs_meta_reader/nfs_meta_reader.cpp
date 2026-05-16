@@ -31,7 +31,7 @@ NfsMetaReaderConfig load_nfs_meta_reader_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("nfs_meta_reader"));
     const std::size_t worker_count =
         config_size_t_or(values, "worker_count", config_size_t_or(values, "thread_count", 8));
-    const std::size_t async_directory_depth = config_size_t_or(values, "async_directory_depth", 1);
+    const std::size_t async_directory_depth = config_size_t_or(values, "async_directory_depth", 256U);
     const std::size_t readdirplus_page_bytes = config_size_t_or(values, "readdirplus_page_bytes", 256U * 1024U);
     return NfsMetaReaderConfig(worker_count,
                                config_size_t(values, "recbuf_window"),

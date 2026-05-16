@@ -27,7 +27,7 @@ MetadataStatsDiscarderConfig load_metadata_stats_discarder_config(const ConfigSt
     return MetadataStatsDiscarderConfig(config_bool_or(values, "enabled", false),
                                         config_u32_or(values, "print_interval_seconds", 5),
                                         config_string_or(values, "output", "stderr"),
-                                        config_bool_or(values, "track_unique_folders", true));
+                                        config_bool_or(values, "track_unique_folders", false));
 }
 
 MetadataStatsDiscarder::MetadataStatsDiscarder(MetadataStatsDiscarderConfig config)
@@ -162,6 +162,7 @@ void MetadataStatsDiscarder::maybe_print() {
 void MetadataStatsDiscarder::print_snapshot() const {
     const MetadataStatsSnapshot current = snapshot();
     output_stream() << "metadata_stats records_per_second=" << current.records_per_second
+                    << " files_per_second=" << current.files_per_second
                     << " files_found=" << current.files_found
                     << " folders_found=" << current.folders_found
                     << " logical_size_bytes=" << current.logical_size_bytes
@@ -182,6 +183,7 @@ MetadataStatsSnapshot MetadataStatsDiscarder::snapshot() const {
     result.logical_size_bytes = logical_size_bytes_;
     result.elapsed_seconds = elapsed;
     result.records_per_second = elapsed > 0.0 ? static_cast<double>(accepted_) / elapsed : 0.0;
+    result.files_per_second = elapsed > 0.0 ? static_cast<double>(result.files_found) / elapsed : 0.0;
     return result;
 }
 

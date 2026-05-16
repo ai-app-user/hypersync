@@ -33,7 +33,7 @@ jobs:
     overflow_csv_path: input_overflow.csv
   nfs_meta_reader:
     worker_count: 8
-    async_directory_depth: 1
+    async_directory_depth: 256
     readdirplus_page_bytes: 262144
     recbuf_window: 1000000
     streaming_mode_threshold: 1000000
@@ -49,6 +49,7 @@ jobs:
     enabled: false
     print_interval_seconds: 5
     output: stderr
+    track_unique_folders: false
   buffer_generator:
     worker_count: 1
     buffer_count: 0

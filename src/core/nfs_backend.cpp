@@ -6,12 +6,14 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -95,6 +97,19 @@ struct NfsAsyncCommandLatencyMetrics {
     std::atomic<std::uint64_t> close_max_latency_ns {0};
 };
 
+struct NfsReaddirplusPageMetrics {
+    std::atomic<std::uint64_t> pages {0};
+    std::atomic<std::uint64_t> failed_pages {0};
+    std::atomic<std::uint64_t> entries {0};
+    std::atomic<std::uint64_t> files {0};
+    std::atomic<std::uint64_t> directories {0};
+    std::atomic<std::uint64_t> requested_bytes {0};
+    std::atomic<std::uint64_t> page_latency_ns {0};
+    std::atomic<std::uint64_t> max_page_latency_ns {0};
+    std::atomic<std::uint64_t> decode_latency_ns {0};
+    std::atomic<std::uint64_t> max_decode_latency_ns {0};
+};
+
 enum class NfsAsyncCommandKind {
     other,
     open,
@@ -109,6 +124,20 @@ NfsAsyncReadLatencyMetrics& nfs_async_read_latency_metrics() {
 NfsAsyncCommandLatencyMetrics& nfs_async_command_latency_metrics() {
     static NfsAsyncCommandLatencyMetrics metrics;
     return metrics;
+}
+
+NfsReaddirplusPageMetrics& nfs_readdirplus_page_metrics() {
+    static NfsReaddirplusPageMetrics metrics;
+    return metrics;
+}
+
+[[maybe_unused]] bool nfs_page_trace_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("HYPERSYNC_NFS_PAGE_TRACE");
+        return value != nullptr && value[0] != '\0' && std::string_view(value) != "0" &&
+               std::string_view(value) != "false" && std::string_view(value) != "off";
+    }();
+    return enabled;
 }
 
 void reset_atomic_max(std::atomic<std::uint64_t>& value) {
@@ -210,6 +239,32 @@ std::uint64_t steady_latency_ns(std::chrono::steady_clock::time_point start,
     }
 }
 
+[[maybe_unused]] void record_readdirplus_page_completed(
+    const std::chrono::steady_clock::time_point& queued_at,
+    const std::chrono::steady_clock::time_point& callback_started_at,
+    const std::chrono::steady_clock::time_point& callback_finished_at,
+    std::size_t requested_bytes,
+    std::size_t entries,
+    std::size_t files,
+    std::size_t directories,
+    bool failed) {
+    NfsReaddirplusPageMetrics& metrics = nfs_readdirplus_page_metrics();
+    const std::uint64_t page_latency = steady_latency_ns(queued_at, callback_started_at);
+    const std::uint64_t decode_latency = steady_latency_ns(callback_started_at, callback_finished_at);
+    metrics.pages.fetch_add(1, std::memory_order_relaxed);
+    metrics.requested_bytes.fetch_add(requested_bytes, std::memory_order_relaxed);
+    metrics.entries.fetch_add(entries, std::memory_order_relaxed);
+    metrics.files.fetch_add(files, std::memory_order_relaxed);
+    metrics.directories.fetch_add(directories, std::memory_order_relaxed);
+    metrics.page_latency_ns.fetch_add(page_latency, std::memory_order_relaxed);
+    metrics.decode_latency_ns.fetch_add(decode_latency, std::memory_order_relaxed);
+    update_atomic_max(metrics.max_page_latency_ns, page_latency);
+    update_atomic_max(metrics.max_decode_latency_ns, decode_latency);
+    if (failed) {
+        metrics.failed_pages.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 }  // namespace
 
 void reset_nfs_async_read_latency_metrics() {
@@ -236,6 +291,18 @@ void reset_nfs_async_read_latency_metrics() {
     command_metrics.close_failed.store(0, std::memory_order_relaxed);
     command_metrics.close_latency_ns.store(0, std::memory_order_relaxed);
     reset_atomic_max(command_metrics.close_max_latency_ns);
+
+    NfsReaddirplusPageMetrics& page_metrics = nfs_readdirplus_page_metrics();
+    page_metrics.pages.store(0, std::memory_order_relaxed);
+    page_metrics.failed_pages.store(0, std::memory_order_relaxed);
+    page_metrics.entries.store(0, std::memory_order_relaxed);
+    page_metrics.files.store(0, std::memory_order_relaxed);
+    page_metrics.directories.store(0, std::memory_order_relaxed);
+    page_metrics.requested_bytes.store(0, std::memory_order_relaxed);
+    page_metrics.page_latency_ns.store(0, std::memory_order_relaxed);
+    reset_atomic_max(page_metrics.max_page_latency_ns);
+    page_metrics.decode_latency_ns.store(0, std::memory_order_relaxed);
+    reset_atomic_max(page_metrics.max_decode_latency_ns);
 }
 
 NfsAsyncReadLatencySnapshot snapshot_nfs_async_read_latency_metrics() {
@@ -267,6 +334,22 @@ NfsAsyncCommandLatencySnapshot snapshot_nfs_async_command_latency_metrics() {
     snapshot.close_failed = metrics.close_failed.load(std::memory_order_relaxed);
     snapshot.close_latency_ns = metrics.close_latency_ns.load(std::memory_order_relaxed);
     snapshot.close_max_latency_ns = metrics.close_max_latency_ns.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+NfsReaddirplusPageSnapshot snapshot_nfs_readdirplus_page_metrics() {
+    NfsReaddirplusPageMetrics& metrics = nfs_readdirplus_page_metrics();
+    NfsReaddirplusPageSnapshot snapshot;
+    snapshot.pages = metrics.pages.load(std::memory_order_relaxed);
+    snapshot.failed_pages = metrics.failed_pages.load(std::memory_order_relaxed);
+    snapshot.entries = metrics.entries.load(std::memory_order_relaxed);
+    snapshot.files = metrics.files.load(std::memory_order_relaxed);
+    snapshot.directories = metrics.directories.load(std::memory_order_relaxed);
+    snapshot.requested_bytes = metrics.requested_bytes.load(std::memory_order_relaxed);
+    snapshot.page_latency_ns = metrics.page_latency_ns.load(std::memory_order_relaxed);
+    snapshot.max_page_latency_ns = metrics.max_page_latency_ns.load(std::memory_order_relaxed);
+    snapshot.decode_latency_ns = metrics.decode_latency_ns.load(std::memory_order_relaxed);
+    snapshot.max_decode_latency_ns = metrics.max_decode_latency_ns.load(std::memory_order_relaxed);
     return snapshot;
 }
 
@@ -1036,6 +1119,12 @@ struct RawReaddirplusState {
     char cookie_verifier[NFS3_COOKIEVERFSIZE] {};
     FlatFolderScanBatch* batch = nullptr;
     std::string rel_prefix;
+    std::string endpoint;
+    std::chrono::steady_clock::time_point queued_at {};
+    std::size_t requested_bytes = 0;
+    std::size_t entries = 0;
+    std::size_t files = 0;
+    std::size_t directories = 0;
 };
 
 struct AsyncRawHandleReadState {
@@ -1160,13 +1249,23 @@ void generic_nfs_callback(int status, struct nfs_context* nfs, void* data, void*
 
 void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
     (void)rpc;
+    const auto callback_started_at = std::chrono::steady_clock::now();
     auto* state = static_cast<RawReaddirplusState*>(private_data);
-    state->done = true;
     state->status = status;
     if (status != RPC_STATUS_SUCCESS) {
         if (data != nullptr) {
             state->error = static_cast<const char*>(data);
         }
+        const auto callback_finished_at = std::chrono::steady_clock::now();
+        record_readdirplus_page_completed(state->queued_at,
+                                          callback_started_at,
+                                          callback_finished_at,
+                                          state->requested_bytes,
+                                          state->entries,
+                                          state->files,
+                                          state->directories,
+                                          true);
+        state->done = true;
         return;
     }
 
@@ -1175,11 +1274,31 @@ void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, v
         state->status = -EIO;
         state->error = result == nullptr ? "NFS READDIRPLUS returned no result"
                                          : "NFS READDIRPLUS failed with status " + std::to_string(result->status);
+        const auto callback_finished_at = std::chrono::steady_clock::now();
+        record_readdirplus_page_completed(state->queued_at,
+                                          callback_started_at,
+                                          callback_finished_at,
+                                          state->requested_bytes,
+                                          state->entries,
+                                          state->files,
+                                          state->directories,
+                                          true);
+        state->done = true;
         return;
     }
     if (state->batch == nullptr) {
         state->status = -EIO;
         state->error = "NFS READDIRPLUS callback missing output batch";
+        const auto callback_finished_at = std::chrono::steady_clock::now();
+        record_readdirplus_page_completed(state->queued_at,
+                                          callback_started_at,
+                                          callback_finished_at,
+                                          state->requested_bytes,
+                                          state->entries,
+                                          state->files,
+                                          state->directories,
+                                          true);
+        state->done = true;
         return;
     }
 
@@ -1192,6 +1311,7 @@ void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, v
         if (entry_name.empty() || entry_name == "." || entry_name == "..") {
             continue;
         }
+        ++state->entries;
         if (!entry->name_attributes.attributes_follow) {
             continue;
         }
@@ -1211,6 +1331,7 @@ void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, v
                 spec.nfs_handle = copy_nfs_handle(entry->name_handle.post_op_fh3_u.handle);
             }
             state->batch->directories.push_back(std::move(spec));
+            ++state->directories;
             continue;
         }
         if (attr.type != NF3REG) {
@@ -1228,7 +1349,33 @@ void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, v
             spec.nfs_handle = copy_nfs_handle(entry->name_handle.post_op_fh3_u.handle);
         }
         state->batch->files.push_back(std::move(spec));
+        ++state->files;
     }
+    const auto callback_finished_at = std::chrono::steady_clock::now();
+    record_readdirplus_page_completed(state->queued_at,
+                                      callback_started_at,
+                                      callback_finished_at,
+                                      state->requested_bytes,
+                                      state->entries,
+                                      state->files,
+                                      state->directories,
+                                      false);
+    if (nfs_page_trace_enabled()) {
+        const double page_latency_ms =
+            static_cast<double>(steady_latency_ns(state->queued_at, callback_started_at)) / 1'000'000.0;
+        const double decode_latency_ms =
+            static_cast<double>(steady_latency_ns(callback_started_at, callback_finished_at)) / 1'000'000.0;
+        std::cerr << "nfs_readdirplus_page endpoint=" << state->endpoint
+                  << " folder=" << (state->rel_prefix.empty() ? "/" : state->rel_prefix)
+                  << " requested_bytes=" << state->requested_bytes
+                  << " latency_ms=" << page_latency_ms
+                  << " decode_ms=" << decode_latency_ms
+                  << " entries=" << state->entries
+                  << " files=" << state->files
+                  << " directories=" << state->directories
+                  << " eof=" << (state->eof ? 1 : 0) << '\n';
+    }
+    state->done = true;
 }
 
 void stat64_nfs_callback(int status, struct nfs_context* nfs, void* data, void* private_data) {
@@ -3792,7 +3939,8 @@ private:
                                                           std::move(batch),
                                                           should_stop,
                                                           page_visitor,
-                                                          readdirplus_page_bytes_);
+                                                          readdirplus_page_bytes_,
+                                                          session().connection_url());
                     } catch (const std::exception& error) {
                         batch.failed = true;
                         batch.error = std::string(error.what()) + " while reading " + slot.remote_path;
@@ -3823,7 +3971,8 @@ private:
                                                          FlatFolderScanBatch batch,
                                                          const std::function<bool()>& should_stop,
                                                          const std::function<void(FlatFolderScanBatch)>& page_visitor,
-                                                         std::size_t readdirplus_page_bytes) {
+                                                         std::size_t readdirplus_page_bytes,
+                                                         const std::string& endpoint) {
         if (directory == nullptr) {
             batch.failed = true;
             batch.error = "nfs_opendir_async returned no directory handle";
@@ -3832,7 +3981,8 @@ private:
 
         const std::string rel_prefix = normalize_path(batch.folder.rel_path);
         auto* private_directory = reinterpret_cast<LibNfsPrivateDir*>(directory);
-        if (private_directory != nullptr && private_directory->fh.val != nullptr && private_directory->fh.len > 0) {
+        if (page_visitor && private_directory != nullptr && private_directory->fh.val != nullptr &&
+            private_directory->fh.len > 0) {
             nfs_fh3 directory_handle {};
             directory_handle.data.data_len = static_cast<u_int>(private_directory->fh.len);
             directory_handle.data.data_val = private_directory->fh.val;
@@ -3853,6 +4003,9 @@ private:
                 std::memcpy(state.cookie_verifier, cookie_verifier, NFS3_COOKIEVERFSIZE);
                 state.batch = page_visitor ? &page_batch : &batch;
                 state.rel_prefix = rel_prefix;
+                state.endpoint = endpoint;
+                state.queued_at = std::chrono::steady_clock::now();
+                state.requested_bytes = readdirplus_page_bytes;
                 const int queue_result = rpc_nfs_readdirplus_async(nfs_get_rpc_context(nfs),
                                                                    raw_readdirplus_callback,
                                                                    &directory_handle,

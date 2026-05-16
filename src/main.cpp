@@ -61,14 +61,14 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
         << "  hypersync status --socket <path>\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
-        << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--checker-threads <n>] [--checker-request-queue-depth <n>] [--checker-batch-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] diff-target --target <dir|nfs-url> [--listen-host <host>] --port <port> [--compare size|time|content] [--non-recursive] [--target-threads <n>] [--metadata-async-depth <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] diff-source --source <dir|nfs-url> --target-host <host> --port <port> --folder-report <report.csv> [--compare size|time|content] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff-target --target <dir|nfs-url> [--listen-host <host>] --port <port> [--compare size|time|content] [--non-recursive] [--target-threads <n>] [--metadata-async-depth <n>] [--pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff-source --source <dir|nfs-url> --target-host <host> --port <port> --folder-report <report.csv> [--compare size|time|content] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--small-file-threshold-bytes <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
@@ -220,6 +220,10 @@ int main(int argc, char** argv) {
             double max_duration_seconds = 0.0;
             std::uint32_t stats_interval_seconds = 5;
             std::filesystem::path status_socket_path;
+            bool pipeline_autoscale = true;
+            std::string autoscale_profile;
+            std::filesystem::path autoscale_settings_path;
+            std::uint64_t autoscale_interval_ms = 1000;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--source") {
@@ -272,6 +276,23 @@ int main(int argc, char** argv) {
                 } else if (args[i] == "--status-socket") {
                     status_socket_path = require_option(args, i, "--status-socket");
                     metadata_scan = true;
+                } else if (args[i] == "--pipeline-autoscale") {
+                    pipeline_autoscale = true;
+                    metadata_scan = true;
+                } else if (args[i] == "--no-pipeline-autoscale") {
+                    pipeline_autoscale = false;
+                    metadata_scan = true;
+                } else if (args[i] == "--autoscale-profile") {
+                    autoscale_profile = require_option(args, i, "--autoscale-profile");
+                    metadata_scan = true;
+                } else if (args[i] == "--autoscale-settings") {
+                    autoscale_settings_path = require_option(args, i, "--autoscale-settings");
+                    metadata_scan = true;
+                } else if (args[i] == "--autoscale-interval-ms") {
+                    autoscale_interval_ms =
+                        parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
+                                            "--autoscale-interval-ms");
+                    metadata_scan = true;
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -285,7 +306,7 @@ int main(int argc, char** argv) {
             }
 
             const std::string output_extension = output_path.extension().string();
-            if (output_extension == ".parquet" || output_extension == ".txt") {
+            if (output_extension == ".csv" || output_extension == ".parquet" || output_extension == ".txt") {
                 metadata_scan = true;
             }
 
@@ -304,7 +325,11 @@ int main(int argc, char** argv) {
                                                                        record_buffer_slots,
                                                                        1,
                                                                        "single",
-                                                                       status_socket_path);
+                                                                       status_socket_path,
+                                                                       pipeline_autoscale,
+                                                                       autoscale_profile,
+                                                                       autoscale_settings_path,
+                                                                       autoscale_interval_ms);
                 std::cout << "scan_metadata_records files_found=" << report.files_seen
                           << " folders_found=" << report.folders_found
                           << " logical_size_bytes=" << report.logical_size_bytes
@@ -316,6 +341,10 @@ int main(int argc, char** argv) {
                           << " metadata_files_written=" << report.metadata_files_written
                           << " metadata_folders_written=" << report.metadata_folders_written
                           << " scan_run_id=" << report.scan_run_id
+                          << " pipeline_autoscale=" << (report.pipeline_autoscale ? "true" : "false")
+                          << " autoscale_profile=" << report.autoscale_profile
+                          << " autoscale_settings=" << report.autoscale_settings_path.string()
+                          << " learned_meta_reader_threads=" << report.learned_meta_reader_threads
                           << " async_backend=" << (report.meta_reader_async ? "true" : "false")
                           << " elapsed_s=" << report.elapsed_seconds
                           << " output=" << output_path << '\n';
@@ -386,6 +415,10 @@ int main(int argc, char** argv) {
             std::size_t target_threads = 0;
             std::size_t metadata_async_depth = 0;
             std::uint32_t stats_interval_seconds = 5;
+            bool pipeline_autoscale = false;
+            std::string autoscale_profile;
+            std::filesystem::path autoscale_settings_path;
+            std::uint64_t autoscale_interval_ms = 1000;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--target") {
@@ -407,6 +440,15 @@ int main(int argc, char** argv) {
                     stats_interval_seconds = static_cast<std::uint32_t>(
                         parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
                                             "--stats-interval-seconds"));
+                } else if (args[i] == "--pipeline-autoscale") {
+                    pipeline_autoscale = true;
+                } else if (args[i] == "--autoscale-profile") {
+                    autoscale_profile = require_option(args, i, "--autoscale-profile");
+                } else if (args[i] == "--autoscale-settings") {
+                    autoscale_settings_path = require_option(args, i, "--autoscale-settings");
+                } else if (args[i] == "--autoscale-interval-ms") {
+                    autoscale_interval_ms = parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
+                                                                "--autoscale-interval-ms");
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -424,7 +466,11 @@ int main(int argc, char** argv) {
                                                recursive,
                                                target_threads,
                                                metadata_async_depth,
-                                               stats_interval_seconds);
+                                               stats_interval_seconds,
+                                               pipeline_autoscale,
+                                               autoscale_profile,
+                                               autoscale_settings_path,
+                                               autoscale_interval_ms);
             return 0;
         }
 
@@ -439,6 +485,10 @@ int main(int argc, char** argv) {
             std::size_t metadata_async_depth = 0;
             double max_duration_seconds = 0.0;
             std::uint32_t stats_interval_seconds = 5;
+            bool pipeline_autoscale = false;
+            std::string autoscale_profile;
+            std::filesystem::path autoscale_settings_path;
+            std::uint64_t autoscale_interval_ms = 1000;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--source") {
@@ -467,6 +517,15 @@ int main(int argc, char** argv) {
                     stats_interval_seconds = static_cast<std::uint32_t>(
                         parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
                                             "--stats-interval-seconds"));
+                } else if (args[i] == "--pipeline-autoscale") {
+                    pipeline_autoscale = true;
+                } else if (args[i] == "--autoscale-profile") {
+                    autoscale_profile = require_option(args, i, "--autoscale-profile");
+                } else if (args[i] == "--autoscale-settings") {
+                    autoscale_settings_path = require_option(args, i, "--autoscale-settings");
+                } else if (args[i] == "--autoscale-interval-ms") {
+                    autoscale_interval_ms = parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
+                                                                "--autoscale-interval-ms");
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -492,7 +551,11 @@ int main(int argc, char** argv) {
                                                                    meta_reader_threads,
                                                                    metadata_async_depth,
                                                                    max_duration_seconds,
-                                                                   stats_interval_seconds);
+                                                                   stats_interval_seconds,
+                                                                   pipeline_autoscale,
+                                                                   autoscale_profile,
+                                                                   autoscale_settings_path,
+                                                                   autoscale_interval_ms);
             std::cout << "distributed_diff"
                       << " folders_sent=" << report.folders_sent
                       << " folders_reported=" << report.folders_reported
@@ -1094,6 +1157,10 @@ int main(int argc, char** argv) {
             double max_duration_seconds = 0.0;
             std::uint32_t stats_interval_seconds = 5;
             std::filesystem::path status_socket_path;
+            bool pipeline_autoscale = true;
+            std::string autoscale_profile;
+            std::filesystem::path autoscale_settings_path;
+            std::uint64_t autoscale_interval_ms = 1000;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--source") {
@@ -1141,6 +1208,18 @@ int main(int argc, char** argv) {
                                             "--stats-interval-seconds"));
                 } else if (args[i] == "--status-socket") {
                     status_socket_path = require_option(args, i, "--status-socket");
+                } else if (args[i] == "--pipeline-autoscale") {
+                    pipeline_autoscale = true;
+                } else if (args[i] == "--no-pipeline-autoscale") {
+                    pipeline_autoscale = false;
+                } else if (args[i] == "--autoscale-profile") {
+                    autoscale_profile = require_option(args, i, "--autoscale-profile");
+                } else if (args[i] == "--autoscale-settings") {
+                    autoscale_settings_path = require_option(args, i, "--autoscale-settings");
+                } else if (args[i] == "--autoscale-interval-ms") {
+                    autoscale_interval_ms =
+                        parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
+                                            "--autoscale-interval-ms");
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -1164,7 +1243,11 @@ int main(int argc, char** argv) {
                                                                    record_buffer_slots,
                                                                    metadata_output_partitions,
                                                                    metadata_output_partition_mode,
-                                                                   status_socket_path);
+                                                                   status_socket_path,
+                                                                   pipeline_autoscale,
+                                                                   autoscale_profile,
+                                                                   autoscale_settings_path,
+                                                                   autoscale_interval_ms);
             std::cout << "files_seen=" << report.files_seen
                       << " checker_emitted=" << report.checker_emitted
                       << " checker_discarded=" << report.checker_discarded
@@ -1179,6 +1262,10 @@ int main(int argc, char** argv) {
                       << " metadata_folders_written=" << report.metadata_folders_written
                       << " metadata_output_partitions=" << report.metadata_output_partitions
                       << " scan_run_id=" << report.scan_run_id
+                      << " pipeline_autoscale=" << (report.pipeline_autoscale ? "true" : "false")
+                      << " autoscale_profile=" << report.autoscale_profile
+                      << " autoscale_settings=" << report.autoscale_settings_path.string()
+                      << " learned_meta_reader_threads=" << report.learned_meta_reader_threads
                       << " async_backend=" << (report.meta_reader_async ? "true" : "false")
                       << " elapsed_s=" << report.elapsed_seconds << '\n';
             return 0;
@@ -1193,6 +1280,17 @@ int main(int argc, char** argv) {
             std::size_t data_reader_threads = 0;
             std::size_t data_outstanding_requests = 0;
             std::size_t small_file_async_window = 0;
+            bool split_small_large = false;
+            std::uint64_t split_small_file_threshold = 0;
+            std::size_t small_data_reader_threads = 0;
+            std::size_t large_data_reader_threads = 0;
+            std::size_t large_data_outstanding_requests = 0;
+            bool pipeline_autoscale = false;
+            bool large_reader_autoscale = false;
+            std::size_t large_reader_initial_threads = 0;
+            std::uint64_t autoscale_interval_ms = 1000;
+            std::string autoscale_profile;
+            std::filesystem::path autoscale_settings_path;
             std::uint64_t max_file_size_bytes = 0;
             std::size_t max_files_queued = 1024;
             std::size_t data_buffer_slots = 0;
@@ -1232,6 +1330,39 @@ int main(int argc, char** argv) {
                     small_file_async_window =
                         parse_size_t_option(require_option(args, i, "--small-file-async-window"),
                                             "--small-file-async-window");
+                } else if (args[i] == "--split-small-large") {
+                    split_small_large = true;
+                } else if (args[i] == "--split-small-file-threshold" ||
+                           args[i] == "--small-file-threshold-bytes") {
+                    split_small_file_threshold =
+                        parse_size_t_option(require_option(args, i, args[i]), args[i]);
+                } else if (args[i] == "--small-data-reader-threads") {
+                    small_data_reader_threads =
+                        parse_size_t_option(require_option(args, i, "--small-data-reader-threads"),
+                                            "--small-data-reader-threads");
+                } else if (args[i] == "--large-data-reader-threads") {
+                    large_data_reader_threads =
+                        parse_size_t_option(require_option(args, i, "--large-data-reader-threads"),
+                                            "--large-data-reader-threads");
+                } else if (args[i] == "--large-data-outstanding-requests") {
+                    large_data_outstanding_requests =
+                        parse_size_t_option(require_option(args, i, "--large-data-outstanding-requests"),
+                                            "--large-data-outstanding-requests");
+                } else if (args[i] == "--pipeline-autoscale") {
+                    pipeline_autoscale = true;
+                } else if (args[i] == "--large-reader-autoscale") {
+                    large_reader_autoscale = true;
+                } else if (args[i] == "--large-reader-initial-threads") {
+                    large_reader_initial_threads =
+                        parse_size_t_option(require_option(args, i, "--large-reader-initial-threads"),
+                                            "--large-reader-initial-threads");
+                } else if (args[i] == "--autoscale-interval-ms") {
+                    autoscale_interval_ms = parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
+                                                                "--autoscale-interval-ms");
+                } else if (args[i] == "--autoscale-profile") {
+                    autoscale_profile = require_option(args, i, "--autoscale-profile");
+                } else if (args[i] == "--autoscale-settings") {
+                    autoscale_settings_path = require_option(args, i, "--autoscale-settings");
                 } else if (args[i] == "--max-file-size-bytes") {
                     max_file_size_bytes =
                         parse_size_t_option(require_option(args, i, "--max-file-size-bytes"),
@@ -1279,6 +1410,17 @@ int main(int argc, char** argv) {
                                                                     data_reader_threads,
                                                                     data_outstanding_requests,
                                                                     small_file_async_window,
+                                                                    split_small_large,
+                                                                    split_small_file_threshold,
+                                                                    small_data_reader_threads,
+                                                                    large_data_reader_threads,
+                                                                    large_data_outstanding_requests,
+                                                                    pipeline_autoscale,
+                                                                    large_reader_autoscale,
+                                                                    large_reader_initial_threads,
+                                                                    autoscale_interval_ms,
+                                                                    autoscale_profile,
+                                                                    autoscale_settings_path,
                                                                     max_file_size_bytes,
                                                                     max_files_queued,
                                                                     data_buffer_slots,
@@ -1294,14 +1436,36 @@ int main(int argc, char** argv) {
                       << " files_failed=" << report.files_failed
                       << " logical_size_bytes=" << report.logical_size_bytes
                       << " bytes_read=" << report.bytes_read
+                      << " small_files_found=" << report.small_files_found
+                      << " large_files_found=" << report.large_files_found
+                      << " small_files_read=" << report.small_files_read
+                      << " large_files_read=" << report.large_files_read
+                      << " small_bytes_read=" << report.small_bytes_read
+                      << " large_bytes_read=" << report.large_bytes_read
                       << " bytes_per_second=" << report.bytes_per_second
                       << " gigabits_per_second=" << report.gigabits_per_second
+                      << " files_per_second=" << report.files_per_second
+                      << " small_files_per_second=" << report.small_files_per_second
+                      << " large_files_per_second=" << report.large_files_per_second
+                      << " small_gigabits_per_second=" << report.small_gigabits_per_second
+                      << " large_gigabits_per_second=" << report.large_gigabits_per_second
                       << " meta_reader_threads=" << report.meta_reader_threads
                       << " metadata_async_depth=" << report.metadata_async_depth
                       << " readdirplus_page_bytes=" << report.readdirplus_page_bytes
                       << " data_reader_threads=" << report.data_reader_threads
                       << " data_outstanding_requests=" << report.data_outstanding_requests
                       << " small_file_async_window=" << report.small_file_async_window
+                      << " split_small_large=" << (report.split_small_large ? "true" : "false")
+                      << " split_small_file_threshold=" << report.split_small_file_threshold
+                      << " small_data_reader_threads=" << report.small_data_reader_threads
+                      << " large_data_reader_threads=" << report.large_data_reader_threads
+                      << " large_data_outstanding_requests=" << report.large_data_outstanding_requests
+                      << " pipeline_autoscale=" << (report.pipeline_autoscale ? "true" : "false")
+                      << " large_reader_autoscale=" << (report.large_reader_autoscale ? "true" : "false")
+                      << " large_reader_initial_threads=" << report.large_reader_initial_threads
+                      << " autoscale_interval_ms=" << report.autoscale_interval_ms
+                      << " autoscale_profile=" << report.autoscale_profile
+                      << " autoscale_settings=" << report.autoscale_settings_path.string()
                       << " max_file_size_bytes=" << report.max_file_size_bytes
                       << " max_files_queued=" << report.max_files_queued
                       << " data_buffer_slots=" << report.data_buffer_slots

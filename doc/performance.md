@@ -1636,3 +1636,48 @@ from 30s through 170s, so this was no longer metadata starvation; during the
 middle of the run, the data reader/libnfs/backend path was the limiter. The last
 minute tailed down as the timer stopped new metadata work and the queued small
 files drained.
+
+Split small/large stream smoke, 2026-05-15
+------------------------------------------
+
+Purpose: verify the new classifier and independent small/large reader streams
+under real libnfs before wiring priority transport into production sync.
+
+Source:
+`nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+
+Settings:
+
+```text
+taskset                         0-79
+meta_reader_threads             64
+metadata_async_depth            256
+readdirplus_page_bytes          262144
+split_small_large               true
+small_file_threshold_bytes      131072
+small_data_reader_threads       96
+small_file_async_window         1
+large_data_reader_threads       32
+large_data_outstanding_requests 2
+max_files_queued                1048576 per stream
+data_buffer_slots               24576
+data_queue_depth                12288 per stream
+duration                        60 s useful sample, outer timeout during drain
+```
+
+Useful 60-second sample:
+
+```text
+elapsed_s  Gbit/s  bytes_read  small_files_read  large_files_read  small_bytes  large_bytes  queued_small  queued_large
+10         61.08   76.36 GB    138,196           33,526            5.45 GB      70.91 GB     0             1,048,576
+20         53.69   134.23 GB   144,995           59,631            5.79 GB      128.44 GB    0             1,048,576
+30         53.73   201.50 GB   159,606           88,434            6.76 GB      194.74 GB    0             1,048,576
+40         59.08   295.43 GB   160,162           106,065           6.77 GB      288.65 GB    0             1,048,576
+50         60.67   379.17 GB   161,019           118,319           6.84 GB      372.33 GB    0             1,048,576
+60         60.12   450.90 GB   183,531           137,465           8.58 GB      442.32 GB    0             0
+```
+
+Interpretation: this tree segment was large-file dominated, so bandwidth came
+mostly from the large stream. The small queue stayed drained while large work
+backlogged, which confirms the stream split and small-first priority shape. The
+run is a smoke test, not a final tuning result.

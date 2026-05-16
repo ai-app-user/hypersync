@@ -373,6 +373,53 @@ class ScenarioWorld:
             env=self.gcov_env(f"benchmark_hash_{len(self.results)}"),
         )
 
+    def run_pipeline_autoscale_data_benchmark(self) -> CommandResult:
+        if self.source_dir is None:
+            raise StepFailure("source tree is not configured before data benchmark")
+        args = [
+            str(self.app),
+            "benchmark-data",
+            "--source",
+            str(self.source_dir),
+            "--split-small-large",
+            "--small-file-threshold-bytes",
+            "4096",
+            "--meta-reader-threads",
+            "1",
+            "--metadata-async-depth",
+            "4",
+            "--data-reader-threads",
+            "1",
+            "--small-data-reader-threads",
+            "4",
+            "--large-data-reader-threads",
+            "4",
+            "--large-data-outstanding-requests",
+            "1",
+            "--pipeline-autoscale",
+            "--autoscale-interval-ms",
+            "5",
+            "--autoscale-profile",
+            "gherkin_pipeline_autoscale",
+            "--autoscale-settings",
+            str(self.temp_root / "autoscale.yaml"),
+            "--max-files-queued",
+            "64",
+            "--data-buffer-slots",
+            "64",
+            "--data-queue-depth",
+            "32",
+            "--max-duration-seconds",
+            "10",
+            "--stats-interval-seconds",
+            "1",
+        ]
+        return self.run_command(
+            "benchmark-data-pipeline-autoscale",
+            args,
+            env=self.gcov_env(f"benchmark_data_autoscale_{len(self.results)}"),
+        )
+
 
 StepHandler = typing.Callable[[ScenarioWorld, Step, re.Match[str]], None]
 STEP_HANDLERS: list[tuple[re.Pattern[str], StepHandler]] = []
@@ -667,6 +714,12 @@ def when_hash_speed_benchmarks(world: ScenarioWorld, step_data: Step, match: re.
     del match
     for row in step_data.table:
         world.run_hash_speed_benchmark(row)
+
+
+@step(r"^I run a pipeline autoscale data benchmark$")
+def when_pipeline_autoscale_data_benchmark(world: ScenarioWorld, step_data: Step, match: re.Match[str]) -> None:
+    del step_data, match
+    world.run_pipeline_autoscale_data_benchmark()
 
 
 @step(r"^the latest command should succeed$")

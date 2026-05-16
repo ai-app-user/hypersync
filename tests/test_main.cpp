@@ -39,6 +39,13 @@ using hypersync::BufferGeneratorPattern;
 using hypersync::BufferReceiverJob;
 using hypersync::BufferSenderJob;
 using hypersync::BufferTransportEndpoint;
+using hypersync::AutoScaleDecision;
+using hypersync::AutoScaleMetrics;
+using hypersync::AutoScalePolicy;
+using hypersync::AutoScaleProfileStore;
+using hypersync::AutoScaler;
+using hypersync::JobAutoScaleRunner;
+using hypersync::PipelineAutoScaleRunner;
 using hypersync::RawBufferPool;
 using hypersync::ShardedBufQueue;
 using hypersync::Checker;
@@ -620,6 +627,194 @@ void test_threaded_job_runtime_metrics_report_wait_states() {
     EXPECT_TRUE(rendered.find("now=wait_input:1") != std::string::npos);
 
     discarder.stop();
+}
+
+void test_autoscaler_recommends_cooperative_worker_limits() {
+    AutoScalePolicy policy;
+    policy.enabled = true;
+    policy.min_workers = 2;
+    policy.max_workers = 16;
+    policy.initial_workers = 4;
+    policy.cooldown_samples = 1;
+    policy.max_cooldown_samples = 1;
+    policy.backoff_confirmation_samples = 1;
+    AutoScaler scaler(policy);
+    EXPECT_EQ(scaler.active_workers(), 4U);
+
+    AutoScaleMetrics pressure;
+    pressure.input_fullness = 0.95;
+    pressure.output_fullness = 0.10;
+    pressure.busy_ratio = 0.90;
+    pressure.throughput_per_second = 1000.0;
+    AutoScaleDecision decision = scaler.update(pressure);
+    EXPECT_TRUE(decision.changed);
+    EXPECT_EQ(decision.active_workers, 8U);
+
+    pressure.throughput_per_second = 400.0;
+    decision = scaler.update(pressure);
+    EXPECT_TRUE(decision.changed);
+    EXPECT_EQ(decision.active_workers, 16U);
+
+    AutoScaleMetrics output_blocked;
+    output_blocked.input_fullness = 0.90;
+    output_blocked.output_fullness = 0.98;
+    output_blocked.busy_ratio = 0.90;
+    output_blocked.throughput_per_second = 300.0;
+    decision = scaler.update(output_blocked);
+    EXPECT_TRUE(decision.changed);
+    EXPECT_TRUE(decision.active_workers < 16U);
+
+    RawBufferPool raw_pool(81U, 1U, 128U);
+    BufferPoolRegistry registry;
+    registry.register_pool(raw_pool);
+    BufQueue input(2U);
+    BufferDiscarderJob discarder(BufferDiscarderConfig(4U), input, registry);
+    EXPECT_EQ(discarder.worker_count(), 4U);
+    EXPECT_EQ(discarder.set_active_worker_limit(2U), 2U);
+    EXPECT_EQ(discarder.active_worker_limit(), 2U);
+    EXPECT_EQ(discarder.set_active_worker_limit(100U), 4U);
+    EXPECT_EQ(discarder.set_active_worker_limit(0U), 1U);
+
+    AutoScalePolicy runner_policy = policy;
+    runner_policy.initial_workers = 2;
+    std::atomic<bool> callback_seen {false};
+    JobAutoScaleRunner runner(discarder,
+                              runner_policy,
+                              [] {
+                                  AutoScaleMetrics metrics;
+                                  metrics.input_fullness = 0.95;
+                                  metrics.output_fullness = 0.0;
+                                  metrics.busy_ratio = 0.95;
+                                  metrics.throughput_per_second = 10.0;
+                                  return metrics;
+                              },
+                              std::chrono::milliseconds(5));
+    runner.set_decision_callback([&callback_seen](const AutoScaleDecision& decision) {
+        if (decision.changed) {
+            callback_seen.store(true, std::memory_order_release);
+        }
+    });
+    runner.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!callback_seen.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    runner.stop();
+    EXPECT_TRUE(callback_seen.load(std::memory_order_acquire));
+    EXPECT_TRUE(discarder.active_worker_limit() > 2U);
+}
+
+void test_pipeline_autoscaler_tunes_one_stage_then_advances() {
+    RawBufferPool raw_pool(82U, 1U, 128U);
+    BufferPoolRegistry registry;
+    registry.register_pool(raw_pool);
+    BufQueue input_a(2U);
+    BufQueue input_b(2U);
+    BufferDiscarderJob first(BufferDiscarderConfig(8U), input_a, registry);
+    BufferDiscarderJob second(BufferDiscarderConfig(8U), input_b, registry);
+
+    AutoScalePolicy policy;
+    policy.enabled = true;
+    policy.min_workers = 2;
+    policy.max_workers = 8;
+    policy.initial_workers = 2;
+    policy.cooldown_samples = 1;
+    policy.scale_up_input_fullness = 0.25;
+    policy.busy_scale_up = 0.25;
+    policy.min_improvement_ratio = 0.05;
+
+    std::atomic<std::uint64_t> first_samples {0};
+    std::atomic<std::uint64_t> second_samples {0};
+    std::atomic<bool> advanced_to_second {false};
+    std::atomic<bool> second_scaled {false};
+
+    PipelineAutoScaleRunner runner(
+        std::vector<PipelineAutoScaleRunner::Stage> {
+            PipelineAutoScaleRunner::Stage {
+                "first",
+                &first,
+                policy,
+                [&first_samples] {
+                    const std::uint64_t sample = first_samples.fetch_add(1, std::memory_order_relaxed);
+                    AutoScaleMetrics metrics;
+                    metrics.input_fullness = 0.95;
+                    metrics.output_fullness = 0.0;
+                    metrics.busy_ratio = 0.95;
+                    metrics.throughput_per_second = sample == 0U ? 100.0 : 50.0;
+                    return metrics;
+                },
+            },
+            PipelineAutoScaleRunner::Stage {
+                "second",
+                &second,
+                policy,
+                [&second_samples] {
+                    const std::uint64_t sample = second_samples.fetch_add(1, std::memory_order_relaxed);
+                    AutoScaleMetrics metrics;
+                    metrics.input_fullness = 0.95;
+                    metrics.output_fullness = 0.0;
+                    metrics.busy_ratio = 0.95;
+                    metrics.throughput_per_second = 100.0 + static_cast<double>(sample) * 10.0;
+                    return metrics;
+                },
+            },
+        },
+        std::chrono::milliseconds(5));
+
+    runner.set_decision_callback([&](const PipelineAutoScaleRunner::StageDecision& decision) {
+        if (decision.stage_advanced) {
+            advanced_to_second.store(true, std::memory_order_release);
+        }
+        if (decision.stage_index == 1U && decision.decision.changed &&
+            decision.decision.active_workers > 2U) {
+            second_scaled.store(true, std::memory_order_release);
+        }
+    });
+    runner.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while ((!advanced_to_second.load(std::memory_order_acquire) ||
+            !second_scaled.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    runner.stop();
+
+    EXPECT_TRUE(advanced_to_second.load(std::memory_order_acquire));
+    EXPECT_TRUE(second_scaled.load(std::memory_order_acquire));
+    EXPECT_EQ(runner.active_stage_index(), 1U);
+    EXPECT_EQ(first.active_worker_limit(), 8U);
+    EXPECT_TRUE(second.active_worker_limit() > 2U);
+}
+
+void test_autoscale_profile_store_defaults_and_persists_learned_workers() {
+    TempDir root("autoscale_profile_store");
+    const fs::path profile_path = root.path / "autoscale.yaml";
+
+    AutoScaleProfileStore store(profile_path);
+    AutoScalePolicy unknown_policy = store.job_policy("scan_pipeline", "unknown_reader", 0U);
+    EXPECT_TRUE(unknown_policy.enabled);
+    EXPECT_EQ(unknown_policy.min_workers, 1U);
+    EXPECT_EQ(unknown_policy.initial_workers, 1U);
+    EXPECT_TRUE(unknown_policy.max_workers >= 1U);
+
+    AutoScalePolicy capped_policy = store.job_policy("scan_pipeline", "capped_reader", 4U);
+    EXPECT_EQ(capped_policy.max_workers, 4U);
+
+    store.update_learned_workers("scan_pipeline", "unknown_reader", 17U);
+    store.save();
+
+    AutoScaleProfileStore reloaded(profile_path);
+    AutoScalePolicy learned_policy = reloaded.job_policy("scan_pipeline", "unknown_reader", 64U);
+    EXPECT_EQ(learned_policy.initial_workers, 17U);
+    EXPECT_TRUE(learned_policy.enabled);
+
+    std::ifstream input(profile_path);
+    std::stringstream contents;
+    contents << input.rdbuf();
+    EXPECT_TRUE(contents.str().find("autoscale_profiles:") != std::string::npos);
+    EXPECT_TRUE(contents.str().find("learned_workers: 17") != std::string::npos);
+    EXPECT_TRUE(contents.str().find("max_workers: auto") != std::string::npos);
 }
 
 void test_periodic_status_reporter_reuses_status_registry() {
@@ -4180,6 +4375,15 @@ int main(int argc, char** argv) {
         {"threaded_job_runtime_metrics_report_wait_states",
          TestSuite::unit,
          test_threaded_job_runtime_metrics_report_wait_states},
+        {"autoscaler_recommends_cooperative_worker_limits",
+         TestSuite::unit,
+         test_autoscaler_recommends_cooperative_worker_limits},
+        {"pipeline_autoscaler_tunes_one_stage_then_advances",
+         TestSuite::unit,
+         test_pipeline_autoscaler_tunes_one_stage_then_advances},
+        {"autoscale_profile_store_defaults_and_persists_learned_workers",
+         TestSuite::unit,
+         test_autoscale_profile_store_defaults_and_persists_learned_workers},
         {"periodic_status_reporter_reuses_status_registry",
          TestSuite::unit,
          test_periodic_status_reporter_reuses_status_registry},
