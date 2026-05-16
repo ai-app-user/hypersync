@@ -1763,3 +1763,65 @@ metadata stream is sequential by cookie and tied to the chosen endpoint/backend
 owner. The next optimization should choose or rotate metadata endpoints for
 wide-folder streaming, and for large recursive scans record per-endpoint
 READDIRPLUS latency so slow metadata lanes are visible.
+
+Small-file reservoir retest, 2026-05-16
+---------------------------------------
+
+Purpose: verify that more parallel metadata scanners plus a deeper file-handle
+reservoir can hide READDIRPLUS endpoint/backend jitter and keep the small-file
+reader fed.
+
+Build/deploy:
+
+```text
+build host      transfer1
+deploy path     /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-transfer1-20260516T181839Z
+hypersync git   f555d3027b9b3d75a1852a87bcefb65e5845a7ce
+piper git       f1aecb4b5025b410082c572e894ba55ac95abea8
+```
+
+Common settings:
+
+```text
+source                    nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+taskset                   0-79
+metadata_async_depth      256
+readdirplus_page_bytes    262144
+data_reader_threads       96
+data_outstanding_requests 1
+small_file_async_window   1
+max_file_size_bytes       131072
+max_files_queued          5000000
+data_buffer_slots         12288
+data_queue_depth          12288
+duration                  90 seconds useful sample, then drain/tail
+```
+
+Results:
+
+```text
+meta threads  30s files/s  60s files/s  90s files/s  queued_files behavior
+64            37,778       31,366       34,356       mostly empty
+96            46,687       43,131       42,854       built ~459K reservoir, drained by 90s
+128           50,814       54,067       55,160       filled 5M reservoir through 60s
+160           50,032       52,624       53,298       filled 5M reservoir through 60s
+```
+
+Recommendation for transfer1 small-file read benchmark profile:
+
+```text
+meta_reader_threads       128
+metadata_async_depth      256
+readdirplus_page_bytes    262144
+data_reader_threads       96
+data_outstanding_requests 1
+small_file_async_window   1
+max_files_queued          5000000
+```
+
+Interpretation: the deeper reservoir and 128 metadata scanners restored the old
+50K+ files/s target. Increasing to 160 did not materially improve throughput and
+raised metadata page latency, so 128 is the better default for this profile.
+This validates the asymmetric reservoir approach: let fast metadata branches
+stockpile file handles so slow READDIRPLUS branches do not immediately starve
+the data readers.
