@@ -275,6 +275,11 @@ struct SplitDataReadFileQueues {
     std::uint64_t small_file_threshold = 128U * 1024U;
 };
 
+enum class SplitDataReadRoute {
+    Small,
+    Large,
+};
+
 struct SplitDataReadAutoscaleConfig {
     bool pipeline_enabled = false;
     bool large_enabled = false;
@@ -5425,6 +5430,72 @@ void record_split_data_read_metadata_batch(bool recursive,
     }
 }
 
+void record_filtered_split_data_read_metadata_batch(bool recursive,
+                                                    FlatMetadataWorkQueue& folder_queue,
+                                                    DataReadFileQueue& file_queue,
+                                                    std::uint64_t small_file_threshold,
+                                                    SplitDataReadRoute route,
+                                                    DataReadBenchmarkStats& stats,
+                                                    FlatFolderScanBatch batch) {
+    if (batch.failed) {
+        std::cerr << "metadata scan skipped folder '"
+                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+        if (batch.folder.rel_path.empty()) {
+            const std::string message =
+                batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
+            const auto error = std::make_exception_ptr(std::runtime_error(message));
+            fail_flat_folder_work(folder_queue, error);
+            fail_data_file_work(file_queue, error);
+            return;
+        }
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        return;
+    }
+
+    std::vector<FileSpec> files_to_read;
+    files_to_read.reserve(batch.files.size());
+    std::uint64_t logical_size_bytes = 0;
+    for (auto& file : batch.files) {
+        const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
+        const bool small_file = logical_size <= small_file_threshold;
+        if ((route == SplitDataReadRoute::Small && small_file) ||
+            (route == SplitDataReadRoute::Large && !small_file)) {
+            logical_size_bytes += logical_size;
+            files_to_read.push_back(std::move(file));
+        }
+    }
+
+    std::vector<FileSpec> child_work;
+    if (recursive && !flat_metadata_scan_should_stop(folder_queue)) {
+        child_work.reserve(batch.directories.size());
+        for (auto& directory : batch.directories) {
+            directory.rel_path = normalize_path(directory.rel_path);
+            child_work.push_back(directory);
+        }
+    }
+
+    record_data_read_metadata(stats, files_to_read.size(), batch.directories.size(), logical_size_bytes);
+    if (route == SplitDataReadRoute::Small) {
+        stats.small_files_found.fetch_add(files_to_read.size(), std::memory_order_relaxed);
+    } else {
+        stats.large_files_found.fetch_add(files_to_read.size(), std::memory_order_relaxed);
+    }
+
+    if (!enqueue_data_read_files(file_queue, std::move(files_to_read))) {
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        return;
+    }
+    enqueue_flat_folder_work(folder_queue, std::move(child_work));
+    if (batch.complete) {
+        finish_flat_folder_work(folder_queue);
+    }
+}
+
 void scan_data_read_metadata_worker(const std::string& source_root,
                                     bool recursive,
                                     std::size_t async_directory_depth,
@@ -5489,6 +5560,47 @@ void scan_split_data_read_metadata_worker(const std::string& source_root,
         fail_flat_folder_work(folder_queue, error);
         fail_data_file_work(file_queues.small, error);
         fail_data_file_work(file_queues.large, error);
+    }
+}
+
+void scan_filtered_split_data_read_metadata_worker(const std::string& source_root,
+                                                   bool recursive,
+                                                   std::size_t async_directory_depth,
+                                                   std::size_t readdirplus_page_bytes,
+                                                   FlatMetadataWorkQueue& folder_queue,
+                                                   DataReadFileQueue& file_queue,
+                                                   std::uint64_t small_file_threshold,
+                                                   SplitDataReadRoute route,
+                                                   DataReadBenchmarkStats& stats) {
+    auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
+    try {
+        backend->scan_flat_folders_streaming(
+            async_directory_depth,
+            [&folder_queue](bool wait_for_work) {
+                return take_flat_folder_work(folder_queue, wait_for_work);
+            },
+            [&folder_queue, &file_queue] {
+                return flat_metadata_scan_should_stop(folder_queue) ||
+                       data_read_timer_expired(file_queue);
+            },
+            [recursive,
+             &folder_queue,
+             &file_queue,
+             small_file_threshold,
+             route,
+             &stats](FlatFolderScanBatch batch) {
+                record_filtered_split_data_read_metadata_batch(recursive,
+                                                               folder_queue,
+                                                               file_queue,
+                                                               small_file_threshold,
+                                                               route,
+                                                               stats,
+                                                               std::move(batch));
+            });
+    } catch (...) {
+        const std::exception_ptr error = std::current_exception();
+        fail_flat_folder_work(folder_queue, error);
+        fail_data_file_work(file_queue, error);
     }
 }
 
@@ -5830,6 +5942,11 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                                             NfsDataReaderConfig large_data_config,
                                                             std::uint64_t small_file_threshold,
                                                             std::size_t max_files_queued,
+                                                            std::size_t small_max_files_queued,
+                                                            std::size_t large_max_files_queued,
+                                                            bool dual_scan_small_large,
+                                                            std::size_t small_meta_reader_threads,
+                                                            std::size_t large_meta_reader_threads,
                                                             std::size_t data_buffer_slots,
                                                             std::size_t data_queue_depth,
                                                             double max_duration_seconds,
@@ -5838,9 +5955,17 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                                             const std::filesystem::path& status_socket_path) {
     FlatMetadataWorkQueue folder_queue;
     folder_queue.folders.push_back(FileSpec{});
+    FlatMetadataWorkQueue small_folder_queue;
+    FlatMetadataWorkQueue large_folder_queue;
+    if (dual_scan_small_large) {
+        small_folder_queue.folders.push_back(FileSpec{});
+        large_folder_queue.folders.push_back(FileSpec{});
+    }
     SplitDataReadFileQueues file_queues;
-    file_queues.small.max_entries = std::max<std::size_t>(1, max_files_queued);
-    file_queues.large.max_entries = std::max<std::size_t>(1, max_files_queued);
+    file_queues.small.max_entries =
+        std::max<std::size_t>(1, small_max_files_queued == 0U ? max_files_queued : small_max_files_queued);
+    file_queues.large.max_entries =
+        std::max<std::size_t>(1, large_max_files_queued == 0U ? max_files_queued : large_max_files_queued);
     file_queues.small_file_threshold = small_file_threshold == 0U ? 128U * 1024U : small_file_threshold;
 
     DataReadBenchmarkStats stats;
@@ -5853,6 +5978,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     const std::size_t outstanding = std::max<std::size_t>(1, small_data_config.outstanding_requests) +
                                     std::max<std::size_t>(1, large_data_config.outstanding_requests);
     const std::size_t metadata_threads = std::max<std::size_t>(1, meta_config.worker_count);
+    const std::size_t small_metadata_threads =
+        std::max<std::size_t>(1, small_meta_reader_threads == 0U ? metadata_threads : small_meta_reader_threads);
+    const std::size_t large_metadata_threads =
+        std::max<std::size_t>(1, large_meta_reader_threads == 0U ? metadata_threads : large_meta_reader_threads);
     const std::size_t total_reader_threads = small_threads + large_threads;
     const std::size_t queue_depth =
         std::max<std::size_t>(1, data_queue_depth == 0 ? total_reader_threads * outstanding * 2U
@@ -6101,6 +6230,18 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         status_registry.register_queue("large_file_work_queue", [&file_queues]() {
             return monitor_data_file_queue("large_file_work_queue", file_queues.large);
         });
+        if (dual_scan_small_large) {
+            status_registry.register_queue("small_folder_work_queue", [&small_folder_queue]() {
+                return monitor_flat_folder_queue("small_folder_work_queue", small_folder_queue);
+            });
+            status_registry.register_queue("large_folder_work_queue", [&large_folder_queue]() {
+                return monitor_flat_folder_queue("large_folder_work_queue", large_folder_queue);
+            });
+        } else {
+            status_registry.register_queue("folder_work_queue", [&folder_queue]() {
+                return monitor_flat_folder_queue("folder_work_queue", folder_queue);
+            });
+        }
         status_registry.register_queue("small_reader_output", [&small_reader_to_discard]() {
             return monitor_buf_queue("small_reader_output", small_reader_to_discard);
         });
@@ -6119,6 +6260,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                              std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                  std::chrono::duration<double>(max_duration_seconds));
         folder_queue.stop_at = stop_at;
+        small_folder_queue.stop_at = stop_at;
+        large_folder_queue.stop_at = stop_at;
         file_queues.small.stop_at = stop_at;
         file_queues.large.stop_at = stop_at;
     }
@@ -6136,6 +6279,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
             });
             if (!cancelled) {
                 request_flat_folder_stop(folder_queue);
+                request_flat_folder_stop(small_folder_queue);
+                request_flat_folder_stop(large_folder_queue);
                 request_data_file_stop(file_queues.small);
                 request_data_file_stop(file_queues.large);
             }
@@ -6188,16 +6333,44 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     }
 
     std::vector<std::thread> metadata_workers;
-    metadata_workers.reserve(metadata_threads);
-    for (std::size_t index = 0; index < metadata_threads; ++index) {
-        metadata_workers.emplace_back(scan_split_data_read_metadata_worker,
-                                      meta_config.source_root,
-                                      meta_config.recursive,
-                                      std::max<std::size_t>(1, meta_config.async_directory_depth),
-                                      meta_config.readdirplus_page_bytes,
-                                      std::ref(folder_queue),
-                                      std::ref(file_queues),
-                                      std::ref(stats));
+    if (dual_scan_small_large) {
+        metadata_workers.reserve(small_metadata_threads + large_metadata_threads);
+        for (std::size_t index = 0; index < small_metadata_threads; ++index) {
+            metadata_workers.emplace_back(scan_filtered_split_data_read_metadata_worker,
+                                          meta_config.source_root,
+                                          meta_config.recursive,
+                                          std::max<std::size_t>(1, meta_config.async_directory_depth),
+                                          meta_config.readdirplus_page_bytes,
+                                          std::ref(small_folder_queue),
+                                          std::ref(file_queues.small),
+                                          file_queues.small_file_threshold,
+                                          SplitDataReadRoute::Small,
+                                          std::ref(stats));
+        }
+        for (std::size_t index = 0; index < large_metadata_threads; ++index) {
+            metadata_workers.emplace_back(scan_filtered_split_data_read_metadata_worker,
+                                          meta_config.source_root,
+                                          meta_config.recursive,
+                                          std::max<std::size_t>(1, meta_config.async_directory_depth),
+                                          meta_config.readdirplus_page_bytes,
+                                          std::ref(large_folder_queue),
+                                          std::ref(file_queues.large),
+                                          file_queues.small_file_threshold,
+                                          SplitDataReadRoute::Large,
+                                          std::ref(stats));
+        }
+    } else {
+        metadata_workers.reserve(metadata_threads);
+        for (std::size_t index = 0; index < metadata_threads; ++index) {
+            metadata_workers.emplace_back(scan_split_data_read_metadata_worker,
+                                          meta_config.source_root,
+                                          meta_config.recursive,
+                                          std::max<std::size_t>(1, meta_config.async_directory_depth),
+                                          meta_config.readdirplus_page_bytes,
+                                          std::ref(folder_queue),
+                                          std::ref(file_queues),
+                                          std::ref(stats));
+        }
     }
 
     for (auto& worker : metadata_workers) {
@@ -6248,6 +6421,12 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
 
     if (folder_queue.error) {
         std::rethrow_exception(folder_queue.error);
+    }
+    if (small_folder_queue.error) {
+        std::rethrow_exception(small_folder_queue.error);
+    }
+    if (large_folder_queue.error) {
+        std::rethrow_exception(large_folder_queue.error);
     }
     if (file_queues.small.error) {
         std::rethrow_exception(file_queues.small.error);
@@ -9023,7 +9202,10 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                                      std::size_t data_outstanding_requests,
                                                                      std::size_t small_file_async_window,
                                                                      bool split_small_large,
+                                                                     bool dual_scan_small_large,
                                                                      std::uint64_t split_small_file_threshold,
+                                                                     std::size_t small_meta_reader_threads,
+                                                                     std::size_t large_meta_reader_threads,
                                                                      std::size_t small_data_reader_threads,
                                                                      std::size_t large_data_reader_threads,
                                                                      std::size_t large_data_outstanding_requests,
@@ -9035,6 +9217,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                                      std::filesystem::path autoscale_settings_path,
                                                                      std::uint64_t max_file_size_bytes,
                                                                      std::size_t max_files_queued,
+                                                                     std::size_t small_max_files_queued,
+                                                                     std::size_t large_max_files_queued,
                                                                      std::size_t data_buffer_slots,
                                                                      std::size_t data_queue_depth,
                                                                      const std::string& data_copy_mode,
@@ -9086,10 +9270,15 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     report.small_file_async_window = data_config.small_file_async_window != 0U
                                          ? data_config.small_file_async_window
                                          : report.data_outstanding_requests;
-    report.split_small_large = split_small_large;
+    report.split_small_large = split_small_large || dual_scan_small_large;
+    report.dual_scan_small_large = dual_scan_small_large;
     report.split_small_file_threshold = split_small_file_threshold == 0U ? config_.small_file_threshold
                                                                          : split_small_file_threshold;
-    const bool data_pipeline_autoscale = split_small_large && (pipeline_autoscale || large_reader_autoscale);
+    report.small_meta_reader_threads =
+        small_meta_reader_threads == 0U ? report.meta_reader_threads : small_meta_reader_threads;
+    report.large_meta_reader_threads =
+        large_meta_reader_threads == 0U ? report.meta_reader_threads : large_meta_reader_threads;
+    const bool data_pipeline_autoscale = report.split_small_large && (pipeline_autoscale || large_reader_autoscale);
     const std::size_t auto_worker_capacity = default_autoscale_max_workers();
     report.small_data_reader_threads =
         small_data_reader_threads == 0U
@@ -9115,11 +9304,15 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                         : std::move(autoscale_settings_path);
     report.max_file_size_bytes = max_file_size_bytes;
     report.max_files_queued = std::max<std::size_t>(1, max_files_queued);
+    report.small_max_files_queued =
+        std::max<std::size_t>(1, small_max_files_queued == 0U ? report.max_files_queued : small_max_files_queued);
+    report.large_max_files_queued =
+        std::max<std::size_t>(1, large_max_files_queued == 0U ? report.max_files_queued : large_max_files_queued);
     report.data_copy_mode = data_copy_mode_name(data_config.copy_data_from_nfs);
     report.pack_small_files = data_config.pack_small_files;
 
     DataReadBenchmarkSnapshot snapshot;
-    if (split_small_large) {
+    if (report.split_small_large) {
         NfsDataReaderConfig small_data_config = data_config;
         NfsDataReaderConfig large_data_config = data_config;
         small_data_config.data_reader_worker_count = report.small_data_reader_threads;
@@ -9133,6 +9326,11 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                      large_data_config,
                                                      report.split_small_file_threshold,
                                                      report.max_files_queued,
+                                                     report.small_max_files_queued,
+                                                     report.large_max_files_queued,
+                                                     report.dual_scan_small_large,
+                                                     report.small_meta_reader_threads,
+                                                     report.large_meta_reader_threads,
                                                      data_buffer_slots,
                                                      data_queue_depth,
                                                      max_duration_seconds,

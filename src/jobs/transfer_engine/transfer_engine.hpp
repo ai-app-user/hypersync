@@ -100,7 +100,10 @@ struct DataReadBenchmarkReport {
     std::size_t data_outstanding_requests = 0;
     std::size_t small_file_async_window = 0;
     bool split_small_large = false;
+    bool dual_scan_small_large = false;
     std::uint64_t split_small_file_threshold = 0;
+    std::size_t small_meta_reader_threads = 0;
+    std::size_t large_meta_reader_threads = 0;
     std::size_t small_data_reader_threads = 0;
     std::size_t large_data_reader_threads = 0;
     std::size_t large_data_outstanding_requests = 0;
@@ -112,6 +115,8 @@ struct DataReadBenchmarkReport {
     std::filesystem::path autoscale_settings_path;
     std::uint64_t max_file_size_bytes = 0;
     std::size_t max_files_queued = 0;
+    std::size_t small_max_files_queued = 0;
+    std::size_t large_max_files_queued = 0;
     std::size_t data_buffer_slots = 0;
     std::size_t data_queue_depth = 0;
     std::string data_copy_mode;
@@ -359,7 +364,10 @@ public:
                                                                        std::size_t data_outstanding_requests = 0,
                                                                        std::size_t small_file_async_window = 0,
                                                                        bool split_small_large = false,
+                                                                       bool dual_scan_small_large = false,
                                                                        std::uint64_t split_small_file_threshold = 0,
+                                                                       std::size_t small_meta_reader_threads = 0,
+                                                                       std::size_t large_meta_reader_threads = 0,
                                                                        std::size_t small_data_reader_threads = 0,
                                                                        std::size_t large_data_reader_threads = 0,
                                                                        std::size_t large_data_outstanding_requests = 0,
@@ -371,6 +379,8 @@ public:
                                                                      std::filesystem::path autoscale_settings_path = {},
                                                                      std::uint64_t max_file_size_bytes = 0,
                                                                        std::size_t max_files_queued = 1024,
+                                                                       std::size_t small_max_files_queued = 0,
+                                                                       std::size_t large_max_files_queued = 0,
                                                                        std::size_t data_buffer_slots = 0,
                                                                        std::size_t data_queue_depth = 0,
                                                                        const std::string& data_copy_mode = {},
