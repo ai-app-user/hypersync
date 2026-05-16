@@ -264,6 +264,8 @@ struct DataReadFileQueue {
     std::deque<FileSpec> files;
     std::optional<std::chrono::steady_clock::time_point> stop_at;
     std::size_t max_entries = 1024;
+    std::size_t resume_entries = 0;
+    bool wait_for_low_watermark = false;
     bool input_done = false;
     bool stop = false;
     std::exception_ptr error;
@@ -280,6 +282,8 @@ enum class SplitDataReadRoute {
     Large,
 };
 
+thread_local SplitDataReadRoute current_split_data_read_route = SplitDataReadRoute::Large;
+
 struct SplitDataReadAutoscaleConfig {
     bool pipeline_enabled = false;
     bool large_enabled = false;
@@ -288,6 +292,15 @@ struct SplitDataReadAutoscaleConfig {
     std::uint64_t interval_ms = 1000;
     std::string profile_name;
     std::filesystem::path settings_path;
+};
+
+struct ReconScanStats {
+    std::atomic<std::size_t> files_found {0};
+    std::atomic<std::size_t> folders_found {0};
+    std::atomic<std::size_t> small_files_found {0};
+    std::atomic<std::size_t> large_files_found {0};
+    std::atomic<std::uint64_t> logical_size_bytes {0};
+    std::atomic<bool> completed {false};
 };
 
 std::filesystem::path default_autoscale_settings_path() {
@@ -703,6 +716,12 @@ struct DataReadBenchmarkSnapshot {
     std::size_t large_files_read = 0;
     std::uint64_t small_bytes_read = 0;
     std::uint64_t large_bytes_read = 0;
+    std::size_t recon_files_found = 0;
+    std::size_t recon_folders_found = 0;
+    std::size_t recon_small_files_found = 0;
+    std::size_t recon_large_files_found = 0;
+    std::uint64_t recon_logical_size_bytes = 0;
+    bool recon_completed = false;
 };
 
 struct DataReadBenchmarkStats {
@@ -1759,7 +1778,8 @@ double ns_to_seconds(std::uint64_t ns) {
     return static_cast<double>(ns) / 1'000'000'000.0;
 }
 
-DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats& stats) {
+DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats& stats,
+                                                   const ReconScanStats* recon_stats = nullptr) {
     const auto now = std::chrono::steady_clock::now();
     const double elapsed = stats.started_at == std::chrono::steady_clock::time_point{}
                                ? 0.0
@@ -1791,6 +1811,14 @@ DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats&
     snapshot.large_gigabits_per_second =
         elapsed > 0.0 ? static_cast<double>(snapshot.large_bytes_read) * 8.0 / elapsed / 1'000'000'000.0
                       : 0.0;
+    if (recon_stats != nullptr) {
+        snapshot.recon_files_found = recon_stats->files_found.load(std::memory_order_relaxed);
+        snapshot.recon_folders_found = recon_stats->folders_found.load(std::memory_order_relaxed);
+        snapshot.recon_small_files_found = recon_stats->small_files_found.load(std::memory_order_relaxed);
+        snapshot.recon_large_files_found = recon_stats->large_files_found.load(std::memory_order_relaxed);
+        snapshot.recon_logical_size_bytes = recon_stats->logical_size_bytes.load(std::memory_order_relaxed);
+        snapshot.recon_completed = recon_stats->completed.load(std::memory_order_relaxed);
+    }
     return snapshot;
 }
 
@@ -4627,6 +4655,11 @@ std::size_t queued_data_read_files(DataReadFileQueue& queue) {
     return queue.files.size();
 }
 
+bool data_file_input_done_and_empty(DataReadFileQueue& queue) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    return queue.input_done && queue.files.empty();
+}
+
 void record_data_read_metadata(DataReadBenchmarkStats& stats,
                                std::size_t files_found,
                                std::size_t folders_found,
@@ -4662,6 +4695,22 @@ void record_small_data_read_file(DataReadBenchmarkStats& stats) {
 void record_large_data_read_file(DataReadBenchmarkStats& stats) {
     record_data_read_file(stats);
     stats.large_files_read.fetch_add(1, std::memory_order_relaxed);
+}
+
+void record_current_split_data_read_bytes(DataReadBenchmarkStats& stats, std::uint64_t bytes_read) {
+    if (current_split_data_read_route == SplitDataReadRoute::Small) {
+        record_small_data_read_bytes(stats, bytes_read);
+    } else {
+        record_large_data_read_bytes(stats, bytes_read);
+    }
+}
+
+void record_current_split_data_read_file(DataReadBenchmarkStats& stats) {
+    if (current_split_data_read_route == SplitDataReadRoute::Small) {
+        record_small_data_read_file(stats);
+    } else {
+        record_large_data_read_file(stats);
+    }
 }
 
 void print_data_buffer_read_stats(const DataReadBenchmarkStats& stats,
@@ -4895,8 +4944,17 @@ bool enqueue_data_read_files(DataReadFileQueue& queue, std::vector<FileSpec>&& f
     for (auto& file : files) {
         std::unique_lock<std::mutex> lock(queue.mutex);
         const auto ready = [&queue]() {
-            return queue.stop || queue.error || queue.files.size() < queue.max_entries || data_read_timer_expired(queue);
+            if (queue.stop || queue.error || data_read_timer_expired(queue)) {
+                return true;
+            }
+            if (queue.wait_for_low_watermark) {
+                return queue.files.size() <= queue.resume_entries;
+            }
+            return queue.files.size() < queue.max_entries;
         };
+        if (queue.resume_entries != 0U && queue.files.size() >= queue.max_entries) {
+            queue.wait_for_low_watermark = true;
+        }
         if (queue.stop_at.has_value()) {
             queue.cv_not_full.wait_until(lock, *queue.stop_at, ready);
         } else {
@@ -4913,6 +4971,7 @@ bool enqueue_data_read_files(DataReadFileQueue& queue, std::vector<FileSpec>&& f
             return false;
         }
 
+        queue.wait_for_low_watermark = false;
         queue.files.push_back(std::move(file));
         lock.unlock();
         queue.cv_not_empty.notify_one();
@@ -4976,8 +5035,11 @@ std::vector<FileSpec> take_data_file_work_batch(DataReadFileQueue& queue, std::s
         batch.push_back(std::move(queue.files.front()));
         queue.files.pop_front();
     }
+    const bool wake_producer = !queue.wait_for_low_watermark || queue.files.size() <= queue.resume_entries;
     lock.unlock();
-    queue.cv_not_full.notify_all();
+    if (wake_producer) {
+        queue.cv_not_full.notify_all();
+    }
     return batch;
 }
 
@@ -5496,6 +5558,68 @@ void record_filtered_split_data_read_metadata_batch(bool recursive,
     }
 }
 
+void record_recon_metadata_batch(bool recursive,
+                                 FlatMetadataWorkQueue& folder_queue,
+                                 ReconScanStats& recon_stats,
+                                 std::uint64_t small_file_threshold,
+                                 std::uint64_t page_sleep_us,
+                                 FlatFolderScanBatch batch) {
+    if (batch.failed) {
+        std::cerr << "metadata recon skipped folder '"
+                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+        if (batch.folder.rel_path.empty()) {
+            const std::string message =
+                batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
+            fail_flat_folder_work(folder_queue, std::make_exception_ptr(std::runtime_error(message)));
+            return;
+        }
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        if (page_sleep_us != 0U) {
+            std::this_thread::sleep_for(std::chrono::microseconds(page_sleep_us));
+        }
+        return;
+    }
+
+    std::size_t small_files = 0;
+    std::size_t large_files = 0;
+    std::uint64_t logical_size_bytes = 0;
+    for (const auto& file : batch.files) {
+        const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
+        logical_size_bytes += logical_size;
+        if (logical_size <= small_file_threshold) {
+            ++small_files;
+        } else {
+            ++large_files;
+        }
+    }
+
+    std::vector<FileSpec> child_work;
+    if (recursive && !flat_metadata_scan_should_stop(folder_queue)) {
+        child_work.reserve(batch.directories.size());
+        for (auto& directory : batch.directories) {
+            directory.rel_path = normalize_path(directory.rel_path);
+            child_work.push_back(directory);
+        }
+    }
+
+    recon_stats.files_found.fetch_add(batch.files.size(), std::memory_order_relaxed);
+    recon_stats.folders_found.fetch_add(batch.directories.size(), std::memory_order_relaxed);
+    recon_stats.small_files_found.fetch_add(small_files, std::memory_order_relaxed);
+    recon_stats.large_files_found.fetch_add(large_files, std::memory_order_relaxed);
+    recon_stats.logical_size_bytes.fetch_add(logical_size_bytes, std::memory_order_relaxed);
+
+    enqueue_flat_folder_work(folder_queue, std::move(child_work));
+    if (batch.complete) {
+        finish_flat_folder_work(folder_queue);
+    }
+    if (page_sleep_us != 0U) {
+        std::this_thread::sleep_for(std::chrono::microseconds(page_sleep_us));
+    }
+}
+
 void scan_data_read_metadata_worker(const std::string& source_root,
                                     bool recursive,
                                     std::size_t async_directory_depth,
@@ -5560,6 +5684,40 @@ void scan_split_data_read_metadata_worker(const std::string& source_root,
         fail_flat_folder_work(folder_queue, error);
         fail_data_file_work(file_queues.small, error);
         fail_data_file_work(file_queues.large, error);
+    }
+}
+
+void scan_recon_metadata_worker(const std::string& source_root,
+                                bool recursive,
+                                std::size_t async_directory_depth,
+                                std::size_t readdirplus_page_bytes,
+                                FlatMetadataWorkQueue& folder_queue,
+                                ReconScanStats& recon_stats,
+                                std::uint64_t small_file_threshold,
+                                std::uint64_t page_sleep_us) {
+    auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
+    try {
+        backend->scan_flat_folders_streaming(
+            std::max<std::size_t>(1, async_directory_depth),
+            [&folder_queue](bool wait_for_work) {
+                return take_flat_folder_work(folder_queue, wait_for_work);
+            },
+            [&folder_queue] {
+                return flat_metadata_scan_should_stop(folder_queue);
+            },
+            [recursive, &folder_queue, &recon_stats, small_file_threshold, page_sleep_us](FlatFolderScanBatch batch) {
+                record_recon_metadata_batch(recursive,
+                                            folder_queue,
+                                            recon_stats,
+                                            small_file_threshold,
+                                            page_sleep_us,
+                                            std::move(batch));
+            });
+        if (!folder_queue.error) {
+            recon_stats.completed.store(true, std::memory_order_relaxed);
+        }
+    } catch (...) {
+        fail_flat_folder_work(folder_queue, std::current_exception());
     }
 }
 
@@ -5945,6 +6103,11 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                                             std::size_t small_max_files_queued,
                                                             std::size_t large_max_files_queued,
                                                             bool dual_scan_small_large,
+                                                            bool recon_scan_enabled,
+                                                            std::size_t recon_meta_reader_threads,
+                                                            std::size_t recon_metadata_async_depth,
+                                                            std::uint64_t recon_page_sleep_us,
+                                                            bool morph_large_readers_to_small,
                                                             std::size_t small_meta_reader_threads,
                                                             std::size_t large_meta_reader_threads,
                                                             std::size_t data_buffer_slots,
@@ -5957,18 +6120,24 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     folder_queue.folders.push_back(FileSpec{});
     FlatMetadataWorkQueue small_folder_queue;
     FlatMetadataWorkQueue large_folder_queue;
+    FlatMetadataWorkQueue recon_folder_queue;
     if (dual_scan_small_large) {
         small_folder_queue.folders.push_back(FileSpec{});
         large_folder_queue.folders.push_back(FileSpec{});
+    }
+    if (recon_scan_enabled) {
+        recon_folder_queue.folders.push_back(FileSpec{});
     }
     SplitDataReadFileQueues file_queues;
     file_queues.small.max_entries =
         std::max<std::size_t>(1, small_max_files_queued == 0U ? max_files_queued : small_max_files_queued);
     file_queues.large.max_entries =
         std::max<std::size_t>(1, large_max_files_queued == 0U ? max_files_queued : large_max_files_queued);
+    file_queues.small.resume_entries = file_queues.small.max_entries * 4U / 5U;
     file_queues.small_file_threshold = small_file_threshold == 0U ? 128U * 1024U : small_file_threshold;
 
     DataReadBenchmarkStats stats;
+    ReconScanStats recon_stats;
     stats.print_interval_seconds = std::max<std::uint32_t>(1, stats_interval_seconds);
     stats.folders_found.store(1, std::memory_order_relaxed);
     reset_nfs_async_read_latency_metrics();
@@ -5982,6 +6151,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         std::max<std::size_t>(1, small_meta_reader_threads == 0U ? metadata_threads : small_meta_reader_threads);
     const std::size_t large_metadata_threads =
         std::max<std::size_t>(1, large_meta_reader_threads == 0U ? metadata_threads : large_meta_reader_threads);
+    const std::size_t recon_metadata_threads =
+        std::max<std::size_t>(1, recon_meta_reader_threads == 0U ? std::size_t {1} : recon_meta_reader_threads);
+    const std::size_t recon_async_depth =
+        std::max<std::size_t>(1, recon_metadata_async_depth == 0U ? std::size_t {1} : recon_metadata_async_depth);
     const std::size_t total_reader_threads = small_threads + large_threads;
     const std::size_t queue_depth =
         std::max<std::size_t>(1, data_queue_depth == 0 ? total_reader_threads * outstanding * 2U
@@ -6002,8 +6175,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     large_data_config.pack_small_files = false;
     large_data_config.small_file_async_window = 1U;
 
-    auto make_file_provider = [](DataReadFileQueue& queue) {
-        return [&queue]() {
+    auto make_file_provider = [](DataReadFileQueue& queue, SplitDataReadRoute route) {
+        return [&queue, route]() {
             thread_local std::deque<FileSpec> worker_file_batch;
             if (worker_file_batch.empty()) {
                 std::vector<FileSpec> next_batch = take_data_file_work_batch(queue, 128);
@@ -6016,15 +6189,42 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
             }
             FileSpec file = std::move(worker_file_batch.front());
             worker_file_batch.pop_front();
+            current_split_data_read_route = route;
             return std::optional<FileSpec> {std::move(file)};
         };
     };
+
+    auto make_morphing_large_file_provider =
+        [](DataReadFileQueue& large_queue, DataReadFileQueue& small_queue, bool morph_to_small) {
+            return [&large_queue, &small_queue, morph_to_small]() {
+                thread_local std::deque<std::pair<FileSpec, SplitDataReadRoute>> worker_file_batch;
+                if (worker_file_batch.empty()) {
+                    std::vector<FileSpec> next_batch = take_data_file_work_batch(large_queue, 128);
+                    for (auto& file : next_batch) {
+                        worker_file_batch.emplace_back(std::move(file), SplitDataReadRoute::Large);
+                    }
+                    if (worker_file_batch.empty() && morph_to_small && data_file_input_done_and_empty(large_queue)) {
+                        next_batch = take_data_file_work_batch(small_queue, 128);
+                        for (auto& file : next_batch) {
+                            worker_file_batch.emplace_back(std::move(file), SplitDataReadRoute::Small);
+                        }
+                    }
+                }
+                if (worker_file_batch.empty()) {
+                    return std::optional<FileSpec> {};
+                }
+                auto item = std::move(worker_file_batch.front());
+                worker_file_batch.pop_front();
+                current_split_data_read_route = item.second;
+                return std::optional<FileSpec> {std::move(item.first)};
+            };
+        };
 
     NfsDataBufferReaderJob small_reader_job(
         small_data_config,
         data_pool,
         small_reader_to_discard,
-        make_file_provider(file_queues.small),
+        make_file_provider(file_queues.small, SplitDataReadRoute::Small),
         [&file_queues]() {
             return data_read_timer_expired(file_queues.small);
         });
@@ -6042,15 +6242,17 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         large_data_config,
         data_pool,
         large_reader_to_discard,
-        make_file_provider(file_queues.large),
+        make_morphing_large_file_provider(file_queues.large,
+                                          file_queues.small,
+                                          morph_large_readers_to_small),
         [&file_queues]() {
-            return data_read_timer_expired(file_queues.large);
+            return data_read_timer_expired(file_queues.large) || data_read_timer_expired(file_queues.small);
         });
     large_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
-        record_large_data_read_bytes(stats, bytes_read);
+        record_current_split_data_read_bytes(stats, bytes_read);
     });
     large_reader_job.set_file_read_callback([&stats]() {
-        record_large_data_read_file(stats);
+        record_current_split_data_read_file(stats);
     });
     large_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
         stats.files_failed.fetch_add(1, std::memory_order_relaxed);
@@ -6242,6 +6444,11 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 return monitor_flat_folder_queue("folder_work_queue", folder_queue);
             });
         }
+        if (recon_scan_enabled) {
+            status_registry.register_queue("recon_folder_work_queue", [&recon_folder_queue]() {
+                return monitor_flat_folder_queue("recon_folder_work_queue", recon_folder_queue);
+            });
+        }
         status_registry.register_queue("small_reader_output", [&small_reader_to_discard]() {
             return monitor_buf_queue("small_reader_output", small_reader_to_discard);
         });
@@ -6262,6 +6469,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         folder_queue.stop_at = stop_at;
         small_folder_queue.stop_at = stop_at;
         large_folder_queue.stop_at = stop_at;
+        recon_folder_queue.stop_at = stop_at;
         file_queues.small.stop_at = stop_at;
         file_queues.large.stop_at = stop_at;
     }
@@ -6281,6 +6489,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 request_flat_folder_stop(folder_queue);
                 request_flat_folder_stop(small_folder_queue);
                 request_flat_folder_stop(large_folder_queue);
+                request_flat_folder_stop(recon_folder_queue);
                 request_data_file_stop(file_queues.small);
                 request_data_file_stop(file_queues.large);
             }
@@ -6298,7 +6507,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
             }
             std::lock_guard<std::mutex> print_lock(stats.print_mutex);
             stats.last_print_at = std::chrono::steady_clock::now();
-            const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+            const DataReadBenchmarkSnapshot snapshot =
+                snapshot_data_read_stats(stats, recon_scan_enabled ? &recon_stats : nullptr);
             std::cerr << "split_data_read_stats gigabits_per_second=" << snapshot.gigabits_per_second
                       << " small_gigabits_per_second=" << snapshot.small_gigabits_per_second
                       << " large_gigabits_per_second=" << snapshot.large_gigabits_per_second
@@ -6313,6 +6523,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                       << " large_files_read=" << snapshot.large_files_read
                       << " small_files_found=" << snapshot.small_files_found
                       << " large_files_found=" << snapshot.large_files_found
+                      << " recon_files_found=" << snapshot.recon_files_found
+                      << " recon_small_files_found=" << snapshot.recon_small_files_found
+                      << " recon_large_files_found=" << snapshot.recon_large_files_found
+                      << " recon_completed=" << (snapshot.recon_completed ? "true" : "false")
                       << " queued_small_files=" << queued_data_read_files(file_queues.small)
                       << " queued_large_files=" << queued_data_read_files(file_queues.large)
                       << " small_output_depth=" << small_reader_to_discard.size()
@@ -6333,6 +6547,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     }
 
     std::vector<std::thread> metadata_workers;
+    std::vector<std::thread> recon_workers;
     if (dual_scan_small_large) {
         metadata_workers.reserve(small_metadata_threads + large_metadata_threads);
         for (std::size_t index = 0; index < small_metadata_threads; ++index) {
@@ -6359,6 +6574,20 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                           SplitDataReadRoute::Large,
                                           std::ref(stats));
         }
+        if (recon_scan_enabled) {
+            recon_workers.reserve(recon_metadata_threads);
+            for (std::size_t index = 0; index < recon_metadata_threads; ++index) {
+                recon_workers.emplace_back(scan_recon_metadata_worker,
+                                           meta_config.source_root,
+                                           meta_config.recursive,
+                                           recon_async_depth,
+                                           meta_config.readdirplus_page_bytes,
+                                           std::ref(recon_folder_queue),
+                                           std::ref(recon_stats),
+                                           file_queues.small_file_threshold,
+                                           recon_page_sleep_us);
+            }
+        }
     } else {
         metadata_workers.reserve(metadata_threads);
         for (std::size_t index = 0; index < metadata_threads; ++index) {
@@ -6378,6 +6607,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     }
     mark_data_file_input_done(file_queues.small);
     mark_data_file_input_done(file_queues.large);
+
+    for (auto& worker : recon_workers) {
+        worker.join();
+    }
 
     if (large_autoscaler) {
         large_autoscaler->stop();
@@ -6428,6 +6661,9 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     if (large_folder_queue.error) {
         std::rethrow_exception(large_folder_queue.error);
     }
+    if (recon_folder_queue.error) {
+        std::rethrow_exception(recon_folder_queue.error);
+    }
     if (file_queues.small.error) {
         std::rethrow_exception(file_queues.small.error);
     }
@@ -6435,7 +6671,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         std::rethrow_exception(file_queues.large.error);
     }
 
-    DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+    DataReadBenchmarkSnapshot snapshot =
+        snapshot_data_read_stats(stats, recon_scan_enabled ? &recon_stats : nullptr);
     snapshot.data_buffer_slots = pool_slots;
     snapshot.data_queue_depth = queue_depth;
     return snapshot;
@@ -9203,7 +9440,12 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                                      std::size_t small_file_async_window,
                                                                      bool split_small_large,
                                                                      bool dual_scan_small_large,
+                                                                     bool recon_scan_enabled,
+                                                                     bool morph_large_readers_to_small,
                                                                      std::uint64_t split_small_file_threshold,
+                                                                     std::size_t recon_meta_reader_threads,
+                                                                     std::size_t recon_metadata_async_depth,
+                                                                     std::uint64_t recon_page_sleep_us,
                                                                      std::size_t small_meta_reader_threads,
                                                                      std::size_t large_meta_reader_threads,
                                                                      std::size_t small_data_reader_threads,
@@ -9272,8 +9514,15 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                          : report.data_outstanding_requests;
     report.split_small_large = split_small_large || dual_scan_small_large;
     report.dual_scan_small_large = dual_scan_small_large;
+    report.recon_scan_enabled = recon_scan_enabled;
+    report.morph_large_readers_to_small = morph_large_readers_to_small;
     report.split_small_file_threshold = split_small_file_threshold == 0U ? config_.small_file_threshold
                                                                          : split_small_file_threshold;
+    report.recon_meta_reader_threads =
+        recon_meta_reader_threads == 0U ? std::size_t {1} : recon_meta_reader_threads;
+    report.recon_metadata_async_depth =
+        recon_metadata_async_depth == 0U ? std::size_t {1} : recon_metadata_async_depth;
+    report.recon_page_sleep_us = recon_page_sleep_us;
     report.small_meta_reader_threads =
         small_meta_reader_threads == 0U ? report.meta_reader_threads : small_meta_reader_threads;
     report.large_meta_reader_threads =
@@ -9329,6 +9578,11 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                      report.small_max_files_queued,
                                                      report.large_max_files_queued,
                                                      report.dual_scan_small_large,
+                                                     report.recon_scan_enabled,
+                                                     report.recon_meta_reader_threads,
+                                                     report.recon_metadata_async_depth,
+                                                     report.recon_page_sleep_us,
+                                                     report.morph_large_readers_to_small,
                                                      report.small_meta_reader_threads,
                                                      report.large_meta_reader_threads,
                                                      data_buffer_slots,
@@ -9368,6 +9622,12 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     report.large_files_read = snapshot.large_files_read;
     report.small_bytes_read = snapshot.small_bytes_read;
     report.large_bytes_read = snapshot.large_bytes_read;
+    report.recon_files_found = snapshot.recon_files_found;
+    report.recon_folders_found = snapshot.recon_folders_found;
+    report.recon_small_files_found = snapshot.recon_small_files_found;
+    report.recon_large_files_found = snapshot.recon_large_files_found;
+    report.recon_logical_size_bytes = snapshot.recon_logical_size_bytes;
+    report.recon_completed = snapshot.recon_completed;
     report.bytes_per_second = snapshot.bytes_per_second;
     report.gigabits_per_second = snapshot.gigabits_per_second;
     report.files_per_second = snapshot.files_per_second;

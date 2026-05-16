@@ -68,7 +68,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--small-file-threshold-bytes <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
@@ -1282,7 +1282,12 @@ int main(int argc, char** argv) {
             std::size_t small_file_async_window = 0;
             bool split_small_large = false;
             bool dual_scan_small_large = false;
+            bool recon_scan_enabled = false;
+            bool morph_large_readers_to_small = false;
             std::uint64_t split_small_file_threshold = 0;
+            std::size_t recon_meta_reader_threads = 0;
+            std::size_t recon_metadata_async_depth = 0;
+            std::uint64_t recon_page_sleep_us = 0;
             std::size_t small_meta_reader_threads = 0;
             std::size_t large_meta_reader_threads = 0;
             std::size_t small_data_reader_threads = 0;
@@ -1340,10 +1345,30 @@ int main(int argc, char** argv) {
                 } else if (args[i] == "--dual-scan-small-large") {
                     dual_scan_small_large = true;
                     split_small_large = true;
+                } else if (args[i] == "--background-recon-scan" || args[i] == "--recon-scan") {
+                    recon_scan_enabled = true;
+                    dual_scan_small_large = true;
+                    split_small_large = true;
+                } else if (args[i] == "--morph-large-readers-to-small") {
+                    morph_large_readers_to_small = true;
+                    dual_scan_small_large = true;
+                    split_small_large = true;
                 } else if (args[i] == "--split-small-file-threshold" ||
                            args[i] == "--small-file-threshold-bytes") {
                     split_small_file_threshold =
                         parse_size_t_option(require_option(args, i, args[i]), args[i]);
+                } else if (args[i] == "--recon-meta-reader-threads") {
+                    recon_meta_reader_threads =
+                        parse_size_t_option(require_option(args, i, "--recon-meta-reader-threads"),
+                                            "--recon-meta-reader-threads");
+                } else if (args[i] == "--recon-metadata-async-depth") {
+                    recon_metadata_async_depth =
+                        parse_size_t_option(require_option(args, i, "--recon-metadata-async-depth"),
+                                            "--recon-metadata-async-depth");
+                } else if (args[i] == "--recon-page-sleep-us") {
+                    recon_page_sleep_us =
+                        parse_size_t_option(require_option(args, i, "--recon-page-sleep-us"),
+                                            "--recon-page-sleep-us");
                 } else if (args[i] == "--small-meta-reader-threads") {
                     small_meta_reader_threads =
                         parse_size_t_option(require_option(args, i, "--small-meta-reader-threads"),
@@ -1436,7 +1461,12 @@ int main(int argc, char** argv) {
                                                                     small_file_async_window,
                                                                     split_small_large,
                                                                     dual_scan_small_large,
+                                                                    recon_scan_enabled,
+                                                                    morph_large_readers_to_small,
                                                                     split_small_file_threshold,
+                                                                    recon_meta_reader_threads,
+                                                                    recon_metadata_async_depth,
+                                                                    recon_page_sleep_us,
                                                                     small_meta_reader_threads,
                                                                     large_meta_reader_threads,
                                                                     small_data_reader_threads,
@@ -1471,6 +1501,12 @@ int main(int argc, char** argv) {
                       << " large_files_read=" << report.large_files_read
                       << " small_bytes_read=" << report.small_bytes_read
                       << " large_bytes_read=" << report.large_bytes_read
+                      << " recon_files_found=" << report.recon_files_found
+                      << " recon_folders_found=" << report.recon_folders_found
+                      << " recon_small_files_found=" << report.recon_small_files_found
+                      << " recon_large_files_found=" << report.recon_large_files_found
+                      << " recon_logical_size_bytes=" << report.recon_logical_size_bytes
+                      << " recon_completed=" << (report.recon_completed ? "true" : "false")
                       << " bytes_per_second=" << report.bytes_per_second
                       << " gigabits_per_second=" << report.gigabits_per_second
                       << " files_per_second=" << report.files_per_second
@@ -1486,7 +1522,12 @@ int main(int argc, char** argv) {
                       << " small_file_async_window=" << report.small_file_async_window
                       << " split_small_large=" << (report.split_small_large ? "true" : "false")
                       << " dual_scan_small_large=" << (report.dual_scan_small_large ? "true" : "false")
+                      << " recon_scan_enabled=" << (report.recon_scan_enabled ? "true" : "false")
+                      << " morph_large_readers_to_small=" << (report.morph_large_readers_to_small ? "true" : "false")
                       << " split_small_file_threshold=" << report.split_small_file_threshold
+                      << " recon_meta_reader_threads=" << report.recon_meta_reader_threads
+                      << " recon_metadata_async_depth=" << report.recon_metadata_async_depth
+                      << " recon_page_sleep_us=" << report.recon_page_sleep_us
                       << " small_meta_reader_threads=" << report.small_meta_reader_threads
                       << " large_meta_reader_threads=" << report.large_meta_reader_threads
                       << " small_data_reader_threads=" << report.small_data_reader_threads
