@@ -230,6 +230,23 @@ full large-file queue pausing small-file discovery, or a full small-file
 reservoir pausing large-file discovery. Classification boundaries must be
 gapless: small is `size <= threshold`, large is `size > threshold`.
 
+A third scanner fleet may run as background reconnaissance:
+
+`ReconScanner(throttled full crawl) -> statistical accumulator`
+
+The recon scanner never preserves raw NFS handles and never feeds data readers.
+It extracts counts and logical sizes, updates relaxed atomic counters, and
+releases metadata pages immediately. It must be explicitly throttled by
+configuration, normally `async_depth=1` plus a per-page sleep, so it cannot
+consume the RPC slots and NIC queues needed by the production scanner and data
+reader lanes.
+
+When the large scanner completes and the large reservoir is empty, bulk reader
+workers may morph into small-file readers by pulling from the small reservoir.
+This morph is a queue-provider transition only: the worker still owns generic
+buffer handles, generic queues remain opaque, and callbacks must account bytes
+and files according to the route of the file actually supplied.
+
 The transport sender drains the small-file data queue first and drains the
 large-file queue only when the small queue is empty or below its configured low
 watermark. This gives small files maximum operation rate while allowing large

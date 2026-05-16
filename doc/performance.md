@@ -1905,3 +1905,76 @@ Note: the benchmark stop timer currently clears the data queues at
 `max_duration_seconds`, so post-stop/tail samples show queue depth dropping to
 zero and should not be used as steady-state performance. Use the last interval
 before stop for throughput comparisons.
+
+3-scanner recon split read test, 2026-05-16
+-------------------------------------------
+
+Purpose: validate a low-priority background recon scanner running concurrently
+with independent small and large production scanners. The recon scanner updates
+only a statistical accumulator and discards raw handles immediately.
+
+Build/deploy:
+
+```text
+build host      transfer1
+deploy path     /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-transfer1-20260516T211558Z
+hypersync git   9a00fcc
+piper git       f1aecb4
+```
+
+Common settings:
+
+```text
+source                         nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+taskset                        0-79
+mode                           --background-recon-scan --morph-large-readers-to-small
+small_meta_reader_threads      96
+large_meta_reader_threads      16
+recon_meta_reader_threads      1
+recon_metadata_async_depth     1
+recon_page_sleep_us            5000
+metadata_async_depth           256
+readdirplus_page_bytes         262144
+small_data_reader_threads      96
+large_data_reader_threads      64
+large_data_outstanding_requests 2
+small_file_async_window        1
+small_max_files_queued         5000000
+large_max_files_queued         50000
+data_buffer_slots              24576
+data_queue_depth               12288
+```
+
+Useful interval results:
+
+```text
+sample  total Gbit/s  small files/s  large Gbit/s  queued small  queued large  recon files  recon done
+30s     191.3         31,440         172.0         4,260,672     50,000        120,068      false
+60s     194.6         30,854         176.6         4,371,136     50,000        120,068      false
+90s     195.7         30,237         178.5         0             0             123,333      false
+```
+
+Interpretation:
+
+- The third recon lane works and remains bounded: it preserved no handles and
+  advanced with one async request plus a 5 ms page sleep.
+- The production path stayed close to the previous dual-scanner result:
+  194-196 Gbit/s steady state with roughly 30K small files/s.
+- Recon did not complete before the 90s stop point in the useful interval,
+  which is expected for the throttled profile. That confirms it is not sprinting
+  and stealing production scanner/data-reader capacity.
+- The large-reader morph path is enabled in this profile. Route-aware accounting
+  records bytes/files as small or large based on the queue that supplied the
+  file, so morphed readers do not corrupt small/large stats.
+
+Current 3-scanner test recommendation:
+
+```text
+--background-recon-scan
+--morph-large-readers-to-small
+--recon-meta-reader-threads 1
+--recon-metadata-async-depth 1
+--recon-page-sleep-us 5000
+--small-meta-reader-threads 96
+--large-meta-reader-threads 16
+```
