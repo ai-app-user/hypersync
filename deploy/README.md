@@ -136,6 +136,11 @@ support included.
 
 ## Build A Bundle On Linux
 
+For this project, the primary Linux build and validation host is currently
+`transfer1`. Build and package there for NFS performance work. Do not use macOS
+or a macOS-hosted container for benchmark artifacts unless that exception is
+called out explicitly in the result notes.
+
 From the workspace root that contains sibling `piper/` and `hypersync/`:
 
 ```bash

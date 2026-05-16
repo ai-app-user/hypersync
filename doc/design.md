@@ -153,7 +153,26 @@ The manifest and checksum files shipped in the bundle are part of the
 reproducibility contract. Performance results must record the deployment path
 and, when available, the manifest git commit/dirty state.
 
-### 0.8 Mandatory Generic Instrumentation
+### 0.8 Linux Build Authority
+
+Linux builds, package creation, and real NFS performance validation must run on
+the primary Linux development host for the current environment. For this phase,
+that host is `transfer1`.
+
+- macOS workstations are coordination clients only for this project. Do not use
+  macOS or macOS-hosted containers to produce Linux performance artifacts unless
+  explicitly approved for a one-off diagnostic.
+- Source checkouts on the Linux development host must come from Git, not from
+  ad-hoc source-file copies.
+- Runtime hosts still follow the package-only rule above. Having a source
+  checkout on the primary Linux development host does not make source-tree
+  runtime deployments acceptable.
+- Release and benchmark manifests must identify the Linux host, git commits,
+  dirty state, build path, deployment path, and the package archive used.
+- If the primary Linux host changes, update this section and record the change
+  in performance notes before comparing benchmark results.
+
+### 0.9 Mandatory Generic Instrumentation
 
 Every production Job must be observable through the shared monitor vocabulary.
 Instrumentation is part of the architecture, not optional debug code.
