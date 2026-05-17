@@ -7205,6 +7205,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 request_flat_folder_stop(recon_folder_queue);
                 request_data_file_stop(file_queues.small);
                 request_data_file_stop(file_queues.large);
+                small_reader_job.stop();
+                large_reader_job.stop();
             }
         });
     }
@@ -7586,6 +7588,7 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
             if (!cancelled) {
                 request_flat_folder_stop(folder_queue);
                 request_data_file_stop(file_queue);
+                data_reader_job.stop();
             }
         });
     }

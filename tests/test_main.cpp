@@ -1031,6 +1031,71 @@ void test_synthetic_replay_cursor_generates_gapless_deterministic_views() {
     EXPECT_TRUE(!cursor.next_file(done));
 }
 
+void test_synthetic_profile_backend_streams_metadata_and_data() {
+    TempDir root("synthetic_profile_backend");
+    const fs::path profile_path = root.path / "profile.txt";
+    write_file(profile_path,
+               "synthetic_profile_benchmark files_observed=4 phases=1 elapsed_s=0 files_per_second=0 "
+               "logical_size_bytes=1183744 small_files=2 large_files=2\n"
+               "phase index=0 name=phase_0 files=4 folders=2 small=2 large=2 "
+               "logical_size_bytes=1183744 "
+               "size_buckets=<=0:0/0,<=4096:1/4096,<=16384:1/8192,<=65536:0/0,"
+               "<=131072:1/65536,<=1048576:1/1048576,<=16777216:0/0,"
+               "<=134217728:0/0,<=1073741824:0/0,<=inf:0/0\n");
+
+    const std::string url = "synthetic-profile://" + profile_path.string();
+    auto backend = hypersync::make_nfs_backend(url);
+
+    std::vector<FileSpec> files;
+    std::uint64_t folders_seen = 0;
+    bool root_consumed = false;
+    backend->scan_flat_folders(
+        1,
+        [&](bool) -> std::optional<FileSpec> {
+            if (root_consumed) {
+                return std::nullopt;
+            }
+            root_consumed = true;
+            return FileSpec {};
+        },
+        [] {
+            return false;
+        },
+        [&](hypersync::FlatFolderScanBatch batch) {
+            ++folders_seen;
+            for (auto& file : batch.files) {
+                files.push_back(std::move(file));
+            }
+        });
+
+    EXPECT_EQ(folders_seen, 1U);
+    EXPECT_EQ(files.size(), 4U);
+    EXPECT_TRUE(!files.front().rel_path.empty());
+    EXPECT_TRUE(!files.front().nfs_handle.empty());
+    EXPECT_TRUE(files.front().declared_size != 0U);
+
+    RawBufferPool pool(kDataBufferPoolId,
+                       4,
+                       sizeof(hypersync::DataBuffer),
+                       alignof(hypersync::DataBuffer));
+    std::uint64_t bytes_read = 0;
+    const std::uint64_t streamed = backend->read_file_raw_chunks_by_handle(
+        files.front(),
+        1,
+        pool,
+        [&](hypersync::RawFileChunk&& chunk) {
+            bytes_read += hypersync::data_buffer(pool, chunk.handle).trailer.data_len;
+            pool.release(chunk.handle);
+        },
+        [] {
+            return false;
+        },
+        false);
+
+    EXPECT_EQ(streamed, files.front().declared_size);
+    EXPECT_EQ(bytes_read, files.front().declared_size);
+}
+
 void test_synthetic_payload_pool_returns_preallocated_blocks() {
     SyntheticPayloadPool pool(4096, 1024 * 1024, SyntheticPayloadPattern::repeated, 7);
     EXPECT_EQ(pool.small_block_bytes(), 4096U);
@@ -4757,6 +4822,9 @@ int main(int argc, char** argv) {
         {"synthetic_replay_cursor_generates_gapless_deterministic_views",
          TestSuite::unit,
          test_synthetic_replay_cursor_generates_gapless_deterministic_views},
+        {"synthetic_profile_backend_streams_metadata_and_data",
+         TestSuite::unit,
+         test_synthetic_profile_backend_streams_metadata_and_data},
         {"synthetic_payload_pool_returns_preallocated_blocks",
          TestSuite::unit,
          test_synthetic_payload_pool_returns_preallocated_blocks},

@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -46,6 +47,7 @@ extern "C" ssize_t write(int, const void*, size_t);
 #include "common/socket_utils.hpp"
 #include "core/data_buffer_codec.hpp"
 #include "core/pipeline_buffers.hpp"
+#include "jobs/synthetic_workload/synthetic_workload.hpp"
 
 #ifndef HYPERSYNC_HAS_LIBNFS
 #define HYPERSYNC_HAS_LIBNFS 0
@@ -837,7 +839,18 @@ public:
         }
         std::uint64_t total = 0;
         while (input && !(should_stop && should_stop())) {
-            BufferHandle handle = pool.acquire_spin();
+            std::optional<BufferHandle> acquired;
+            while (!(should_stop && should_stop())) {
+                acquired = pool.try_acquire();
+                if (acquired.has_value()) {
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (!acquired.has_value()) {
+                break;
+            }
+            BufferHandle handle = *acquired;
             DataBuffer& buffer = data_buffer(pool, handle);
             char* read_target = copy_payload_to_buffer ? reinterpret_cast<char*>(buffer.bytes.data())
                                                        : scratch.data();
@@ -933,6 +946,348 @@ public:
 
 private:
     std::filesystem::path root_;
+};
+
+bool is_synthetic_profile_url(std::string_view path) {
+    return path.rfind("synthetic-profile://", 0) == 0;
+}
+
+std::filesystem::path synthetic_profile_path_from_url(std::string_view url) {
+    constexpr std::string_view kPrefix = "synthetic-profile://";
+    std::string path(url.substr(kPrefix.size()));
+    if (path.rfind("file://", 0) == 0) {
+        path.erase(0, std::string("file://").size());
+    }
+    if (path.empty()) {
+        throw std::runtime_error("synthetic-profile URL requires a profile path");
+    }
+    return std::filesystem::path(path);
+}
+
+std::optional<std::string_view> synthetic_profile_token(std::string_view line,
+                                                        std::string_view key) noexcept {
+    const std::size_t begin = line.find(key);
+    if (begin == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::size_t value_begin = begin + key.size();
+    const std::size_t value_end = line.find(' ', value_begin);
+    return line.substr(value_begin,
+                       value_end == std::string_view::npos ? std::string_view::npos
+                                                            : value_end - value_begin);
+}
+
+std::uint64_t synthetic_profile_u64(std::string_view line, std::string_view key) {
+    const std::optional<std::string_view> token = synthetic_profile_token(line, key);
+    if (!token.has_value()) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(std::stoull(std::string(token.value())));
+}
+
+void parse_synthetic_size_buckets(std::string_view line,
+                                  std::array<std::uint64_t, kSyntheticSizeBucketCount>& counts,
+                                  std::array<std::uint64_t, kSyntheticSizeBucketCount>& bytes) {
+    const std::optional<std::string_view> token = synthetic_profile_token(line, "size_buckets=");
+    if (!token.has_value()) {
+        return;
+    }
+    std::stringstream stream(std::string(token.value()));
+    std::string item;
+    std::size_t index = 0;
+    while (index < counts.size() && std::getline(stream, item, ',')) {
+        const std::size_t colon = item.find(':');
+        const std::size_t slash = item.find('/', colon == std::string::npos ? 0U : colon + 1U);
+        if (colon != std::string::npos && slash != std::string::npos) {
+            counts[index] = static_cast<std::uint64_t>(std::stoull(item.substr(colon + 1U, slash - colon - 1U)));
+            bytes[index] = static_cast<std::uint64_t>(std::stoull(item.substr(slash + 1U)));
+        }
+        ++index;
+    }
+}
+
+SyntheticWorkloadProfile load_synthetic_profile_for_backend(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open synthetic profile: " + path.string());
+    }
+
+    SyntheticWorkloadProfile profile;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.rfind("phase ", 0) != 0) {
+            continue;
+        }
+        SyntheticPhaseProfile phase;
+        phase.name = std::string(synthetic_profile_token(line, "name=").value_or("phase"));
+        phase.file_count = synthetic_profile_u64(line, "files=");
+        phase.folder_count = synthetic_profile_u64(line, "folders=");
+        phase.small_file_count = synthetic_profile_u64(line, "small=");
+        phase.large_file_count = synthetic_profile_u64(line, "large=");
+        phase.logical_size_bytes = synthetic_profile_u64(line, "logical_size_bytes=");
+        parse_synthetic_size_buckets(line, phase.size_file_counts, phase.size_logical_bytes);
+        profile.phases.push_back(std::move(phase));
+    }
+    if (profile.phases.empty()) {
+        throw std::runtime_error("synthetic profile has no phase records: " + path.string());
+    }
+    return profile;
+}
+
+FileSpec synthetic_file_spec_from_view(const SyntheticFileView& view) {
+    FileSpec spec;
+    spec.rel_path = std::string(view.path_view());
+    spec.declared_size = view.size_bytes;
+    spec.mtime = 1'700'000'000'000'000'000ULL + view.file_id;
+    spec.mode = 0644;
+    spec.uid = static_cast<std::uint32_t>(1000U + (view.file_id % 97U));
+    spec.gid = static_cast<std::uint32_t>(1000U + (view.file_id % 89U));
+    spec.nfs_handle.assign(view.nfs_handle.begin(), view.nfs_handle.end());
+    return spec;
+}
+
+std::optional<std::uint64_t> synthetic_batch_index_from_path(std::string_view path) {
+    constexpr std::string_view kPrefix = "synthetic/batch_";
+    if (path.rfind(kPrefix, 0) != 0) {
+        return std::nullopt;
+    }
+    const std::string_view digits = path.substr(kPrefix.size());
+    if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](char ch) {
+            return ch >= '0' && ch <= '9';
+        })) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(std::stoull(std::string(digits)));
+}
+
+class SyntheticProfileBackend final : public NfsBackend {
+public:
+    explicit SyntheticProfileBackend(std::string profile_url)
+        : profile_path_(synthetic_profile_path_from_url(profile_url)),
+          profile_(load_synthetic_profile_for_backend(profile_path_)) {}
+
+    [[nodiscard]] std::vector<FileSpec> list_files(bool recursive) const override {
+        std::vector<FileSpec> result;
+        visit_files(recursive, [&](FileSpec spec) {
+            result.push_back(std::move(spec));
+        });
+        return result;
+    }
+
+    [[nodiscard]] std::vector<FileSpec> list_directories(bool recursive) const override {
+        (void)recursive;
+        std::vector<FileSpec> result;
+        for (std::size_t phase_index = 0; phase_index < profile_.phases.size(); ++phase_index) {
+            FileSpec spec;
+            spec.rel_path = "synthetic/phase_" + std::to_string(phase_index);
+            spec.mode = 0755;
+            result.push_back(std::move(spec));
+        }
+        return result;
+    }
+
+    void visit_files(bool recursive, const std::function<void(FileSpec)>& visitor) const override {
+        (void)recursive;
+        SyntheticReplayConfig config;
+        config.profile = profile_;
+        SyntheticReplayCursor cursor(std::move(config));
+        SyntheticFileView view;
+        while (cursor.next_file(view)) {
+            visitor(synthetic_file_spec_from_view(view));
+        }
+    }
+
+    void visit_metadata(bool recursive,
+                        const std::function<void(FileSpec)>& file_visitor,
+                        const std::function<void(FileSpec)>& directory_visitor) const override {
+        (void)recursive;
+        if (directory_visitor) {
+            for (std::size_t phase_index = 0; phase_index < profile_.phases.size(); ++phase_index) {
+                FileSpec spec;
+                spec.rel_path = "synthetic/phase_" + std::to_string(phase_index);
+                spec.mode = 0755;
+                directory_visitor(std::move(spec));
+            }
+        }
+        visit_files(recursive, file_visitor);
+    }
+
+    void scan_flat_folders(
+        std::size_t outstanding_folders,
+        const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
+        const std::function<bool()>& should_stop,
+        const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
+        (void)outstanding_folders;
+        std::optional<FileSpec> requested_root;
+        if (folder_provider) {
+            requested_root = folder_provider(true);
+        }
+        if (folder_provider && !requested_root.has_value()) {
+            return;
+        }
+        constexpr std::uint64_t kFilesPerSyntheticBatch = 4096;
+        SyntheticReplayConfig config;
+        config.profile = profile_;
+        SyntheticReplayCursor cursor(std::move(config));
+        SyntheticFileView view;
+        std::uint64_t batch_index = 0;
+        std::uint64_t emitted_files = 0;
+        const std::optional<std::uint64_t> requested_batch =
+            requested_root.has_value() ? synthetic_batch_index_from_path(requested_root->rel_path) : std::nullopt;
+        if (requested_batch.has_value()) {
+            const std::uint64_t files_to_skip = *requested_batch * kFilesPerSyntheticBatch;
+            while (emitted_files < files_to_skip && cursor.next_file(view)) {
+                ++emitted_files;
+            }
+            batch_index = *requested_batch;
+        }
+        while (!(should_stop && should_stop())) {
+            FlatFolderScanBatch batch;
+            batch.folder.rel_path = "synthetic/batch_" + std::to_string(batch_index++);
+            batch.folder.mode = 0755;
+            batch.scan_started_unix_ns = current_unix_time_nanoseconds();
+            batch.files.reserve(static_cast<std::size_t>(kFilesPerSyntheticBatch));
+            for (std::uint64_t index = 0;
+                 index < kFilesPerSyntheticBatch && !(should_stop && should_stop());
+                 ++index) {
+                if (!cursor.next_file(view)) {
+                    break;
+                }
+                FileSpec file = synthetic_file_spec_from_view(view);
+                file.rel_path = batch.folder.rel_path + "/file_" + std::to_string(emitted_files);
+                batch.files.push_back(std::move(file));
+                ++emitted_files;
+            }
+            if (batch.files.empty()) {
+                return;
+            }
+            batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
+            folder_visitor(std::move(batch));
+            if (requested_batch.has_value()) {
+                return;
+            }
+        }
+    }
+
+    void scan_flat_folders_streaming(
+        std::size_t outstanding_folders,
+        const std::function<std::optional<FileSpec>(bool wait_for_work)>& folder_provider,
+        const std::function<bool()>& should_stop,
+        const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
+        scan_flat_folders(outstanding_folders, folder_provider, should_stop, folder_visitor);
+    }
+
+    [[nodiscard]] FileSpec load_file(std::string_view rel_path) const override {
+        FileSpec spec;
+        spec.rel_path = std::string(rel_path);
+        spec.declared_size = 1;
+        spec.content.assign(1, '\0');
+        return spec;
+    }
+
+    [[nodiscard]] std::uint64_t read_file_discard(
+        std::string_view rel_path,
+        std::uint64_t declared_size,
+        std::size_t outstanding_requests,
+        const std::function<void(std::uint64_t)>& bytes_visitor) const override {
+        (void)rel_path;
+        (void)outstanding_requests;
+        std::uint64_t remaining = declared_size;
+        while (remaining != 0U) {
+            const std::uint64_t chunk = std::min<std::uint64_t>(remaining, kLargeChunkBytes);
+            if (bytes_visitor) {
+                bytes_visitor(chunk);
+            }
+            remaining -= chunk;
+        }
+        return declared_size;
+    }
+
+    [[nodiscard]] std::uint64_t read_file_into(std::string_view rel_path,
+                                               std::uint64_t declared_size,
+                                               std::byte* destination,
+                                               std::size_t destination_bytes) const override {
+        (void)rel_path;
+        const std::size_t bytes = static_cast<std::size_t>(
+            std::min<std::uint64_t>(declared_size, destination_bytes));
+        if (bytes != 0U) {
+            std::memset(destination, 0, bytes);
+        }
+        return bytes;
+    }
+
+    [[nodiscard]] std::uint64_t read_file_raw_chunks(
+        std::string_view rel_path,
+        std::uint64_t declared_size,
+        std::size_t outstanding_requests,
+        RawBufferPool& pool,
+        const std::function<void(RawFileChunk&&)>& data_visitor,
+        const std::function<bool()>& should_stop,
+        bool copy_payload_to_buffer) const override {
+        (void)rel_path;
+        (void)outstanding_requests;
+        std::uint64_t total = 0;
+        while (total < declared_size && !(should_stop && should_stop())) {
+            const std::size_t chunk_size = static_cast<std::size_t>(
+                std::min<std::uint64_t>(kLargeChunkBytes, declared_size - total));
+            if (should_stop && should_stop()) {
+                break;
+            }
+            BufferHandle handle = pool.acquire_spin();
+            if (should_stop && should_stop()) {
+                pool.release(handle);
+                break;
+            }
+            DataBuffer& buffer = data_buffer(pool, handle);
+            if (copy_payload_to_buffer && chunk_size != 0U) {
+                std::memset(buffer.bytes.data(), 0, chunk_size);
+            }
+            buffer.trailer = {};
+            buffer.trailer.data_offset = total;
+            buffer.trailer.data_len = chunk_size;
+            RawFileChunk chunk;
+            chunk.offset = total;
+            chunk.handle = handle;
+            total += chunk_size;
+            if (data_visitor) {
+                data_visitor(std::move(chunk));
+            } else {
+                pool.release(handle);
+            }
+        }
+        return total;
+    }
+
+    [[nodiscard]] std::optional<FileSpec> stat_path(std::string_view rel_path) const override {
+        FileSpec spec;
+        spec.rel_path = std::string(rel_path);
+        return spec;
+    }
+
+    [[nodiscard]] bool metadata_matches(std::string_view rel_path,
+                                        std::uint64_t size,
+                                        std::uint64_t mtime) const override {
+        (void)rel_path;
+        (void)size;
+        (void)mtime;
+        return true;
+    }
+
+    [[nodiscard]] std::uint64_t file_hash(std::string_view rel_path) const override {
+        return hash64(std::string(rel_path));
+    }
+
+    [[nodiscard]] bool uses_async_api() const override {
+        return false;
+    }
+
+    [[nodiscard]] std::string description() const override {
+        return "synthetic-profile://" + profile_path_.string();
+    }
+
+private:
+    std::filesystem::path profile_path_;
+    SyntheticWorkloadProfile profile_;
 };
 
 class LocalTargetWriterBackend final : public TargetWriterBackend {
@@ -4955,6 +5310,11 @@ std::uint64_t NfsBackend::visit_file_chunks(
 std::unique_ptr<NfsBackend> make_nfs_backend(std::string root,
                                              std::size_t endpoint_index,
                                              std::size_t readdirplus_page_bytes) {
+    if (is_synthetic_profile_url(root)) {
+        (void)endpoint_index;
+        (void)readdirplus_page_bytes;
+        return std::make_unique<SyntheticProfileBackend>(std::move(root));
+    }
     if (is_nfs_url(root)) {
 #if HYPERSYNC_HAS_LIBNFS
         return std::make_unique<LibNfsBackend>(std::move(root), endpoint_index, readdirplus_page_bytes);

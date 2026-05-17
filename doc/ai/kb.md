@@ -1094,3 +1094,25 @@ logical size: 335.99 TB
     mix `2.17M` small and `7.83M` large files.
   - Optional `--with-payload` touches preallocated payload views; it does not
     allocate or read storage.
+
+## Synthetic Profile Backend
+
+- 2026-05-17 14:20 PDT:
+  - Added initial `synthetic-profile://<profile-path>` support in `make_nfs_backend()`.
+  - Example source URL:
+    `synthetic-profile:////mnt/local-nvme/src/wsync/hypersync/doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt`
+  - Supported through the normal backend interface:
+    flat-folder scan, metadata benchmark, data benchmark/read by generated handles,
+    and summary diff against another synthetic-profile source.
+  - Synthetic metadata is streamed in deterministic `synthetic/batch_N/file_M`
+    batches; generated file records include declared size, deterministic mtime,
+    uid/gid, and a 64-byte synthetic handle.
+  - Synthetic data reads generate raw chunks up to the declared logical size and
+    honor stop predicates without storage I/O. `--data-copy-mode no-copy` avoids
+    payload memset on the benchmark path.
+  - Timed data benchmarks now stop `NfsDataBufferReaderJob` on timer expiry as
+    well as closing the file input queue; this prevents synthetic large-file
+    reads from keeping benchmark status alive after the requested duration.
+  - Local verification: `benchmark-meta` over the archived profile, `benchmark-data`
+    over the archived profile, selected synthetic tests, and summary diff
+    synthetic-profile vs itself (`same=1000`, `new=0`, `target_only=0`).

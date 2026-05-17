@@ -401,3 +401,9 @@ Also fixed replay of empty profile phases so the zero-filled tail phases from
 the 100-phase profile do not emit bogus records. Added a focused integration
 test and deployed to transfer1. Transfer1 release replayed `10M` synthetic file
 records from the archived NFS profile in `1.03s` at `9.69M files/s`.
+
+## 2026-05-17 14:20 PDT
+
+**User:** ok , we need to make a generator job(s) that generate nfs metadata and nfs data based on ptovided profile, we should be able to do regular opeartion like scan , read, diff etc using generator based on profile
+
+**Codex:** Added an initial `synthetic-profile://<profile-path>` backend so existing scan/data/diff-style flows can consume a saved profiler output as a source. The backend streams synthetic flat-folder metadata from `SyntheticReplayCursor`, preserves deterministic synthetic NFS handles, and generates zero-copy-style raw data chunks from declared sizes without storage I/O. Also fixed timed data benchmarks so `--max-duration-seconds` stops synthetic data readers promptly instead of waiting on a drained file queue.
