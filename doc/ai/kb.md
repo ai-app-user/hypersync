@@ -917,3 +917,29 @@ logical size: 335.99 TB
   - `make integration-test`: `21/21` passed after adding
     `main_cli_benchmark_nfs_profile_smoke`.
   - `make unit-test`: `67/67` passed.
+
+## Root Scanner-Only Baseline, 2026-05-17 11:28 PDT
+
+- User asked to test scanner-only on the full source for at least 5 minutes.
+- Important correction: the first run was accidentally non-root and invalid:
+  - Run dir:
+    `/mnt/local-nvme/wsync-codex/scanner-full-5min-20260517T181737Z`
+  - It produced `5,212` `NFS3ERR_PERM` skips and was discarded.
+- Valid root run:
+  - Run dir:
+    `/mnt/local-nvme/wsync-codex/scanner-full-root-5min-20260517T182221Z`
+  - Source:
+    `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+  - Command:
+    `sudo -n ./build/release/hypersync benchmark-meta --source <source> --metadata-stats-discarder --meta-reader-threads 96 --metadata-async-depth 256 --max-duration-seconds 300 --stats-interval-seconds 10`
+  - Git/version: `cd73886`, `hypersync 0.0.3`
+  - Permission errors: `0`
+  - Final: `1,484,518,222` files, `29,612,855` folders,
+    logical size `2,897,130,198,133,623` bytes, elapsed `314.329s`,
+    final cumulative `4.738M files/s`.
+  - Best cumulative sample: `6.581M files/s` at `100s`.
+  - Top estimated 10-second intervals:
+    `8.862M`, `8.837M`, `8.391M`, `8.021M`, `7.720M files/s`.
+- Conclusion: scanner-only is still close to/above the old `~7M/s` territory
+  during mid-run intervals. Final 5-minute average is lower due to slower/tail
+  regions and timed stop/drain.

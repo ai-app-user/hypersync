@@ -295,3 +295,15 @@ counters, and only lock once per touched phase to merge compact totals. Reran
 the same 100M/10-phase profile on transfer1: throughput improved from
 `1.23M files/s` to `5.39M files/s` (`18.545s` elapsed). Updated performance
 and AI context docs.
+
+## 2026-05-17 11:28 PDT
+
+**User:** ok, lets test just scanner on the full source test to see how fast we can do it now, run at least for 5 min to observe, report results
+
+**Codex:** First run was mistakenly launched as `ubuntu`, hit `5,212`
+`NFS3ERR_PERM` skips, and was discarded. Reran scanner-only as root on
+transfer1 for 5 minutes using direct libnfs, 96 metadata workers, async depth
+256, and no DB/write path. Valid root run saw `0` permission errors, final
+`1.484B` files and `29.6M` folders in `314.329s`, cumulative best
+`6.58M files/s` at 100s, and peak 10-second intervals around `8.86M files/s`.
+Recorded the baseline in `hypersync/doc/performance.md`.

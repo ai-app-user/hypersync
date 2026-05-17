@@ -2160,3 +2160,76 @@ Interpretation:
 - The first 20M observed records were much more large-file-heavy than the later
   phases, which is exactly the kind of phase transition the synthetic replay
   engine needs to reproduce.
+
+Root Direct-Libnfs Scanner-Only Baseline, 2026-05-17
+----------------------------------------------------
+
+Purpose: verify scanner-only throughput on the full source after noticing the
+first scanner pass was accidentally run as the non-root `ubuntu` user and hit
+thousands of permission errors.
+
+Invalid non-root run:
+
+```text
+run dir       /mnt/local-nvme/wsync-codex/scanner-full-5min-20260517T181737Z
+result        discarded
+reason        ran as ubuntu, produced 5,212 NFS3ERR_PERM skips
+```
+
+Valid root run:
+
+```text
+run dir       /mnt/local-nvme/wsync-codex/scanner-full-root-5min-20260517T182221Z
+command       sudo -n ./build/release/hypersync benchmark-meta --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 --metadata-stats-discarder --meta-reader-threads 96 --metadata-async-depth 256 --max-duration-seconds 300 --stats-interval-seconds 10
+git           cd73886
+version       hypersync 0.0.3
+wall_seconds 316.98
+elapsed_s     314.329
+max_rss_kb    25,304,188
+perm_errors   0
+```
+
+Final report:
+
+```text
+files_seen             1,484,518,222
+folders_found          29,612,855
+logical_size_bytes     2,897,130,198,133,623
+records_per_second     4.817M
+final files_per_second 4.738M
+```
+
+Useful interval/cumulative observations:
+
+```text
+elapsed  cumulative files/s
+60s      5.651M
+80s      6.014M
+90s      6.330M
+100s     6.581M  <-- best cumulative sample
+120s     6.494M
+180s     6.109M
+190s     6.095M
+290s     5.104M
+313s     4.738M  <-- includes stop/tail drain
+```
+
+Top 10-second interval estimates:
+
+```text
+80-90s    8.862M files/s
+90-100s   8.837M files/s
+50-60s    8.391M files/s
+170-180s  8.021M files/s
+70-80s    7.720M files/s
+```
+
+Interpretation:
+
+- Running as root is required for valid NFS scanner baselines on this source.
+- Scanner-only performance is still capable of old-baseline territory during
+  the middle of the run: cumulative reached `6.58M files/s`, and several
+  10-second intervals exceeded `7M files/s`.
+- The 5-minute final average is lower because the scan entered slower/tail
+  regions and the timed stop/drain phase; use mid-run interval/cumulative
+  samples when comparing scanner engine throughput.
