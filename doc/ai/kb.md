@@ -1143,3 +1143,13 @@ logical size: 335.99 TB
     profile with `?latency=all&latency-scale=1.0` completed `benchmark-data`
     with `10` files read and elapsed `0.012s`, matching the injected 1ms
     metadata page plus 10 x 1ms data-read sleeps.
+
+## Synthetic Metadata Generator Speed
+
+- 2026-05-17 14:35 PDT, transfer1 release build `4771e87`/`e578d34` lineage:
+  - Command shape:
+    `./build/release/hypersync benchmark-meta --source synthetic-profile:////mnt/local-nvme/src/wsync/hypersync/doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt --metadata-stats-discarder --max-duration-seconds 10 --stats-interval-seconds 1 --meta-reader-threads 1 --metadata-async-depth 1`
+  - Result: `48,948,328` files in `10.002s`, `4.89366M records/s`,
+    logical bytes `116,501,691,159,702`, latency disabled.
+  - Interval rate was stable around `4.90M files/s`.
+  - A `--discard-after-checker` probe did not emit timely progress in the synthetic setup and was stopped.

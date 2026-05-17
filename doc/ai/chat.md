@@ -413,3 +413,9 @@ records from the archived NFS profile in `1.03s` at `9.69M files/s`.
 **User:** agreed , implement it
 
 **Codex:** Added configurable latency emulation to the `synthetic-profile://` backend. The default remains unthrottled. The backend now supports query parameters such as `?latency=metadata`, `?latency=data`, `?latency=all`, `?latency-scale=...`, `?metadata-latency-scale=...`, and `?data-latency-scale=...`. Metadata scan sleeps use profile READDIRPLUS page latency percentiles; data reads use sampled small/large read latency percentiles. Added a focused test that verifies both metadata and data latency emulation.
+
+## 2026-05-17 14:35 PDT
+
+**User:** ok, let test metadata generator speed by connecting it to discarder
+
+**Codex:** Ran `benchmark-meta` on transfer1 with the archived full-source profile as `synthetic-profile://...`, latency disabled, and `--metadata-stats-discarder`. The synthetic metadata generator plus stats discarder sustained about `4.89M files/s` for 10 seconds and processed `48,948,328` files. Also tried the checker discard route, but it did not produce timely progress in this synthetic setup, so it was stopped.
