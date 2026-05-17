@@ -2095,3 +2095,64 @@ Interpretation:
   histograms and phase counters, not per-file paths or NFS handles.
 - This is fast enough for the intended replay/profiler control plane; next work
   is wiring live scan capture into the same profile format.
+
+Real NFS Profiler Smoke, 2026-05-17
+-----------------------------------
+
+Purpose: capture a compact workload profile from a real NFS source without
+persisting per-file records. The profiler stops after a fixed number of file
+records and divides the observed stream into fixed chronological macro-phases.
+
+Command, run on transfer1:
+
+```text
+./build/release/hypersync benchmark-nfs-profile \
+  --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 \
+  --max-records 100000000 \
+  --phase-count 10 \
+  --meta-reader-threads 96 \
+  --metadata-async-depth 256 \
+  --readdirplus-page-bytes 262144 \
+  --output /mnt/local-nvme/wsync-codex/nfs-profile-100m-10phase-20260517T180034Z/profile.txt
+```
+
+Result:
+
+```text
+files_observed      100,000,000
+folders_observed    5,585,721
+failed_folders      7
+elapsed_s           81.076
+files_per_second    1,233,417.406
+max_rss_kb          8,582,080
+phases              10
+small_files         54,756,155
+large_files         45,243,845
+logical_size        661,381,123,540,554 bytes
+```
+
+Phase small-file ratios:
+
+```text
+phase 0  0.014
+phase 1  0.127
+phase 2  0.448
+phase 3  0.612
+phase 4  0.754
+phase 5  0.749
+phase 6  0.689
+phase 7  0.689
+phase 8  0.724
+phase 9  0.670
+```
+
+Interpretation:
+
+- This run used direct libnfs through the existing `scan_flat_folders()` path.
+- The profiler stored aggregate counters/histograms only, not the 100M file
+  records or raw handles.
+- Memory is dominated by concurrent libnfs metadata scanning state and in-flight
+  directory/page buffers; the compact profile itself is tiny.
+- The first 20M observed records were much more large-file-heavy than the later
+  phases, which is exactly the kind of phase transition the synthetic replay
+  engine needs to reproduce.

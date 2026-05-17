@@ -888,3 +888,29 @@ logical size: 335.99 TB
   - `make unit-test`: `67/67` passed before CLI smoke addition.
   - `make integration-test`: `20/20` passed after adding
     `main_cli_benchmark_synthetic_profile_smoke`.
+
+## Real NFS Profiler Benchmark, 2026-05-17 11:02 PDT
+
+- Added CLI command:
+  `hypersync benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--output <profile.txt>]`.
+- Implementation uses direct libnfs via `NfsBackend::scan_flat_folders()` and
+  accumulates fixed chronological phase histograms. It does not store per-file
+  records or raw NFS handles.
+- Transfer1 run:
+  - Run dir:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-100m-10phase-20260517T180034Z`
+  - Source:
+    `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+  - Command settings:
+    `--max-records 100000000 --phase-count 10 --meta-reader-threads 96 --metadata-async-depth 256 --readdirplus-page-bytes 262144`
+  - Result: `100,000,000` file records in `81.076s`,
+    `1.233M files/s`, max RSS `8,582,080 KB`.
+  - Observed: `5,585,721` folders, `7` failed folders,
+    `54,756,155` small files, `45,243,845` large files,
+    logical size `661,381,123,540,554` bytes.
+  - Phase small ratios:
+    `0.014, 0.127, 0.448, 0.612, 0.754, 0.749, 0.689, 0.689, 0.724, 0.670`.
+- Verification:
+  - `make integration-test`: `21/21` passed after adding
+    `main_cli_benchmark_nfs_profile_smoke`.
+  - `make unit-test`: `67/67` passed.

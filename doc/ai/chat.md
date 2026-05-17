@@ -271,3 +271,17 @@ Result: `1.721s`, `58.1M files/s`, `3.8MB` max RSS, and a compact 3-phase
 profile: 35M small-heavy files, 35M mixed files, and 30M large-bulk-tail files.
 Added an integration smoke test for the CLI and recorded the result in
 `hypersync/doc/performance.md`.
+
+## 2026-05-17 11:02 PDT
+
+**User:** ok, I want a profiler for real NFS source, 100M records for now, 10 phases
+
+**Codex:** Added `benchmark-nfs-profile`, a direct-libnfs profile capture CLI
+that scans a real NFS source through `scan_flat_folders()`, stops at a fixed
+file-record cap, and emits a compact 10-phase profile without storing per-file
+records or handles. Ran it on transfer1 against
+`nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`.
+Result: `100M` file records in `81.076s` (`1.23M files/s`), `5.59M` folders
+observed, `7` failed folders, `54.76M` small files, `45.24M` large files, and
+10 chronological phase slices. Added an integration smoke test and recorded the
+run in `hypersync/doc/performance.md`.

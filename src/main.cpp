@@ -1,12 +1,18 @@
 #include "hypersync.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -153,6 +159,285 @@ void print_synthetic_profile(std::ostream& out,
     }
 }
 
+struct NfsProfileWorkQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<hypersync::FileSpec> folders;
+    std::size_t active = 0;
+    bool done = false;
+    std::exception_ptr error;
+};
+
+struct FixedPhaseAccumulator {
+    std::uint64_t file_count = 0;
+    std::uint64_t folder_count = 0;
+    std::uint64_t logical_size_bytes = 0;
+    std::uint64_t small_file_count = 0;
+    std::uint64_t large_file_count = 0;
+    std::array<std::uint64_t, hypersync::kSyntheticSizeBucketCount> size_file_counts {};
+    std::array<std::uint64_t, hypersync::kSyntheticSizeBucketCount> size_logical_bytes {};
+    std::array<std::uint64_t, hypersync::kSyntheticFolderFanoutBucketCount> folder_fanout_counts {};
+    std::uint64_t filename_length_sum = 0;
+    std::uint64_t depth_sum = 0;
+};
+
+std::uint16_t profile_path_depth(std::string_view path) noexcept {
+    if (path.empty()) {
+        return 0;
+    }
+    std::uint16_t depth = 1;
+    for (const char ch : path) {
+        if (ch == '/') {
+            ++depth;
+        }
+    }
+    return depth;
+}
+
+std::uint16_t profile_filename_length(std::string_view path) noexcept {
+    const std::size_t slash = path.find_last_of('/');
+    const std::size_t length = slash == std::string_view::npos ? path.size() : path.size() - slash - 1U;
+    return static_cast<std::uint16_t>(std::min<std::size_t>(length, std::numeric_limits<std::uint16_t>::max()));
+}
+
+void add_file_to_fixed_phase(FixedPhaseAccumulator& accumulator,
+                             const hypersync::FileSpec& file,
+                             std::uint64_t small_threshold,
+                             std::uint64_t files_in_folder) {
+    const std::uint64_t size = file.declared_size != 0U ? file.declared_size : file.content.size();
+    ++accumulator.file_count;
+    accumulator.logical_size_bytes += size;
+    if (size <= small_threshold) {
+        ++accumulator.small_file_count;
+    } else {
+        ++accumulator.large_file_count;
+    }
+    const std::size_t size_bucket = hypersync::synthetic_size_bucket_index(size);
+    ++accumulator.size_file_counts[size_bucket];
+    accumulator.size_logical_bytes[size_bucket] += size;
+    ++accumulator.folder_fanout_counts[hypersync::synthetic_folder_fanout_bucket_index(files_in_folder)];
+    accumulator.filename_length_sum += profile_filename_length(file.rel_path);
+    accumulator.depth_sum += profile_path_depth(file.rel_path);
+}
+
+hypersync::SyntheticWorkloadProfile make_fixed_phase_profile(
+    const std::vector<FixedPhaseAccumulator>& accumulators,
+    std::uint64_t small_threshold) {
+    hypersync::SyntheticWorkloadProfile profile;
+    profile.small_file_threshold_bytes = small_threshold;
+    profile.phases.reserve(accumulators.size());
+    for (std::size_t index = 0; index < accumulators.size(); ++index) {
+        const auto& accumulator = accumulators[index];
+        hypersync::SyntheticPhaseProfile phase;
+        phase.name = "phase_" + std::to_string(index);
+        phase.file_count = accumulator.file_count;
+        phase.folder_count = accumulator.folder_count;
+        phase.logical_size_bytes = accumulator.logical_size_bytes;
+        phase.small_file_count = accumulator.small_file_count;
+        phase.large_file_count = accumulator.large_file_count;
+        phase.size_file_counts = accumulator.size_file_counts;
+        phase.size_logical_bytes = accumulator.size_logical_bytes;
+        phase.folder_fanout_counts = accumulator.folder_fanout_counts;
+        phase.filename_length_sum = accumulator.filename_length_sum;
+        phase.depth_sum = accumulator.depth_sum;
+        profile.phases.push_back(std::move(phase));
+    }
+    return profile;
+}
+
+std::optional<hypersync::FileSpec> take_nfs_profile_folder_work(NfsProfileWorkQueue& queue,
+                                                                bool wait_for_work) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    const auto ready = [&queue]() {
+        return queue.done || queue.error || !queue.folders.empty();
+    };
+    if (wait_for_work) {
+        queue.cv.wait(lock, ready);
+    } else if (!ready()) {
+        return std::nullopt;
+    }
+    if (queue.done || queue.error || queue.folders.empty()) {
+        return std::nullopt;
+    }
+    hypersync::FileSpec folder = std::move(queue.folders.front());
+    queue.folders.pop_front();
+    ++queue.active;
+    return folder;
+}
+
+void finish_nfs_profile_folder_work(NfsProfileWorkQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.active != 0U) {
+            --queue.active;
+        }
+        if (queue.folders.empty() && queue.active == 0U) {
+            queue.done = true;
+        }
+    }
+    queue.cv.notify_all();
+}
+
+void request_nfs_profile_stop(NfsProfileWorkQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.done = true;
+        queue.folders.clear();
+    }
+    queue.cv.notify_all();
+}
+
+void fail_nfs_profile_work(NfsProfileWorkQueue& queue, std::exception_ptr error) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.done = true;
+        if (!queue.error) {
+            queue.error = error;
+        }
+    }
+    queue.cv.notify_all();
+}
+
+void enqueue_nfs_profile_folders(NfsProfileWorkQueue& queue,
+                                 std::vector<hypersync::FileSpec>&& folders) {
+    if (folders.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (queue.done || queue.error) {
+            return;
+        }
+        for (auto& folder : folders) {
+            queue.folders.push_back(std::move(folder));
+        }
+    }
+    queue.cv.notify_all();
+}
+
+struct NfsProfileCaptureResult {
+    hypersync::SyntheticWorkloadProfile profile;
+    std::uint64_t files_observed = 0;
+    std::uint64_t folders_observed = 0;
+    std::uint64_t failed_folders = 0;
+    double elapsed_seconds = 0.0;
+};
+
+NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_root,
+                                            bool recursive,
+                                            std::size_t meta_reader_threads,
+                                            std::size_t metadata_async_depth,
+                                            std::size_t readdirplus_page_bytes,
+                                            std::uint64_t max_records,
+                                            std::size_t phase_count,
+                                            std::uint64_t small_threshold) {
+    NfsProfileWorkQueue queue;
+    queue.folders.push_back(hypersync::FileSpec {});
+    std::mutex profile_mutex;
+    std::vector<FixedPhaseAccumulator> accumulators(std::max<std::size_t>(1U, phase_count));
+    std::uint64_t files_observed = 0;
+    std::uint64_t folders_observed = 1;
+    std::uint64_t failed_folders = 0;
+    const std::uint64_t records_per_phase =
+        std::max<std::uint64_t>(1U, (max_records + accumulators.size() - 1U) / accumulators.size());
+    const auto started = std::chrono::steady_clock::now();
+
+    const auto should_stop = [&]() {
+        std::lock_guard<std::mutex> lock(profile_mutex);
+        return files_observed >= max_records;
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(std::max<std::size_t>(1U, meta_reader_threads));
+    for (std::size_t worker_index = 0; worker_index < std::max<std::size_t>(1U, meta_reader_threads); ++worker_index) {
+        (void)worker_index;
+        workers.emplace_back([&]() {
+            try {
+                auto backend = hypersync::make_nfs_backend(source_root.string(),
+                                                           hypersync::kNfsEndpointAny,
+                                                           readdirplus_page_bytes);
+                backend->scan_flat_folders(
+                    std::max<std::size_t>(1U, metadata_async_depth),
+                    [&queue](bool wait_for_work) {
+                        return take_nfs_profile_folder_work(queue, wait_for_work);
+                    },
+                    [&should_stop]() {
+                        return should_stop();
+                    },
+                    [&](hypersync::FlatFolderScanBatch batch) {
+                        if (batch.failed) {
+                            {
+                                std::lock_guard<std::mutex> lock(profile_mutex);
+                                ++failed_folders;
+                            }
+                            finish_nfs_profile_folder_work(queue);
+                            return;
+                        }
+
+                        std::vector<hypersync::FileSpec> child_work;
+                        if (recursive && !should_stop()) {
+                            child_work.reserve(batch.directories.size());
+                            for (auto& directory : batch.directories) {
+                                child_work.push_back(std::move(directory));
+                            }
+                        }
+
+                        {
+                            std::lock_guard<std::mutex> lock(profile_mutex);
+                            const std::uint64_t folder_file_count = batch.files.size();
+                            for (const auto& file : batch.files) {
+                                if (files_observed >= max_records) {
+                                    break;
+                                }
+                                const std::size_t phase_index = std::min<std::size_t>(
+                                    accumulators.size() - 1U,
+                                    static_cast<std::size_t>(files_observed / records_per_phase));
+                                add_file_to_fixed_phase(accumulators[phase_index],
+                                                        file,
+                                                        small_threshold,
+                                                        folder_file_count);
+                                ++files_observed;
+                            }
+                            const std::size_t folder_phase_index = std::min<std::size_t>(
+                                accumulators.size() - 1U,
+                                static_cast<std::size_t>(std::min(files_observed, max_records - 1U) /
+                                                         records_per_phase));
+                            accumulators[folder_phase_index].folder_count += 1U + batch.directories.size();
+                            folders_observed += 1U + batch.directories.size();
+                        }
+
+                        if (should_stop()) {
+                            request_nfs_profile_stop(queue);
+                        } else {
+                            enqueue_nfs_profile_folders(queue, std::move(child_work));
+                        }
+                        finish_nfs_profile_folder_work(queue);
+                    });
+                if (should_stop()) {
+                    request_nfs_profile_stop(queue);
+                }
+            } catch (...) {
+                fail_nfs_profile_work(queue, std::current_exception());
+            }
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    if (queue.error) {
+        std::rethrow_exception(queue.error);
+    }
+
+    NfsProfileCaptureResult result;
+    result.profile = make_fixed_phase_profile(accumulators, small_threshold);
+    result.files_observed = files_observed;
+    result.folders_observed = folders_observed;
+    result.failed_folders = failed_folders;
+    result.elapsed_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    return result;
+}
+
 void print_usage() {
     std::cerr
         << "Usage:\n"
@@ -169,6 +454,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-fake-diff [--file-count <n>] [--folder-count <n>] [--average-file-size <bytes>] [--source-threads <n>] [--fake-remote-threads <n>] [--checker-threads <n>] [--remote-delay-us <n>] [--request-queue-depth <n>] [--batch-queue-depth <n>] [--stats-interval-seconds <n>]\n"
@@ -288,6 +574,96 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("failed to open output: " + output_path.string());
                 }
                 print_synthetic_profile(output, profile, file_count, elapsed_seconds);
+            }
+            return 0;
+        }
+
+        if (command == "benchmark-nfs-profile") {
+            std::filesystem::path source_root;
+            bool recursive = true;
+            std::uint64_t max_records = 100'000'000ULL;
+            std::size_t phase_count = 10;
+            std::size_t meta_reader_threads = 96;
+            std::size_t metadata_async_depth = 256;
+            std::size_t readdirplus_page_bytes = 256U * 1024U;
+            std::uint64_t small_threshold = hypersync::kSmallFileThreshold;
+            std::filesystem::path output_path;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--source") {
+                    source_root = require_option(args, i, "--source");
+                } else if (args[i] == "--non-recursive") {
+                    recursive = false;
+                } else if (args[i] == "--max-records") {
+                    max_records = parse_u64_option(require_option(args, i, "--max-records"),
+                                                   "--max-records");
+                } else if (args[i] == "--phase-count") {
+                    phase_count = parse_size_t_option(require_option(args, i, "--phase-count"),
+                                                      "--phase-count");
+                } else if (args[i] == "--meta-reader-threads") {
+                    meta_reader_threads =
+                        parse_size_t_option(require_option(args, i, "--meta-reader-threads"),
+                                            "--meta-reader-threads");
+                } else if (args[i] == "--metadata-async-depth") {
+                    metadata_async_depth =
+                        parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
+                                            "--metadata-async-depth");
+                } else if (args[i] == "--readdirplus-page-bytes") {
+                    readdirplus_page_bytes =
+                        parse_size_t_option(require_option(args, i, "--readdirplus-page-bytes"),
+                                            "--readdirplus-page-bytes");
+                } else if (args[i] == "--small-file-threshold-bytes") {
+                    small_threshold =
+                        parse_u64_option(require_option(args, i, "--small-file-threshold-bytes"),
+                                         "--small-file-threshold-bytes");
+                } else if (args[i] == "--output") {
+                    output_path = require_option(args, i, "--output");
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            if (source_root.empty()) {
+                throw std::runtime_error("--source is required");
+            }
+            if (max_records == 0U) {
+                throw std::runtime_error("--max-records must be greater than zero");
+            }
+
+            const NfsProfileCaptureResult result = capture_nfs_profile(source_root,
+                                                                       recursive,
+                                                                       meta_reader_threads,
+                                                                       metadata_async_depth,
+                                                                       readdirplus_page_bytes,
+                                                                       max_records,
+                                                                       phase_count,
+                                                                       small_threshold);
+            print_synthetic_profile(std::cout,
+                                    result.profile,
+                                    result.files_observed,
+                                    result.elapsed_seconds);
+            std::cout << "nfs_profile source=" << source_root.string()
+                      << " folders_observed=" << result.folders_observed
+                      << " failed_folders=" << result.failed_folders
+                      << " meta_reader_threads=" << meta_reader_threads
+                      << " metadata_async_depth=" << metadata_async_depth
+                      << " readdirplus_page_bytes=" << readdirplus_page_bytes
+                      << " recursive=" << (recursive ? "true" : "false") << '\n';
+            if (!output_path.empty()) {
+                std::ofstream output(output_path);
+                if (!output) {
+                    throw std::runtime_error("failed to open output: " + output_path.string());
+                }
+                print_synthetic_profile(output,
+                                        result.profile,
+                                        result.files_observed,
+                                        result.elapsed_seconds);
+                output << "nfs_profile source=" << source_root.string()
+                       << " folders_observed=" << result.folders_observed
+                       << " failed_folders=" << result.failed_folders
+                       << " meta_reader_threads=" << meta_reader_threads
+                       << " metadata_async_depth=" << metadata_async_depth
+                       << " readdirplus_page_bytes=" << readdirplus_page_bytes
+                       << " recursive=" << (recursive ? "true" : "false") << '\n';
             }
             return 0;
         }

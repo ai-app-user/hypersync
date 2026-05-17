@@ -3904,6 +3904,43 @@ void test_main_cli_benchmark_synthetic_profile_smoke() {
                 profile_text.find("small_ratio=0.200") != std::string::npos);
 }
 
+void test_main_cli_benchmark_nfs_profile_smoke() {
+    TempDir source("hypersync_cli_benchmark_nfs_profile_source");
+    TempDir output("hypersync_cli_benchmark_nfs_profile_output");
+
+    fs::create_directories(source.path / "small");
+    fs::create_directories(source.path / "large");
+    for (int index = 0; index < 20; ++index) {
+        write_file(source.path / "small" / ("s" + std::to_string(index) + ".txt"), "x");
+        write_file(source.path / "large" / ("l" + std::to_string(index) + ".bin"),
+                   std::string(200U * 1024U, 'L'));
+    }
+
+    const std::string app = (fs::current_path() / "build" / "hypersync").string();
+    const fs::path stdout_path = output.path / "nfs_profile_stdout.txt";
+    const fs::path profile_path = output.path / "nfs_profile.txt";
+
+    EXPECT_TRUE(command_succeeds(app + " benchmark-nfs-profile --source " +
+                                 source.path.string() +
+                                 " --max-records 30 --phase-count 10" +
+                                 " --meta-reader-threads 2 --metadata-async-depth 2" +
+                                 " --output " + profile_path.string() +
+                                 " > " + stdout_path.string() + " 2>&1"));
+    const std::string output_text = hypersync::read_file_contents(stdout_path);
+    EXPECT_TRUE(output_text.find("synthetic_profile_benchmark files_observed=30") !=
+                std::string::npos);
+    EXPECT_TRUE(output_text.find("phases=10") != std::string::npos);
+    EXPECT_TRUE(output_text.find("nfs_profile source=") != std::string::npos);
+    EXPECT_TRUE(output_text.find("failed_folders=0") != std::string::npos);
+
+    const std::string profile_text = hypersync::read_file_contents(profile_path);
+    EXPECT_TRUE(profile_text.find("phase index=0") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("phase index=9") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("small_files=") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("large_files=") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("<=1048576:") != std::string::npos);
+}
+
 void test_main_cli_benchmark_hash_smoke() {
     TempDir output("hypersync_cli_benchmark_hash_output");
 
@@ -4815,6 +4852,9 @@ int main(int argc, char** argv) {
         {"main_cli_benchmark_synthetic_profile_smoke",
          TestSuite::integration,
          test_main_cli_benchmark_synthetic_profile_smoke},
+        {"main_cli_benchmark_nfs_profile_smoke",
+         TestSuite::integration,
+         test_main_cli_benchmark_nfs_profile_smoke},
         {"main_cli_benchmark_hash_smoke", TestSuite::integration, test_main_cli_benchmark_hash_smoke},
         {"main_cli_benchmark_metadata_writer_smoke",
          TestSuite::integration,
