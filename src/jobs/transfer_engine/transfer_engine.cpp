@@ -4000,6 +4000,7 @@ void pack_flat_folder_batch_to_queue_with(const FlatFolderScanBatch& batch,
 }
 
 inline constexpr BufferPoolId kFolderWorkBufferPoolId = 34;
+inline constexpr BufferPoolId kFolderFeedbackBufferPoolId = 35;
 
 enum class FolderWorkKind : std::uint32_t {
     folder = 1,
@@ -4045,8 +4046,8 @@ FileSpec folder_spec_from_work_buffer(const MetadataBuffer& buffer) {
     return folder;
 }
 
-RawBufferPool make_folder_work_buffer_pool(std::size_t capacity) {
-    return RawBufferPool(kFolderWorkBufferPoolId, capacity, sizeof(MetadataBuffer), alignof(MetadataBuffer));
+RawBufferPool make_folder_work_buffer_pool(BufferPoolId pool_id, std::size_t capacity) {
+    return RawBufferPool(pool_id, capacity, sizeof(MetadataBuffer), alignof(MetadataBuffer));
 }
 
 std::size_t folder_work_slots(std::size_t worker_count, std::size_t async_depth) {
@@ -4058,12 +4059,14 @@ public:
     FolderSeederJob(bool recursive,
                     double max_duration_seconds,
                     RawBufferPool& folder_pool,
+                    RawBufferPool& feedback_pool,
                     BufQueue& folder_output,
                     BufQueue& feedback_input)
         : ThreadedJob(1U),
           recursive_(recursive),
           max_duration_seconds_(max_duration_seconds),
           folder_pool_(folder_pool),
+          feedback_pool_(feedback_pool),
           folder_output_(folder_output),
           feedback_input_(feedback_input) {}
 
@@ -4117,21 +4120,21 @@ protected:
             while (feedback_drained < 4096U && feedback_input_.try_pop(feedback)) {
                 ++feedback_drained;
                 progressed = true;
-                MetadataBuffer& buffer = metadata_buffer(folder_pool_, feedback);
+                MetadataBuffer& buffer = metadata_buffer(feedback_pool_, feedback);
                 const FolderWorkKind kind = folder_work_kind(buffer);
                 if (kind == FolderWorkKind::folder) {
                     FileSpec folder = folder_spec_from_work_buffer(buffer);
-                    folder_pool_.release(feedback);
+                    feedback_pool_.release(feedback);
                     pending_folders.push_back(std::move(folder));
                     ++active_folders_;
                 } else if (kind == FolderWorkKind::complete) {
-                    folder_pool_.release(feedback);
+                    feedback_pool_.release(feedback);
                     if (active_folders_ != 0U) {
                         --active_folders_;
                     }
                 } else {
                     const std::string message(reinterpret_cast<const char*>(buffer.bytes.data()), buffer.bytes_used);
-                    folder_pool_.release(feedback);
+                    feedback_pool_.release(feedback);
                     {
                         std::lock_guard<std::mutex> lock(error_mutex_);
                         error_ = std::make_exception_ptr(std::runtime_error(message));
@@ -4193,6 +4196,7 @@ private:
     bool recursive_ = true;
     double max_duration_seconds_ = 0.0;
     RawBufferPool& folder_pool_;
+    RawBufferPool& feedback_pool_;
     BufQueue& folder_output_;
     BufQueue& feedback_input_;
     std::optional<std::chrono::steady_clock::time_point> stop_at_;
@@ -4208,6 +4212,7 @@ public:
                            std::size_t worker_count,
                            std::size_t async_depth,
                            RawBufferPool& folder_pool,
+                           RawBufferPool& feedback_pool,
                            BufQueue& folder_input,
                            BufQueue& folder_feedback,
                            RawBufferPool& output_pool,
@@ -4218,6 +4223,7 @@ public:
           compare_mode_(std::move(compare_mode)),
           async_depth_(std::max<std::size_t>(1U, async_depth)),
           folder_pool_(folder_pool),
+          feedback_pool_(feedback_pool),
           folder_input_(folder_input),
           folder_feedback_(folder_feedback),
           output_pool_(output_pool),
@@ -4327,14 +4333,14 @@ private:
                        FolderWorkKind kind,
                        std::string_view rel_path,
                        bool recursive) {
-        std::optional<BufferHandle> maybe_handle = wait_for_pool(worker_index, folder_pool_);
+        std::optional<BufferHandle> maybe_handle = wait_for_pool(worker_index, feedback_pool_);
         if (!maybe_handle.has_value()) {
             return;
         }
         const BufferHandle handle = *maybe_handle;
-        reset_folder_work_buffer(metadata_buffer(folder_pool_, handle), kind, rel_path, recursive);
+        reset_folder_work_buffer(metadata_buffer(feedback_pool_, handle), kind, rel_path, recursive);
         if (!wait_for_output(worker_index, folder_feedback_, handle)) {
-            folder_pool_.release(handle);
+            feedback_pool_.release(handle);
         }
     }
 
@@ -4342,6 +4348,7 @@ private:
     std::string compare_mode_;
     std::size_t async_depth_ = 1;
     RawBufferPool& folder_pool_;
+    RawBufferPool& feedback_pool_;
     BufQueue& folder_input_;
     BufQueue& folder_feedback_;
     RawBufferPool& output_pool_;
@@ -10161,16 +10168,21 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         report.record_buffer_slots = flat_slots;
 
         RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
-        RawBufferPool folder_pool =
-            make_folder_work_buffer_pool(folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
+        RawBufferPool folder_pool = make_folder_work_buffer_pool(
+            kFolderWorkBufferPoolId,
+            folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
+        RawBufferPool folder_feedback_pool = make_folder_work_buffer_pool(
+            kFolderFeedbackBufferPoolId,
+            folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
         BufferPoolRegistry registry;
         registry.register_pool(metadata_pool);
         BufQueue metadata_queue(flat_slots);
         BufQueue folder_queue(folder_pool.capacity());
-        BufQueue folder_feedback_queue(folder_pool.capacity());
+        BufQueue folder_feedback_queue(folder_feedback_pool.capacity());
         FolderSeederJob folder_seeder(recursive,
                                       max_duration_seconds,
                                       folder_pool,
+                                      folder_feedback_pool,
                                       folder_queue,
                                       folder_feedback_queue);
         NfsMetaReaderBufferJob scanner(source_root.string(),
@@ -10178,6 +10190,7 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                        report.meta_reader_threads,
                                        report.metadata_async_depth,
                                        folder_pool,
+                                       folder_feedback_pool,
                                        folder_queue,
                                        folder_feedback_queue,
                                        metadata_pool,
@@ -10226,17 +10239,22 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         report.record_buffer_slots = flat_slots;
 
         RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
-        RawBufferPool folder_pool =
-            make_folder_work_buffer_pool(folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
+        RawBufferPool folder_pool = make_folder_work_buffer_pool(
+            kFolderWorkBufferPoolId,
+            folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
+        RawBufferPool folder_feedback_pool = make_folder_work_buffer_pool(
+            kFolderFeedbackBufferPoolId,
+            folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
         BufferPoolRegistry registry;
         registry.register_pool(metadata_pool);
         BufQueue metadata_to_discard(flat_slots);
         BufQueue folder_queue(folder_pool.capacity());
-        BufQueue folder_feedback_queue(folder_pool.capacity());
+        BufQueue folder_feedback_queue(folder_feedback_pool.capacity());
 
         FolderSeederJob folder_seeder(recursive,
                                       max_duration_seconds,
                                       folder_pool,
+                                      folder_feedback_pool,
                                       folder_queue,
                                       folder_feedback_queue);
         NfsMetaReaderBufferJob scanner(source_root.string(),
@@ -10244,6 +10262,7 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                        report.meta_reader_threads,
                                        report.metadata_async_depth,
                                        folder_pool,
+                                       folder_feedback_pool,
                                        folder_queue,
                                        folder_feedback_queue,
                                        metadata_pool,
@@ -12167,11 +12186,14 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     const std::size_t control_slots = distributed_diff_control_slots(worker_count);
     RawBufferPool send_pool = make_metadata_batch_buffer_pool(flat_slots);
     RawBufferPool result_pool = make_metadata_batch_buffer_pool(control_slots);
-    RawBufferPool folder_pool = make_folder_work_buffer_pool(folder_work_slots(worker_count, async_depth));
+    RawBufferPool folder_pool =
+        make_folder_work_buffer_pool(kFolderWorkBufferPoolId, folder_work_slots(worker_count, async_depth));
+    RawBufferPool folder_feedback_pool =
+        make_folder_work_buffer_pool(kFolderFeedbackBufferPoolId, folder_work_slots(worker_count, async_depth));
     BufQueue send_queue(flat_slots);
     BufQueue result_queue(control_slots);
     BufQueue folder_queue(folder_pool.capacity());
-    BufQueue folder_feedback_queue(folder_pool.capacity());
+    BufQueue folder_feedback_queue(folder_feedback_pool.capacity());
     BufferPoolRegistry send_registry;
     send_registry.register_pool(send_pool);
 
@@ -12186,6 +12208,7 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     FolderSeederJob folder_seeder(recursive,
                                   max_duration_seconds,
                                   folder_pool,
+                                  folder_feedback_pool,
                                   folder_queue,
                                   folder_feedback_queue);
     NfsMetaReaderBufferJob scanner(source_root.string(),
@@ -12193,6 +12216,7 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
                                    worker_count,
                                    async_depth,
                                    folder_pool,
+                                   folder_feedback_pool,
                                    folder_queue,
                                    folder_feedback_queue,
                                    send_pool,
