@@ -46,6 +46,7 @@
 #include "jobs/nfs_data_reader/nfs_data_reader.hpp"
 #include "jobs/nfs_meta_reader/nfs_meta_reader.hpp"
 #include "jobs/scan_writer/scan_writer.hpp"
+#include "jobs/synthetic_workload/synthetic_workload.hpp"
 #include "jobs/transfer_engine/transfer_engine.hpp"
 #include "monitoring/autoscaler.hpp"
 #include "monitoring/status_monitor.hpp"

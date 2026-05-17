@@ -354,6 +354,49 @@ scan, small/large data read, diff, sync, and writer pipelines, must keep
 separate learned profiles because the same Job can need different settings in
 different contexts.
 
+### 0.10 Synthetic Workload Engine
+
+Hypersync must be able to validate autoscaling, queue thresholds, and mixed
+small/large routing without depending on a live storage array. The synthetic
+workload engine has two independent modes:
+
+- **Profile capture:** one high-speed live metadata scan builds a compact,
+  storage-agnostic workload profile. It does not persist paths or file handles.
+- **Synthetic replay:** a zero-storage replay cursor emits deterministic
+  metadata/data work shaped by that profile, usually faster than any NFS or
+  local filesystem reader.
+
+Profile capture groups the live namespace in chronological scan order. It
+observes fixed-size blocks, normally one million files per block, and compares
+the current block with the active phase. If the small-file ratio or future
+distribution checks shift beyond the configured threshold, the current phase is
+sealed and a new phase begins. Adjacent similar blocks are merged so a
+multi-billion-file tree normally compresses to a small number of macro-phases.
+
+Each phase stores histograms and totals only:
+
+- explicit file-size buckets
+- small and large file counts using the gapless boundary `small <= threshold`,
+  `large > threshold`
+- logical bytes by size bucket
+- files-per-folder fanout buckets and depth totals
+- filename length totals, UID/GID/mode distributions when enabled
+- latency percentiles for READDIRPLUS pages, small reads, and large block reads
+
+The replay hot path must not allocate heap memory, format variable strings into
+heap objects, or track file handles in global lookup tables. It generates paths
+into fixed stack/reusable buffers, creates deterministic 64-byte opaque NFS
+handles from `(seed, phase_id, folder_id, file_id)`, samples size buckets from
+the active phase, and returns pointer/length or view records to downstream
+pipeline adapters. Payload data comes from preallocated fixed-size pools such as
+4 KiB small buffers and 1 MiB large buffers. Rate limiting and latency emulation
+are disabled by default; they are enabled only to reproduce a degraded backend.
+
+Replay phases advance by counters: emitted files, bytes, folders, or elapsed
+time depending on profile settings. Scale knobs may multiply file counts and
+data volume so a compact profile captured from a smaller run can stress
+multi-billion-file buffers and petabyte-scale data-path behavior.
+
 ---
 
 ## 1. Overview

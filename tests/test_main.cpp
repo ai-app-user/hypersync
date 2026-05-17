@@ -86,6 +86,17 @@ using hypersync::SplitBucketPriorityInput;
 using hypersync::BucketPathOverloadInput;
 using hypersync::BucketPathOverloadScores;
 using hypersync::SplitScannerCapacityDecision;
+using hypersync::SyntheticFileView;
+using hypersync::SyntheticObservedFile;
+using hypersync::SyntheticPayloadPattern;
+using hypersync::SyntheticPayloadPool;
+using hypersync::SyntheticPayloadView;
+using hypersync::SyntheticPhaseProfile;
+using hypersync::SyntheticProfileBuilder;
+using hypersync::SyntheticProfileCaptureConfig;
+using hypersync::SyntheticReplayConfig;
+using hypersync::SyntheticReplayCursor;
+using hypersync::SyntheticWorkloadProfile;
 using hypersync::ScanWriter;
 using hypersync::SpscRing;
 using hypersync::TransferEngine;
@@ -95,6 +106,7 @@ using hypersync::kMetadataBufferPoolId;
 using hypersync::choose_split_bucket_priority_workers;
 using hypersync::choose_split_scanner_capacity;
 using hypersync::evaluate_bucket_path_overload;
+using hypersync::synthetic_size_bucket_index;
 
 namespace {
 
@@ -917,6 +929,131 @@ void test_bucket_path_overload_scores_reflect_eta_reservoir_and_wire_pressure() 
     scores = evaluate_bucket_path_overload(input);
     EXPECT_TRUE(scores.small_score < 1.0);
     EXPECT_TRUE(scores.large_score < 1.0);
+}
+
+void test_synthetic_profile_builder_detects_chronological_phases() {
+    SyntheticProfileCaptureConfig config;
+    config.block_file_count = 10;
+    config.small_ratio_shift_threshold = 0.20;
+    config.small_file_threshold_bytes = 128U * 1024U;
+    SyntheticProfileBuilder builder(config);
+
+    for (std::size_t index = 0; index < 10U; ++index) {
+        builder.observe_file(SyntheticObservedFile {
+            4U * 1024U,
+            1000,
+            1000,
+            0644,
+            12,
+            3,
+            10,
+        });
+    }
+    for (std::size_t index = 0; index < 10U; ++index) {
+        builder.observe_file(SyntheticObservedFile {
+            16U * 1024U * 1024U,
+            1000,
+            1000,
+            0644,
+            12,
+            3,
+            10,
+        });
+    }
+
+    const SyntheticWorkloadProfile profile = builder.finish();
+    EXPECT_EQ(profile.phases.size(), 2U);
+    EXPECT_EQ(profile.phases[0].small_file_count, 10U);
+    EXPECT_EQ(profile.phases[0].large_file_count, 0U);
+    EXPECT_EQ(profile.phases[1].small_file_count, 0U);
+    EXPECT_EQ(profile.phases[1].large_file_count, 10U);
+    EXPECT_EQ(profile.phases[0].size_file_counts[synthetic_size_bucket_index(4U * 1024U)], 10U);
+    EXPECT_EQ(profile.phases[1].size_file_counts[synthetic_size_bucket_index(16U * 1024U * 1024U)], 10U);
+}
+
+void test_synthetic_replay_cursor_generates_gapless_deterministic_views() {
+    SyntheticPhaseProfile phase;
+    phase.name = "phase_0";
+    phase.file_count = 4;
+    phase.folder_count = 2;
+    phase.size_file_counts[synthetic_size_bucket_index(128U * 1024U)] = 2;
+    phase.size_file_counts[synthetic_size_bucket_index(1024U * 1024U)] = 2;
+    phase.small_read_latency.p50_us = 11;
+    phase.small_read_latency.p90_us = 22;
+    phase.small_read_latency.p99_us = 33;
+    phase.small_read_latency.max_us = 44;
+    phase.large_read_latency.p50_us = 55;
+    phase.large_read_latency.p90_us = 66;
+    phase.large_read_latency.p99_us = 77;
+    phase.large_read_latency.max_us = 88;
+
+    SyntheticWorkloadProfile profile;
+    profile.seed = 42;
+    profile.small_file_threshold_bytes = 128U * 1024U;
+    profile.phases.push_back(phase);
+
+    SyntheticReplayConfig config;
+    config.profile = profile;
+    config.latency_enabled = true;
+    SyntheticReplayCursor cursor(config);
+
+    SyntheticFileView first;
+    EXPECT_TRUE(cursor.next_file(first));
+    EXPECT_TRUE(!first.path_view().empty());
+    EXPECT_EQ(first.nfs_handle.size(), hypersync::kSyntheticHandleBytes);
+
+    SyntheticReplayCursor repeat(config);
+    SyntheticFileView repeated_first;
+    EXPECT_TRUE(repeat.next_file(repeated_first));
+    EXPECT_EQ(first.path_view(), repeated_first.path_view());
+    EXPECT_TRUE(first.nfs_handle == repeated_first.nfs_handle);
+    EXPECT_EQ(first.size_bytes, repeated_first.size_bytes);
+    EXPECT_EQ(first.latency_us, repeated_first.latency_us);
+
+    std::size_t small_count = first.small ? 1U : 0U;
+    std::size_t large_count = first.small ? 0U : 1U;
+    for (std::size_t index = 1; index < 4U; ++index) {
+        SyntheticFileView file;
+        EXPECT_TRUE(cursor.next_file(file));
+        if (file.size_bytes <= profile.small_file_threshold_bytes) {
+            EXPECT_TRUE(file.small);
+            ++small_count;
+        } else {
+            EXPECT_TRUE(!file.small);
+            ++large_count;
+        }
+        EXPECT_TRUE(file.latency_us != 0U);
+    }
+    EXPECT_EQ(small_count + large_count, 4U);
+    EXPECT_TRUE(small_count > 0U);
+    EXPECT_TRUE(large_count > 0U);
+    SyntheticFileView done;
+    EXPECT_TRUE(!cursor.next_file(done));
+}
+
+void test_synthetic_payload_pool_returns_preallocated_blocks() {
+    SyntheticPayloadPool pool(4096, 1024 * 1024, SyntheticPayloadPattern::repeated, 7);
+    EXPECT_EQ(pool.small_block_bytes(), 4096U);
+    EXPECT_EQ(pool.large_block_bytes(), 1024U * 1024U);
+
+    SyntheticFileView small;
+    small.small = true;
+    small.size_bytes = 1234;
+    SyntheticPayloadView small_payload = pool.payload_for(small);
+    EXPECT_TRUE(small_payload.data != nullptr);
+    EXPECT_EQ(small_payload.size, 1234U);
+    EXPECT_EQ(small_payload.capacity, 4096U);
+
+    SyntheticFileView large;
+    large.small = false;
+    large.size_bytes = 8U * 1024U * 1024U;
+    SyntheticPayloadView large_payload = pool.payload_for(large);
+    EXPECT_TRUE(large_payload.data != nullptr);
+    EXPECT_EQ(large_payload.size, 1024U * 1024U);
+    EXPECT_EQ(large_payload.capacity, 1024U * 1024U);
+
+    SyntheticPayloadView small_payload_again = pool.payload_for(small);
+    EXPECT_TRUE(small_payload.data == small_payload_again.data);
 }
 
 void test_autoscale_profile_store_defaults_and_persists_learned_workers() {
@@ -4522,6 +4659,15 @@ int main(int argc, char** argv) {
         {"bucket_path_overload_scores_reflect_eta_reservoir_and_wire_pressure",
          TestSuite::unit,
          test_bucket_path_overload_scores_reflect_eta_reservoir_and_wire_pressure},
+        {"synthetic_profile_builder_detects_chronological_phases",
+         TestSuite::unit,
+         test_synthetic_profile_builder_detects_chronological_phases},
+        {"synthetic_replay_cursor_generates_gapless_deterministic_views",
+         TestSuite::unit,
+         test_synthetic_replay_cursor_generates_gapless_deterministic_views},
+        {"synthetic_payload_pool_returns_preallocated_blocks",
+         TestSuite::unit,
+         test_synthetic_payload_pool_returns_preallocated_blocks},
         {"autoscale_profile_store_defaults_and_persists_learned_workers",
          TestSuite::unit,
          test_autoscale_profile_store_defaults_and_persists_learned_workers},
