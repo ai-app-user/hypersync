@@ -1066,3 +1066,6 @@ logical size: 335.99 TB
     `--data-sample-large-read-bytes 1048576`, stats interval `10s`.
   - First healthy progress: `501.7M` files in `70s` (`7.17M files/s`
     cumulative), `0` failed folders, `0` permission errors.
+  - 2026-05-17 13:07 PDT status: still running; `1.409B` files in `220s`,
+    `6.40M files/s` cumulative, `0` failed folders, `0` permission errors.
+    Decision: performance is good enough, so keep this as the full long test.

@@ -369,3 +369,13 @@ started a full source profiler run with `--profile-data-reads` but conservative
 sampling (`1` sample per 1B files and max `1` sample per phase). Early progress
 was healthy: `501.7M` files in `70s`, `7.17M files/s` cumulative, no failed
 folders, no `NFS3ERR_PERM`.
+
+## 2026-05-17 13:07 PDT
+
+**User:** if you get to good perf then start the full test, if not then fix it
+and start the long test
+
+**Codex:** Verified the corrected full-source profiler was already in the good
+performance path and left it running as the long test. Current status was
+`1.409B` files in `220s`, `6.40M files/s` cumulative, `0` failed folders, and
+`0` permission errors.
