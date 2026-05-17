@@ -210,6 +210,10 @@ Rules:
 - Performance-sensitive paths must expose their concurrency settings.
 - Final summaries must include the settings used for the run.
 - Progress stats should be printed periodically during long runs.
+- When a pipeline has both production scanners and an overall/recon scanner,
+  user-facing progress totals must come from the overall scanner. Production
+  scanner counters are reservoir-limited and may be useful diagnostics, but
+  they must not be presented as whole-tree totals.
 - Generic job monitoring should report cumulative rate, recent/current rate,
   first observed startup rate, mid-run historical rate, peak observed rate, tail
   rate after a job stops, queue fullness, and worker wait-state percentages.
