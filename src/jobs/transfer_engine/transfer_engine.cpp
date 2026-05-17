@@ -1436,6 +1436,83 @@ std::string utc_time_string(std::chrono::system_clock::time_point time_point) {
     return out.str();
 }
 
+std::string local_progress_time_string(std::chrono::system_clock::time_point time_point) {
+    const std::time_t seconds = std::chrono::system_clock::to_time_t(time_point);
+    std::tm tm {};
+#if defined(_WIN32)
+    localtime_s(&tm, &seconds);
+#else
+    localtime_r(&seconds, &tm);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&tm, "%d-%b, %I:%M%p");
+    return out.str();
+}
+
+std::string compact_duration(double seconds) {
+    if (!std::isfinite(seconds) || seconds < 0.0) {
+        return "unknown";
+    }
+    std::uint64_t total_seconds = static_cast<std::uint64_t>(std::llround(seconds));
+    const std::uint64_t hours = total_seconds / 3600U;
+    total_seconds %= 3600U;
+    const std::uint64_t minutes = total_seconds / 60U;
+    const std::uint64_t secs = total_seconds % 60U;
+    std::ostringstream out;
+    if (hours != 0U) {
+        out << hours << 'h';
+    }
+    if (hours != 0U || minutes != 0U) {
+        out << minutes << 'm';
+    }
+    out << secs << 's';
+    return out.str();
+}
+
+std::string eta_time_string(double seconds_from_now) {
+    if (!std::isfinite(seconds_from_now) || seconds_from_now < 0.0) {
+        return "unknown";
+    }
+    const auto now = std::chrono::system_clock::now();
+    const auto eta = now + std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                               std::chrono::duration<double>(seconds_from_now));
+    return local_progress_time_string(eta);
+}
+
+std::string human_count(double value, std::string_view suffix = "") {
+    const double abs_value = std::abs(value);
+    const char* unit = "";
+    double scaled = value;
+    if (abs_value >= 1'000'000'000.0) {
+        scaled = value / 1'000'000'000.0;
+        unit = "B";
+    } else if (abs_value >= 1'000'000.0) {
+        scaled = value / 1'000'000.0;
+        unit = "M";
+    } else if (abs_value >= 1'000.0) {
+        scaled = value / 1'000.0;
+        unit = "K";
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(abs_value >= 1'000.0 ? 1 : 0)
+        << scaled << unit << suffix;
+    return out.str();
+}
+
+std::string human_bytes(std::uint64_t bytes) {
+    const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    double value = static_cast<double>(bytes);
+    std::size_t unit_index = 0;
+    while (value >= 1000.0 && unit_index + 1U < std::size(units)) {
+        value /= 1000.0;
+        ++unit_index;
+    }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(unit_index == 0U ? 0 : 1)
+        << value << units[unit_index];
+    return out.str();
+}
+
 std::uint64_t unix_time_nanoseconds(std::chrono::system_clock::time_point time_point) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(time_point.time_since_epoch()).count());
@@ -6269,10 +6346,22 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         std::max<std::size_t>(1, small_meta_reader_threads == 0U ? metadata_threads : small_meta_reader_threads);
     const std::size_t large_metadata_threads =
         std::max<std::size_t>(1, large_meta_reader_threads == 0U ? metadata_threads : large_meta_reader_threads);
+    const std::size_t default_recon_metadata_threads =
+        bucket_priority_enabled ? small_metadata_threads : std::size_t {1};
+    const std::size_t default_recon_async_depth =
+        bucket_priority_enabled
+            ? std::max<std::size_t>(1, meta_config.async_directory_depth)
+            : std::size_t {1};
     const std::size_t recon_metadata_threads =
-        std::max<std::size_t>(1, recon_meta_reader_threads == 0U ? std::size_t {1} : recon_meta_reader_threads);
+        std::max<std::size_t>(
+            1,
+            recon_meta_reader_threads == 0U ? default_recon_metadata_threads
+                                            : recon_meta_reader_threads);
     const std::size_t recon_async_depth =
-        std::max<std::size_t>(1, recon_metadata_async_depth == 0U ? std::size_t {1} : recon_metadata_async_depth);
+        std::max<std::size_t>(
+            1,
+            recon_metadata_async_depth == 0U ? default_recon_async_depth
+                                             : recon_metadata_async_depth);
     const std::size_t total_reader_threads = small_threads + large_threads;
     const std::size_t queue_depth =
         std::max<std::size_t>(1, data_queue_depth == 0 ? total_reader_threads * outstanding * 2U
@@ -6569,12 +6658,14 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         std::uint64_t large_read = 0;
         std::uint64_t large_bytes_read = 0;
     };
+    std::atomic<bool> production_scan_completed {false};
     std::atomic<bool> bucket_priority_stop {false};
     std::thread bucket_priority_coordinator;
     if (bucket_priority_enabled) {
         bucket_priority_coordinator = std::thread([&]() {
             std::deque<PrioritySample> samples;
             const auto sample_window = std::chrono::minutes(10);
+            auto last_human_report = std::chrono::steady_clock::time_point {};
             while (!bucket_priority_stop.load(std::memory_order_relaxed)) {
                 const auto now = std::chrono::steady_clock::now();
                 const DataReadBenchmarkSnapshot snapshot =
@@ -6670,8 +6761,43 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << " large_total_bytes=" << large_total_bytes
                           << " queued_small_files=" << queued_small
                           << " queued_large_files=" << queued_large
+                          << " scan_completed="
+                          << (production_scan_completed.load(std::memory_order_relaxed) ? "true" : "false")
                           << " recon_completed=" << (snapshot.recon_completed ? "true" : "false")
                           << '\n';
+
+                if (last_human_report == std::chrono::steady_clock::time_point{} ||
+                    now - last_human_report >= std::chrono::seconds(10)) {
+                    last_human_report = now;
+                    const bool full_totals = snapshot.recon_completed;
+                    const double small_percent =
+                        small_total == 0U ? 0.0 : percentage_of(snapshot.small_files_read, small_total);
+                    const double large_percent =
+                        large_total_bytes == 0U ? 0.0 : percentage_of(snapshot.large_bytes_read,
+                                                                      large_total_bytes);
+                    std::cerr << "progress "
+                              << local_progress_time_string(std::chrono::system_clock::now())
+                              << ", discovered " << (full_totals ? "[full] " : "[so far] ")
+                              << "small=" << human_count(static_cast<double>(small_total), " files")
+                              << "/" << human_bytes(snapshot.small_logical_size_bytes)
+                              << ", large=" << human_bytes(large_total_bytes)
+                              << "/" << human_count(static_cast<double>(large_total), " files")
+                              << ", scanner="
+                              << (production_scan_completed.load(std::memory_order_relaxed) ? "done" : "running")
+                              << ", recon=" << (snapshot.recon_completed ? "done" : "running")
+                              << ", processed: time=" << compact_duration(snapshot.elapsed_seconds)
+                              << ", small=" << human_count(static_cast<double>(snapshot.small_files_read), " files")
+                              << " [" << std::fixed << std::setprecision(1) << small_percent << "%]"
+                              << " (" << human_count(small_rate, " files/s") << ")"
+                              << ", large=" << human_bytes(snapshot.large_bytes_read)
+                              << " [" << std::fixed << std::setprecision(1) << large_percent << "%]"
+                              << " (" << human_bytes(static_cast<std::uint64_t>(
+                                             std::max(0.0, large_byte_rate)))
+                              << "/s)"
+                              << ", eta: small=" << eta_time_string(decision.small_eta_seconds)
+                              << ", large=" << eta_time_string(decision.large_eta_seconds)
+                              << '\n';
+                }
 
                 for (int tick = 0; tick < 50 &&
                                    !bucket_priority_stop.load(std::memory_order_relaxed);
@@ -6872,6 +6998,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     for (auto& worker : metadata_workers) {
         worker.join();
     }
+    production_scan_completed.store(true, std::memory_order_relaxed);
     mark_data_file_input_done(file_queues.small);
     mark_data_file_input_done(file_queues.large);
 

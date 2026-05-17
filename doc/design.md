@@ -261,6 +261,15 @@ not ready. If the large bucket has the longer ETA, the borrow percentage returns
 to zero and large readers stay on the large reservoir. The goal is equalized
 small/large ETA while keeping all useful data-reader capacity busy.
 
+Bucket-priority progress reporting prints a human progress line every ten
+seconds. Until the independent recon scanner finishes, totals are labeled
+`discovered [so far]` and ETAs are based on discovered totals only. Once recon
+finishes, the line switches to `discovered [full]`, and ETA becomes whole-tree
+ETA. Production scanners remain reservoir-backpressured; recon is the only
+source of full-tree totals during a running transfer. In bucket-priority mode,
+the recon default is a fast stats-only crawl unless the command line explicitly
+sets recon thread/depth/sleep values.
+
 The transport sender drains the small-file data queue first and drains the
 large-file queue only when the small queue is empty or below its configured low
 watermark. This gives small files maximum operation rate while allowing large
