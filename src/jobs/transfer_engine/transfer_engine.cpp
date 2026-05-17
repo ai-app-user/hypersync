@@ -6823,15 +6823,24 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                         static_cast<std::uint64_t>(snapshot.large_files_found);
                     displayed_totals.large_total_bytes = snapshot.large_logical_size_bytes;
                 }
-                const std::uint64_t small_total =
+                const std::uint64_t control_small_total =
                     std::max<std::uint64_t>(displayed_totals.small_total,
                                             static_cast<std::uint64_t>(snapshot.small_files_read));
-                const std::uint64_t large_total =
+                const std::uint64_t control_large_total =
                     std::max<std::uint64_t>(displayed_totals.large_total,
                                             static_cast<std::uint64_t>(snapshot.large_files_read));
-                const std::uint64_t large_total_bytes =
+                const std::uint64_t control_large_total_bytes =
                     std::max<std::uint64_t>(displayed_totals.large_total_bytes,
                                             snapshot.large_bytes_read);
+                const std::uint64_t small_total =
+                    std::max<std::uint64_t>(control_small_total,
+                                            static_cast<std::uint64_t>(snapshot.small_files_found));
+                const std::uint64_t large_total =
+                    std::max<std::uint64_t>(control_large_total,
+                                            static_cast<std::uint64_t>(snapshot.large_files_found));
+                const std::uint64_t large_total_bytes =
+                    std::max<std::uint64_t>(control_large_total_bytes,
+                                            snapshot.large_logical_size_bytes);
 
                 SplitBucketPriorityInput input;
                 input.small_total = small_total;
@@ -6897,6 +6906,9 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << " displayed_small_total=" << displayed_totals.small_total
                           << " displayed_large_total=" << displayed_totals.large_total
                           << " displayed_large_total_bytes=" << displayed_totals.large_total_bytes
+                          << " control_small_total=" << small_total
+                          << " control_large_total=" << large_total
+                          << " control_large_total_bytes=" << large_total_bytes
                           << " production_small_found=" << snapshot.small_files_found
                           << " production_large_found=" << snapshot.large_files_found
                           << " production_large_logical_size_bytes=" << snapshot.large_logical_size_bytes
@@ -6931,6 +6943,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                               << " , T: " << human_gbit_rate(total_byte_rate)
                               << " , ms:" << small_scanners << '/' << large_scanners
                               << " , src:" << displayed_totals.source
+                              << " , ctrl:" << human_count(static_cast<double>(small_total))
+                              << "/" << human_capacity(large_total_bytes)
                               << " , scan:"
                               << (production_scan_completed.load(std::memory_order_relaxed) ? "done" : "run")
                               << " recon:" << (snapshot.recon_completed ? "done" : "run")
