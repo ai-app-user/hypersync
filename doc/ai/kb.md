@@ -1116,3 +1116,11 @@ logical size: 335.99 TB
   - Local verification: `benchmark-meta` over the archived profile, `benchmark-data`
     over the archived profile, selected synthetic tests, and summary diff
     synthetic-profile vs itself (`same=1000`, `new=0`, `target_only=0`).
+  - Transfer1 release verification after deploy of `a85f165`:
+    - `benchmark-meta` synthetic profile source: `9,871,153` files in `2.00s`,
+      `4.93M files/s` with one metadata thread.
+    - `benchmark-data` synthetic profile source: `88,256` files and
+      `203.15GB` generated/read in `2.00s`, `812 Gbit/s`, `44.1K files/s`,
+      clean timer shutdown.
+    - Summary diff synthetic-profile vs itself: `1000` same, `0` new,
+      `0` changed, `0` target-only.
