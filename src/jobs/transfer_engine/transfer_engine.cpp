@@ -3999,24 +3999,212 @@ void pack_flat_folder_batch_to_queue_with(const FlatFolderScanBatch& batch,
     flush_current(true);
 }
 
-class FlatFolderScannerBufferJob final : public ThreadedJob {
+inline constexpr BufferPoolId kFolderWorkBufferPoolId = 34;
+
+enum class FolderWorkKind : std::uint32_t {
+    folder = 1,
+    complete = 2,
+    error = 3,
+};
+
+void reset_folder_work_buffer(MetadataBuffer& buffer,
+                              FolderWorkKind kind,
+                              std::string_view rel_path,
+                              bool recursive) {
+    if (rel_path.size() > buffer.bytes.size()) {
+        throw std::runtime_error("folder work path does not fit metadata buffer");
+    }
+    buffer.record_kind = kind == FolderWorkKind::folder ? MetadataBufferRecordKind::folder
+                       : kind == FolderWorkKind::complete ? MetadataBufferRecordKind::folder_complete
+                                                          : MetadataBufferRecordKind::error;
+    buffer.bytes_used = static_cast<std::uint32_t>(rel_path.size());
+    buffer.file_id = static_cast<std::uint64_t>(kind);
+    buffer.folder_hash = recursive ? 1U : 0U;
+    if (!rel_path.empty()) {
+        std::memcpy(buffer.bytes.data(), rel_path.data(), rel_path.size());
+    }
+}
+
+FolderWorkKind folder_work_kind(const MetadataBuffer& buffer) {
+    if (buffer.record_kind == MetadataBufferRecordKind::folder) {
+        return FolderWorkKind::folder;
+    }
+    if (buffer.record_kind == MetadataBufferRecordKind::folder_complete) {
+        return FolderWorkKind::complete;
+    }
+    if (buffer.record_kind == MetadataBufferRecordKind::error) {
+        return FolderWorkKind::error;
+    }
+    throw std::runtime_error("invalid folder work buffer kind");
+}
+
+FileSpec folder_spec_from_work_buffer(const MetadataBuffer& buffer) {
+    FileSpec folder;
+    folder.rel_path = std::string(reinterpret_cast<const char*>(buffer.bytes.data()), buffer.bytes_used);
+    folder.recursive = buffer.folder_hash != 0U;
+    return folder;
+}
+
+RawBufferPool make_folder_work_buffer_pool(std::size_t capacity) {
+    return RawBufferPool(kFolderWorkBufferPoolId, capacity, sizeof(MetadataBuffer), alignof(MetadataBuffer));
+}
+
+std::size_t folder_work_slots(std::size_t worker_count, std::size_t async_depth) {
+    return std::max<std::size_t>(64U, worker_count * std::max<std::size_t>(1U, async_depth) * 4U);
+}
+
+class FolderSeederJob final : public ThreadedJob {
 public:
-    FlatFolderScannerBufferJob(std::string root,
-                               bool recursive,
-                               std::string compare_mode,
-                               std::size_t worker_count,
-                               std::size_t async_depth,
-                               RawBufferPool& output_pool,
-                               BufQueue& output,
-                               double max_duration_seconds)
+    FolderSeederJob(bool recursive,
+                    double max_duration_seconds,
+                    RawBufferPool& folder_pool,
+                    BufQueue& folder_output,
+                    BufQueue& feedback_input)
+        : ThreadedJob(1U),
+          recursive_(recursive),
+          max_duration_seconds_(max_duration_seconds),
+          folder_pool_(folder_pool),
+          folder_output_(folder_output),
+          feedback_input_(feedback_input) {}
+
+    [[nodiscard]] bool should_stop() const {
+        return stop_requested() || expired();
+    }
+
+    [[nodiscard]] std::exception_ptr error() const {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        return error_;
+    }
+
+protected:
+    void on_starting() override {
+        if (max_duration_seconds_ > 0.0) {
+            stop_at_ = std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<double>(max_duration_seconds_));
+        } else {
+            stop_at_.reset();
+        }
+        active_folders_ = 0;
+        error_ = nullptr;
+    }
+
+    void run_worker(std::size_t worker_index) override {
+        std::deque<FileSpec> pending_folders;
+        FileSpec root;
+        root.recursive = recursive_;
+        pending_folders.push_back(std::move(root));
+        active_folders_ = 1U;
+
+        BufferHandle feedback;
+        while (active_folders_ != 0U && !stop_requested() && !expired()) {
+            bool progressed = false;
+            if (!pending_folders.empty()) {
+                if (try_emit_folder(worker_index, pending_folders.front())) {
+                    pending_folders.pop_front();
+                    progressed = true;
+                }
+            }
+            while (feedback_input_.try_pop(feedback)) {
+                progressed = true;
+                MetadataBuffer& buffer = metadata_buffer(folder_pool_, feedback);
+                const FolderWorkKind kind = folder_work_kind(buffer);
+                if (kind == FolderWorkKind::folder) {
+                    FileSpec folder = folder_spec_from_work_buffer(buffer);
+                    folder_pool_.release(feedback);
+                    pending_folders.push_back(std::move(folder));
+                    ++active_folders_;
+                } else if (kind == FolderWorkKind::complete) {
+                    folder_pool_.release(feedback);
+                    if (active_folders_ != 0U) {
+                        --active_folders_;
+                    }
+                } else {
+                    const std::string message(reinterpret_cast<const char*>(buffer.bytes.data()), buffer.bytes_used);
+                    folder_pool_.release(feedback);
+                    {
+                        std::lock_guard<std::mutex> lock(error_mutex_);
+                        error_ = std::make_exception_ptr(std::runtime_error(message));
+                    }
+                    pending_folders.clear();
+                    break;
+                }
+            }
+            if (!progressed) {
+                {
+                    auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_input_empty);
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+            }
+        }
+        folder_output_.close();
+        feedback_input_.close();
+    }
+
+    void on_stop_requested() override {
+        folder_output_.close();
+        feedback_input_.close();
+    }
+
+private:
+    [[nodiscard]] bool expired() const {
+        return stop_at_.has_value() && std::chrono::steady_clock::now() >= *stop_at_;
+    }
+
+    bool try_emit_folder(std::size_t worker_index, const FileSpec& folder) {
+        if (stop_requested() || expired()) {
+            return true;
+        }
+        std::optional<BufferHandle> maybe_handle = folder_pool_.try_acquire();
+        if (!maybe_handle.has_value()) {
+            auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_pool_empty);
+            return false;
+        }
+        const BufferHandle handle = *maybe_handle;
+        reset_folder_work_buffer(metadata_buffer(folder_pool_, handle),
+                                 FolderWorkKind::folder,
+                                 folder.rel_path,
+                                 folder.recursive);
+        if (!folder_output_.try_push(handle)) {
+            folder_pool_.release(handle);
+            auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_output_full);
+            return false;
+        }
+        (void)worker_index;
+        return true;
+    }
+
+    bool recursive_ = true;
+    double max_duration_seconds_ = 0.0;
+    RawBufferPool& folder_pool_;
+    BufQueue& folder_output_;
+    BufQueue& feedback_input_;
+    std::optional<std::chrono::steady_clock::time_point> stop_at_;
+    std::size_t active_folders_ = 0;
+    mutable std::mutex error_mutex_;
+    std::exception_ptr error_;
+};
+
+class NfsMetaReaderBufferJob final : public ThreadedJob {
+public:
+    NfsMetaReaderBufferJob(std::string root,
+                           std::string compare_mode,
+                           std::size_t worker_count,
+                           std::size_t async_depth,
+                           RawBufferPool& folder_pool,
+                           BufQueue& folder_input,
+                           BufQueue& folder_feedback,
+                           RawBufferPool& output_pool,
+                           BufQueue& output)
         : ThreadedJob(worker_count),
           root_(std::move(root)),
-          recursive_(recursive),
           compare_mode_(std::move(compare_mode)),
           async_depth_(std::max<std::size_t>(1U, async_depth)),
+          folder_pool_(folder_pool),
+          folder_input_(folder_input),
+          folder_feedback_(folder_feedback),
           output_pool_(output_pool),
-          output_(output),
-          max_duration_seconds_(max_duration_seconds) {}
+          output_(output) {}
 
     [[nodiscard]] DistributedDiffRunReport stats() const {
         DistributedDiffRunReport report;
@@ -4027,46 +4215,47 @@ public:
     }
 
 protected:
-    void on_starting() override {
-        {
-            std::lock_guard<std::mutex> lock(queue_.mutex);
-            queue_.folders.clear();
-            queue_.folders.push_back(FileSpec{});
-            queue_.active = 0;
-            queue_.done = false;
-            queue_.error = nullptr;
-            if (max_duration_seconds_ > 0.0) {
-                queue_.stop_at = std::chrono::steady_clock::now() +
-                                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                     std::chrono::duration<double>(max_duration_seconds_));
-            }
-        }
-        queue_.cv.notify_all();
-    }
-
     void run_worker(std::size_t worker_index) override {
         auto backend = make_nfs_backend(root_);
         auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
         backend->scan_flat_folders(
             async_depth_,
-            [this, worker_index](bool wait_for_work) {
+            [this, worker_index](bool wait_for_work) -> std::optional<FileSpec> {
                 if (!wait_until_worker_active(worker_index)) {
                     return std::optional<FileSpec> {};
                 }
-                return take_flat_folder_work(queue_, wait_for_work);
+                BufferHandle handle;
+                const bool got_work = wait_for_work ? wait_for_input(worker_index, folder_input_, handle)
+                                                    : folder_input_.try_pop(handle);
+                if (!got_work) {
+                    return std::optional<FileSpec> {};
+                }
+                const FileSpec folder = folder_spec_from_work_buffer(metadata_buffer(folder_pool_, handle));
+                folder_pool_.release(handle);
+                return folder;
             },
             [this] {
-                return stop_requested() || flat_metadata_scan_should_stop(queue_);
+                return stop_requested() || folder_input_.closed();
             },
             [this, worker_index](FlatFolderScanBatch batch) {
-                if (!batch.failed && recursive_ && !flat_metadata_scan_should_stop(queue_)) {
-                    std::vector<FileSpec> child_work;
-                    child_work.reserve(batch.directories.size());
+                if (batch.failed) {
+                    std::cerr << "metadata scan skipped folder '"
+                              << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                              << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+                    if (batch.folder.rel_path.empty()) {
+                        const std::string message =
+                            batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
+                        send_feedback(worker_index, FolderWorkKind::error, message, false);
+                    } else {
+                        send_feedback(worker_index, FolderWorkKind::complete, {}, false);
+                    }
+                    return;
+                }
+                if (batch.folder.recursive) {
                     for (FileSpec directory : batch.directories) {
                         directory.rel_path = normalize_path(directory.rel_path);
-                        child_work.push_back(std::move(directory));
+                        send_feedback(worker_index, FolderWorkKind::folder, directory.rel_path, batch.folder.recursive);
                     }
-                    enqueue_flat_folder_work(queue_, std::move(child_work));
                 }
                 files_seen_.fetch_add(batch.files.size(), std::memory_order_relaxed);
                 logical_size_.fetch_add(flat_folder_logical_size(batch.files), std::memory_order_relaxed);
@@ -4087,15 +4276,13 @@ protected:
                         }
                     });
                 folders_sent_.fetch_add(1U, std::memory_order_relaxed);
-                finish_flat_folder_work(queue_);
+                send_feedback(worker_index, FolderWorkKind::complete, {}, false);
             });
-        if (flat_metadata_scan_should_stop(queue_)) {
-            request_flat_folder_stop(queue_);
-        }
     }
 
     void on_stop_requested() override {
-        request_flat_folder_stop(queue_);
+        folder_input_.close();
+        folder_feedback_.close();
         output_.close();
     }
 
@@ -4104,14 +4291,29 @@ protected:
     }
 
 private:
+    void send_feedback(std::size_t worker_index,
+                       FolderWorkKind kind,
+                       std::string_view rel_path,
+                       bool recursive) {
+        std::optional<BufferHandle> maybe_handle = wait_for_pool(worker_index, folder_pool_);
+        if (!maybe_handle.has_value()) {
+            return;
+        }
+        const BufferHandle handle = *maybe_handle;
+        reset_folder_work_buffer(metadata_buffer(folder_pool_, handle), kind, rel_path, recursive);
+        if (!wait_for_output(worker_index, folder_feedback_, handle)) {
+            folder_pool_.release(handle);
+        }
+    }
+
     std::string root_;
-    bool recursive_ = true;
     std::string compare_mode_;
     std::size_t async_depth_ = 1;
+    RawBufferPool& folder_pool_;
+    BufQueue& folder_input_;
+    BufQueue& folder_feedback_;
     RawBufferPool& output_pool_;
     BufQueue& output_;
-    double max_duration_seconds_ = 0.0;
-    FlatMetadataWorkQueue queue_;
     std::atomic<std::uint64_t> folders_sent_ {0};
     std::atomic<std::uint64_t> files_seen_ {0};
     std::atomic<std::uint64_t> logical_size_ {0};
@@ -9925,17 +10127,27 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         report.record_buffer_slots = flat_slots;
 
         RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
+        RawBufferPool folder_pool =
+            make_folder_work_buffer_pool(folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
         BufferPoolRegistry registry;
         registry.register_pool(metadata_pool);
         BufQueue metadata_queue(flat_slots);
-        FlatFolderScannerBufferJob scanner(source_root.string(),
-                                           recursive,
-                                           "size",
-                                           report.meta_reader_threads,
-                                           report.metadata_async_depth,
-                                           metadata_pool,
-                                           metadata_queue,
-                                           max_duration_seconds);
+        BufQueue folder_queue(folder_pool.capacity());
+        BufQueue folder_feedback_queue(folder_pool.capacity());
+        FolderSeederJob folder_seeder(recursive,
+                                      max_duration_seconds,
+                                      folder_pool,
+                                      folder_queue,
+                                      folder_feedback_queue);
+        NfsMetaReaderBufferJob scanner(source_root.string(),
+                                       "size",
+                                       report.meta_reader_threads,
+                                       report.metadata_async_depth,
+                                       folder_pool,
+                                       folder_queue,
+                                       folder_feedback_queue,
+                                       metadata_pool,
+                                       metadata_queue);
         FlatFolderMetadataConsumerJob metadata_consumer(metadata_queue,
                                                         registry,
                                                         &stats_discarder,
@@ -9944,9 +10156,14 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
 
         stats_discarder.start();
         stats_discarder.record_folder("");
+        folder_seeder.start();
         metadata_consumer.start();
         scanner.start();
         scanner.wait();
+        folder_seeder.wait();
+        if (auto error = folder_seeder.error()) {
+            std::rethrow_exception(error);
+        }
         metadata_consumer.wait();
         report.learned_meta_reader_threads = report.meta_reader_threads;
         stats_discarder.stop();
@@ -9974,23 +10191,38 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         report.record_buffer_slots = flat_slots;
 
         RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
+        RawBufferPool folder_pool =
+            make_folder_work_buffer_pool(folder_work_slots(report.meta_reader_threads, report.metadata_async_depth));
         BufferPoolRegistry registry;
         registry.register_pool(metadata_pool);
         BufQueue metadata_to_discard(flat_slots);
+        BufQueue folder_queue(folder_pool.capacity());
+        BufQueue folder_feedback_queue(folder_pool.capacity());
 
-        FlatFolderScannerBufferJob scanner(source_root.string(),
-                                           recursive,
-                                           "size",
-                                           report.meta_reader_threads,
-                                           report.metadata_async_depth,
-                                           metadata_pool,
-                                           metadata_to_discard,
-                                           max_duration_seconds);
+        FolderSeederJob folder_seeder(recursive,
+                                      max_duration_seconds,
+                                      folder_pool,
+                                      folder_queue,
+                                      folder_feedback_queue);
+        NfsMetaReaderBufferJob scanner(source_root.string(),
+                                       "size",
+                                       report.meta_reader_threads,
+                                       report.metadata_async_depth,
+                                       folder_pool,
+                                       folder_queue,
+                                       folder_feedback_queue,
+                                       metadata_pool,
+                                       metadata_to_discard);
         BufferDiscarderJob discarder(BufferDiscarderConfig(1U), metadata_to_discard, registry);
 
+        folder_seeder.start();
         discarder.start();
         scanner.start();
         scanner.wait();
+        folder_seeder.wait();
+        if (auto error = folder_seeder.error()) {
+            std::rethrow_exception(error);
+        }
         discarder.wait();
 
         const DistributedDiffRunReport scanner_stats = scanner.stats();
@@ -11899,8 +12131,11 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     const std::size_t control_slots = distributed_diff_control_slots(worker_count);
     RawBufferPool send_pool = make_metadata_batch_buffer_pool(flat_slots);
     RawBufferPool result_pool = make_metadata_batch_buffer_pool(control_slots);
+    RawBufferPool folder_pool = make_folder_work_buffer_pool(folder_work_slots(worker_count, async_depth));
     BufQueue send_queue(flat_slots);
     BufQueue result_queue(control_slots);
+    BufQueue folder_queue(folder_pool.capacity());
+    BufQueue folder_feedback_queue(folder_pool.capacity());
     BufferPoolRegistry send_registry;
     send_registry.register_pool(send_pool);
 
@@ -11912,14 +12147,20 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
                                         send_registry,
                                         fd.get(),
                                         metadata_batch_payload_size);
-    FlatFolderScannerBufferJob scanner(source_root.string(),
-                                       recursive,
-                                       compare_mode,
-                                       worker_count,
-                                       async_depth,
-                                       send_pool,
-                                       send_queue,
-                                       max_duration_seconds);
+    FolderSeederJob folder_seeder(recursive,
+                                  max_duration_seconds,
+                                  folder_pool,
+                                  folder_queue,
+                                  folder_feedback_queue);
+    NfsMetaReaderBufferJob scanner(source_root.string(),
+                                   compare_mode,
+                                   worker_count,
+                                   async_depth,
+                                   folder_pool,
+                                   folder_queue,
+                                   folder_feedback_queue,
+                                   send_pool,
+                                   send_queue);
 
     std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
     std::unique_ptr<JobAutoScaleRunner> scanner_autoscaler;
@@ -12127,6 +12368,7 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
 
     result_receiver.start();
     result_writer.start();
+    folder_seeder.start();
     source_sender.start();
     scanner.start();
     if (scanner_autoscaler) {
@@ -12139,6 +12381,10 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     std::exception_ptr wait_error;
     try {
         scanner.wait();
+        folder_seeder.wait();
+        if (auto error = folder_seeder.error()) {
+            std::rethrow_exception(error);
+        }
         source_sender.wait();
         result_receiver.wait();
         result_writer.wait();
@@ -12147,6 +12393,9 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
         try {
             finish_scanner_autoscale();
             scanner.stop();
+        } catch (...) {}
+        try {
+            folder_seeder.stop();
         } catch (...) {}
         try {
             source_sender.stop();

@@ -1177,3 +1177,25 @@ logical size: 335.99 TB
   - Local verification: `make build/hypersync build/hypersync_tests`, manual
     tiny `benchmark-meta --discard-after-checker --no-pipeline-autoscale`,
     and `./build/hypersync_tests --only main_cli_benchmark_meta_smoke` passed.
+
+## Metadata Scanner Pipeline Split
+
+- 2026-05-17 16:12 PDT:
+  - The old `FlatFolderScannerBufferJob` mixed folder seeding, metadata reading,
+    recursion scheduling, and flat-folder metadata buffer emission.
+  - The metadata benchmark/diff source front now uses explicit queue-connected
+    jobs:
+    `[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-N]->(BufQueue)->[consumer]`
+  - Child folders and folder-completion/error signals return from
+    `NfsMetaReaderBuffer` to `FolderSeeder` through a separate bounded feedback
+    buffer queue. This preserves the pipeline rule while allowing recursion.
+  - `FileSpec::recursive` marks folder work. If false, discovered child folders
+    are not re-enqueued.
+  - Downstream flat-folder metadata buffers are unchanged, so existing
+    `BufferDiscarder`, stats/writer, parquet, and diff transport consumers keep
+    the same contract.
+  - Local verification passed:
+    `make build/hypersync build/hypersync_tests`,
+    `./build/hypersync_tests --only main_cli_benchmark_meta_smoke`,
+    recursive tiny scan (`2` files / `2` folders), and non-recursive tiny scan
+    (`1` file / `1` folder).

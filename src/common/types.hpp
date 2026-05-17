@@ -171,6 +171,7 @@ struct FileSpec {
     std::uint32_t uid = 0;
     std::uint32_t gid = 0;
     bool need_check = true;
+    bool recursive = true;
     std::uint64_t declared_size = 0;
     std::string hash_algorithm;
     std::string content_hash;

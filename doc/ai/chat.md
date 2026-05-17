@@ -436,3 +436,9 @@ ownership: scanner emits flat-folder metadata buffers, and a metadata consumer
 job decodes buffers, updates stats/writers, and releases the handles. Removed
 the old unused direct flat-metadata scan helper. Local build passed and
 `main_cli_benchmark_meta_smoke` passed.
+
+## 2026-05-17 16:12 PDT
+
+**User:** Asked why the metadata generator was named `FlatFolderScannerBuffer`, observed that it mixed metadata provision and packing, then clarified that `NfsMetaReader` should get folders from a seeder, feed child folders back to the seeder, respect a non-recursive folder flag, and continue feeding the existing downstream parquet/discard pipeline unchanged.
+
+**Codex:** Split the benchmark metadata scanner front into explicit jobs and queues: folder seeding, NFS/synthetic/local metadata reading, and downstream metadata buffer packing/consumption. Added a recursive flag to `FileSpec` folder work, routed child-folder discovery through a feedback buffer queue, preserved the existing flat-folder metadata buffer output for downstream jobs, and verified recursive and non-recursive behavior locally.
