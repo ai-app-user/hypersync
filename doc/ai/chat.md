@@ -448,3 +448,9 @@ the old unused direct flat-metadata scan helper. Local build passed and
 **User:** Asked to verify the metadata scanner did not regress on the real NFS source for at least a few minutes.
 
 **Codex:** Deployed from `dev` to transfer1 via git, found the initial queue-split build had a timed-shutdown/front-edge feedback problem, fixed it in two follow-up commits (`6a50f9a`, `d1f58d8`, `8b529ef`), and reran the real NFS scanner. The final verification on `8b529ef` processed `797,041,501` files and `13,152,488` folders in `122.94s`, `async_backend=true`, final `6.48M files/s`, with cumulative samples above `7M files/s` from 80s through 100s.
+
+## 2026-05-17 16:58 PDT
+
+**User:** Asked to try the scanner saving results to DB and run for at least a few minutes to verify it remained fast.
+
+**Codex:** Rebuilt transfer1 release with DuckDB enabled from `/mnt/local-nvme/deps/duckdb`, ran a real NFS `benchmark-meta` to 32 partitioned Parquet outputs for 180s scan time, and verified the output with the DuckDB CLI. The run wrote `641,113,308` file rows and `7,096,081` folder rows, `7.5G` total output, final `3.61M records/s` after writer drain, with early/mid samples around `5.1M-5.3M files/s`.

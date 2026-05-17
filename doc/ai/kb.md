@@ -1219,3 +1219,19 @@ logical size: 335.99 TB
     - Cumulative samples: `7.04M` at 80s, `7.29M` at 90s, `7.15M` at 100s.
   - Conclusion: scanner speed on the real NFS source is back in the expected
     baseline band after the queue split.
+
+## Metadata Scanner To Parquet Verification
+
+- 2026-05-17 16:58 PDT:
+  - transfer1 release was rebuilt clean with DuckDB enabled using:
+    - `DUCKDB_CFLAGS=-I/mnt/local-nvme/deps/duckdb`
+    - `DUCKDB_LIBS=-L/mnt/local-nvme/deps/duckdb -lduckdb -Wl,-rpath,/mnt/local-nvme/deps/duckdb`
+  - Source: `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+  - Output: `/mnt/local-nvme/wsync-codex/db-scan-verify-20260517T235303Z/metadata.parquet`
+  - Command used 96 metadata readers, async depth 256, 32 partitioned parquet writers,
+    `--record-buffer-slots 4096`, and `--max-duration-seconds 180`.
+  - Result: `641,113,308` file rows written, `7,096,081` folder rows written,
+    `648,209,389` readable Parquet rows, output size `7.5G`.
+  - Final report elapsed `231.653s`; writer drain continued after scan timer.
+    Final `records_per_second=3.613M`; early/mid cumulative file rates were about
+    `5.1M-5.3M files/s` through 80s.

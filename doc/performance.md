@@ -2280,3 +2280,57 @@ Cumulative samples:
 ```
 
 Interpretation: scanner performance is back in the expected NFS source band after splitting the folder-work and folder-feedback buffer pools. The first refactor attempt regressed because the same pool was used for folder input and completion/child feedback; a full folder queue could starve feedback handles and stall the front edge.
+
+## Metadata Scanner To Parquet Verification, 2026-05-17 16:58 PDT
+
+Source: `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+
+Build: transfer1 release built clean with libnfs and DuckDB enabled from `/mnt/local-nvme/deps/duckdb`.
+
+Command:
+
+```text
+sudo -n ./build/release/hypersync benchmark-meta --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 --metadata-output /mnt/local-nvme/wsync-codex/db-scan-verify-20260517T235303Z/metadata.parquet --metadata-output-format parquet --metadata-records all --metadata-output-partitions 32 --metadata-output-partition-mode processes --meta-reader-threads 96 --metadata-async-depth 256 --max-duration-seconds 180 --stats-interval-seconds 10 --no-pipeline-autoscale --record-buffer-slots 4096
+```
+
+Pipeline front edge:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(BufQueue-4096)->[FlatFolderMetadataConsumer-1]->[PartitionedMetadataWriter-32]
+```
+
+Result:
+
+```text
+files_seen                 641,113,308
+folders_found_reported      20,808,784
+metadata_files_written     641,113,308
+metadata_folders_written     7,096,081
+logical_size_bytes       1,715,109,886,013,382
+elapsed_s                         231.653
+records_per_second                 3.613M
+async_backend                       true
+output_size                         7.5G
+```
+
+Readable Parquet verification with DuckDB CLI:
+
+```text
+file rows      641,113,308
+folder rows      7,096,081
+total rows     648,209,389
+file size sum  1,715,109,886,013,382
+```
+
+Cumulative scanner/writer samples:
+
+```text
+40s   5.117M files/s
+60s   5.314M files/s
+80s   5.261M files/s
+100s  4.982M files/s
+120s  4.727M files/s
+170s  3.612M files/s
+```
+
+Interpretation: DB-backed scan remains fast and the parquet output is finalized/readable. It is slower than discard-only, as expected, because parquet writer processes drain after the 180s scan timer and the run entered slower/tail regions.
