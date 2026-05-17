@@ -251,7 +251,10 @@ Mixed small/large reads may enable the bucket-priority coordinator. The
 coordinator is not a bandwidth throttle. It samples bucket progress, computes
 rolling small-file and large-file rates over the last ten minutes, estimates
 remaining ETA for each bucket, and changes only queue selection priorities and
-active worker limits. If the small bucket has the longer ETA, large-reader
+active worker limits. Small-file ETA is file-count based because the small path
+is operation-rate limited. Large-file ETA is byte based, using remaining logical
+large-file bytes divided by rolling large read bandwidth, because the large path
+is bandwidth limited. If the small bucket has the longer ETA, large-reader
 workers may borrow a configured percentage of their provider pulls for the
 small reservoir while still falling back to large work whenever small work is
 not ready. If the large bucket has the longer ETA, the borrow percentage returns
