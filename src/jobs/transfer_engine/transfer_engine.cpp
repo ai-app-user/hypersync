@@ -316,7 +316,7 @@ std::filesystem::path default_autoscale_settings_path() {
     return std::filesystem::path("hypersync-autoscale.yaml");
 }
 
-SplitBucketPriorityDecision choose_split_bucket_priority_workers(
+SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
     const SplitBucketPriorityInput& input) noexcept {
     const std::size_t max_small = std::max<std::size_t>(1, input.max_small_workers);
     const std::size_t max_large = std::max<std::size_t>(1, input.max_large_workers);
@@ -6556,7 +6556,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 input.max_small_workers = small_reader_job.worker_count();
                 input.max_large_workers = large_reader_job.worker_count();
                 const SplitBucketPriorityDecision decision =
-                    choose_split_bucket_priority_workers(input);
+                    choose_split_bucket_priority_workers_impl(input);
                 const std::size_t applied_small =
                     small_reader_job.set_active_worker_limit(decision.small_workers);
                 const std::size_t applied_large =
@@ -8810,6 +8810,11 @@ std::string read_text_file(const std::filesystem::path& path) {
 }
 
 }  // namespace
+
+SplitBucketPriorityDecision choose_split_bucket_priority_workers(
+    const SplitBucketPriorityInput& input) noexcept {
+    return choose_split_bucket_priority_workers_impl(input);
+}
 
 SenderRuntimeConfig::SenderRuntimeConfig()
     : SenderRuntimeConfig(load_sender_runtime_config(ConfigStore{})) {}
