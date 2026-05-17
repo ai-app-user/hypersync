@@ -4195,7 +4195,8 @@ public:
                            BufQueue& folder_input,
                            BufQueue& folder_feedback,
                            RawBufferPool& output_pool,
-                           BufQueue& output)
+                           BufQueue& output,
+                           double max_duration_seconds)
         : ThreadedJob(worker_count),
           root_(std::move(root)),
           compare_mode_(std::move(compare_mode)),
@@ -4204,7 +4205,8 @@ public:
           folder_input_(folder_input),
           folder_feedback_(folder_feedback),
           output_pool_(output_pool),
-          output_(output) {}
+          output_(output),
+          max_duration_seconds_(max_duration_seconds) {}
 
     [[nodiscard]] DistributedDiffRunReport stats() const {
         DistributedDiffRunReport report;
@@ -4215,6 +4217,16 @@ public:
     }
 
 protected:
+    void on_starting() override {
+        if (max_duration_seconds_ > 0.0) {
+            stop_at_ = std::chrono::steady_clock::now() +
+                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                           std::chrono::duration<double>(max_duration_seconds_));
+        } else {
+            stop_at_.reset();
+        }
+    }
+
     void run_worker(std::size_t worker_index) override {
         auto backend = make_nfs_backend(root_);
         auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
@@ -4235,7 +4247,7 @@ protected:
                 return folder;
             },
             [this] {
-                return stop_requested() || folder_input_.closed();
+                return stop_requested() || expired() || folder_input_.closed();
             },
             [this, worker_index](FlatFolderScanBatch batch) {
                 if (batch.failed) {
@@ -4291,6 +4303,10 @@ protected:
     }
 
 private:
+    [[nodiscard]] bool expired() const {
+        return stop_at_.has_value() && std::chrono::steady_clock::now() >= *stop_at_;
+    }
+
     void send_feedback(std::size_t worker_index,
                        FolderWorkKind kind,
                        std::string_view rel_path,
@@ -4314,6 +4330,8 @@ private:
     BufQueue& folder_feedback_;
     RawBufferPool& output_pool_;
     BufQueue& output_;
+    double max_duration_seconds_ = 0.0;
+    std::optional<std::chrono::steady_clock::time_point> stop_at_;
     std::atomic<std::uint64_t> folders_sent_ {0};
     std::atomic<std::uint64_t> files_seen_ {0};
     std::atomic<std::uint64_t> logical_size_ {0};
@@ -10147,7 +10165,8 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                        folder_queue,
                                        folder_feedback_queue,
                                        metadata_pool,
-                                       metadata_queue);
+                                       metadata_queue,
+                                       max_duration_seconds);
         FlatFolderMetadataConsumerJob metadata_consumer(metadata_queue,
                                                         registry,
                                                         &stats_discarder,
@@ -10212,7 +10231,8 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                        folder_queue,
                                        folder_feedback_queue,
                                        metadata_pool,
-                                       metadata_to_discard);
+                                       metadata_to_discard,
+                                       max_duration_seconds);
         BufferDiscarderJob discarder(BufferDiscarderConfig(1U), metadata_to_discard, registry);
 
         folder_seeder.start();
@@ -12160,7 +12180,8 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
                                    folder_queue,
                                    folder_feedback_queue,
                                    send_pool,
-                                   send_queue);
+                                   send_queue,
+                                   max_duration_seconds);
 
     std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
     std::unique_ptr<JobAutoScaleRunner> scanner_autoscaler;
