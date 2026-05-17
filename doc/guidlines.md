@@ -214,6 +214,8 @@ Rules:
   user-facing progress totals must come from the overall scanner. Production
   scanner counters are reservoir-limited and may be useful diagnostics, but
   they must not be presented as whole-tree totals.
+- Large-file progress should include both logical capacity and file count, for
+  example `L: 80.8T(5M files)/12% 168Gbit/s eta:56.2m`.
 - Generic job monitoring should report cumulative rate, recent/current rate,
   first observed startup rate, mid-run historical rate, peak observed rate, tail
   rate after a job stops, queue fullness, and worker wait-state percentages.

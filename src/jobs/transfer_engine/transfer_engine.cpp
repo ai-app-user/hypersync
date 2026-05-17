@@ -6937,6 +6937,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                               << " " << human_count_rate(small_rate)
                               << " eta:" << compact_eta_duration(decision.small_eta_seconds)
                               << " , L: " << human_capacity(displayed_totals.large_total_bytes)
+                              << "(" << human_count(static_cast<double>(displayed_totals.large_total))
+                              << " files)"
                               << "/" << percent_string(large_percent)
                               << " " << human_gbit_rate(large_byte_rate)
                               << " eta:" << compact_eta_duration(decision.large_eta_seconds)
