@@ -249,7 +249,7 @@ and files according to the route of the file actually supplied.
 
 Mixed small/large reads may enable the bucket-priority coordinator. The
 coordinator is not a bandwidth throttle. It samples bucket progress, computes
-rolling small-file and large-file rates over the last ten minutes, estimates
+rolling small-file and large-file rates over the last minute, estimates
 remaining ETA for each bucket, and changes only queue selection priorities and
 active worker limits. Small-file ETA is file-count based because the small path
 is operation-rate limited. Large-file ETA is byte based, using remaining logical
@@ -276,6 +276,17 @@ remain reservoir-backpressured; recon is the only source of full-tree totals
 during a running transfer. In bucket-priority mode, the recon default is a fast
 stats-only crawl unless the command line explicitly sets recon thread/depth/sleep
 values.
+
+The same ETA signal also shifts production scanner capacity. Reader borrowing
+without scanner borrowing can starve the borrowed readers if the small reservoir
+is not replenished fast enough. In normal state the mixed profile keeps the
+production scanners at `96 small / 16 large`. When the controller sets a
+non-zero large-reader small-priority percentage, it parks enough large scanner
+workers to respect a floor of eight active large scanners and wakes the same
+number of spare small scanner workers, yielding `104 small / 8 large` for the
+current transfer1 profile. When the borrow percentage returns to zero, the
+scanner split returns to `96 / 16`. Workers park only between folder batches;
+no scanner is interrupted while it owns a folder or is inside libnfs.
 
 The transport sender drains the small-file data queue first and drains the
 large-file queue only when the small queue is empty or below its configured low

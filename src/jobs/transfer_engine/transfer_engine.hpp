@@ -185,6 +185,17 @@ struct SplitBucketPriorityDecision {
 [[nodiscard]] SplitBucketPriorityDecision choose_split_bucket_priority_workers(
     const SplitBucketPriorityInput& input) noexcept;
 
+struct SplitScannerCapacityDecision {
+    std::size_t small_scanners = 1;
+    std::size_t large_scanners = 1;
+};
+
+[[nodiscard]] SplitScannerCapacityDecision choose_split_scanner_capacity(
+    std::size_t base_small_scanners,
+    std::size_t base_large_scanners,
+    std::size_t large_scanner_floor,
+    std::uint32_t large_reader_small_priority_percent) noexcept;
+
 struct DataHashBenchmarkReport {
     std::size_t files_found = 0;
     std::size_t folders_found = 0;

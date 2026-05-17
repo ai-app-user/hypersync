@@ -83,6 +83,7 @@ using hypersync::RecBuf;
 using hypersync::ScanIndex;
 using hypersync::SplitBucketPriorityDecision;
 using hypersync::SplitBucketPriorityInput;
+using hypersync::SplitScannerCapacityDecision;
 using hypersync::ScanWriter;
 using hypersync::SpscRing;
 using hypersync::TransferEngine;
@@ -90,6 +91,7 @@ using hypersync::ThreadedJob;
 using hypersync::kDataBufferPoolId;
 using hypersync::kMetadataBufferPoolId;
 using hypersync::choose_split_bucket_priority_workers;
+using hypersync::choose_split_scanner_capacity;
 
 namespace {
 
@@ -844,6 +846,21 @@ void test_split_bucket_priority_balances_eta() {
     EXPECT_EQ(decision.large_workers, 1U);
     EXPECT_TRUE(decision.small_workers > 96U);
     EXPECT_EQ(decision.large_reader_small_priority_percent, 100U);
+}
+
+void test_split_scanner_capacity_follows_reader_borrowing() {
+    SplitScannerCapacityDecision decision =
+        choose_split_scanner_capacity(96, 16, 8, 0);
+    EXPECT_EQ(decision.small_scanners, 96U);
+    EXPECT_EQ(decision.large_scanners, 16U);
+
+    decision = choose_split_scanner_capacity(96, 16, 8, 1);
+    EXPECT_EQ(decision.small_scanners, 104U);
+    EXPECT_EQ(decision.large_scanners, 8U);
+
+    decision = choose_split_scanner_capacity(96, 6, 8, 75);
+    EXPECT_EQ(decision.small_scanners, 96U);
+    EXPECT_EQ(decision.large_scanners, 6U);
 }
 
 void test_autoscale_profile_store_defaults_and_persists_learned_workers() {
@@ -4443,6 +4460,9 @@ int main(int argc, char** argv) {
         {"split_bucket_priority_balances_eta",
          TestSuite::unit,
          test_split_bucket_priority_balances_eta},
+        {"split_scanner_capacity_follows_reader_borrowing",
+         TestSuite::unit,
+         test_split_scanner_capacity_follows_reader_borrowing},
         {"autoscale_profile_store_defaults_and_persists_learned_workers",
          TestSuite::unit,
          test_autoscale_profile_store_defaults_and_persists_learned_workers},

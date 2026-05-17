@@ -273,6 +273,12 @@ struct DataReadFileQueue {
     std::exception_ptr error;
 };
 
+struct ScannerCapacityControl {
+    std::atomic<std::size_t> active_workers {1};
+    std::mutex mutex;
+    std::condition_variable cv;
+};
+
 struct SplitDataReadFileQueues {
     DataReadFileQueue small;
     DataReadFileQueue large;
@@ -4855,6 +4861,57 @@ bool data_file_input_done_and_empty(DataReadFileQueue& queue) {
     return queue.input_done && queue.files.empty();
 }
 
+bool wait_until_scanner_worker_active(std::size_t worker_index,
+                                      ScannerCapacityControl* control,
+                                      const std::function<bool()>& should_stop) {
+    if (control == nullptr) {
+        return !should_stop();
+    }
+    if (worker_index < control->active_workers.load(std::memory_order_acquire)) {
+        return !should_stop();
+    }
+    std::unique_lock<std::mutex> lock(control->mutex);
+    while (!should_stop() &&
+           worker_index >= control->active_workers.load(std::memory_order_acquire)) {
+        control->cv.wait_for(lock, std::chrono::milliseconds(100));
+    }
+    return !should_stop();
+}
+
+std::size_t set_scanner_active_workers(ScannerCapacityControl& control,
+                                       std::size_t requested,
+                                       std::size_t max_workers) {
+    const std::size_t clamped = std::clamp<std::size_t>(requested, 1U, std::max<std::size_t>(1U, max_workers));
+    control.active_workers.store(clamped, std::memory_order_release);
+    control.cv.notify_all();
+    return clamped;
+}
+
+SplitScannerCapacityDecision choose_split_scanner_capacity_impl(
+    std::size_t base_small_scanners,
+    std::size_t base_large_scanners,
+    std::size_t large_scanner_floor,
+    std::uint32_t large_reader_small_priority_percent) noexcept {
+    base_small_scanners = std::max<std::size_t>(1U, base_small_scanners);
+    base_large_scanners = std::max<std::size_t>(1U, base_large_scanners);
+    large_scanner_floor = std::clamp<std::size_t>(
+        std::max<std::size_t>(1U, large_scanner_floor),
+        1U,
+        base_large_scanners);
+
+    SplitScannerCapacityDecision decision;
+    decision.small_scanners = base_small_scanners;
+    decision.large_scanners = base_large_scanners;
+    if (large_reader_small_priority_percent == 0U) {
+        return decision;
+    }
+
+    const std::size_t shift = base_large_scanners - large_scanner_floor;
+    decision.small_scanners = base_small_scanners + shift;
+    decision.large_scanners = large_scanner_floor;
+    return decision;
+}
+
 void record_data_read_metadata(DataReadBenchmarkStats& stats,
                                std::size_t files_found,
                                std::size_t folders_found,
@@ -5938,12 +5995,20 @@ void scan_filtered_split_data_read_metadata_worker(const std::string& source_roo
                                                    DataReadFileQueue& file_queue,
                                                    std::uint64_t small_file_threshold,
                                                    SplitDataReadRoute route,
-                                                   DataReadBenchmarkStats& stats) {
+                                                   DataReadBenchmarkStats& stats,
+                                                   ScannerCapacityControl* capacity_control = nullptr,
+                                                   std::size_t worker_index = 0) {
     auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
     try {
         backend->scan_flat_folders_streaming(
             async_directory_depth,
-            [&folder_queue](bool wait_for_work) {
+            [&folder_queue, &file_queue, capacity_control, worker_index](bool wait_for_work) {
+                if (!wait_until_scanner_worker_active(worker_index, capacity_control, [&]() {
+                        return flat_metadata_scan_should_stop(folder_queue) ||
+                               data_read_timer_expired(file_queue);
+                    })) {
+                    return std::optional<FileSpec> {};
+                }
                 return take_flat_folder_work(folder_queue, wait_for_work);
             },
             [&folder_queue, &file_queue] {
@@ -6377,6 +6442,15 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
             1,
             recon_metadata_async_depth == 0U ? default_recon_async_depth
                                              : recon_metadata_async_depth);
+    const std::size_t large_scanner_floor =
+        bucket_priority_enabled && large_metadata_threads > 8U ? std::size_t {8} : std::size_t {1};
+    const std::size_t scanner_shift_capacity =
+        bucket_priority_enabled && large_metadata_threads > large_scanner_floor
+            ? large_metadata_threads - large_scanner_floor
+            : std::size_t {0};
+    const std::size_t small_metadata_worker_slots =
+        small_metadata_threads + scanner_shift_capacity;
+    const std::size_t large_metadata_worker_slots = large_metadata_threads;
     const std::size_t total_reader_threads = small_threads + large_threads;
     const std::size_t queue_depth =
         std::max<std::size_t>(1, data_queue_depth == 0 ? total_reader_threads * outstanding * 2U
@@ -6417,6 +6491,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     };
 
     std::atomic<std::uint32_t> large_reader_small_priority_percent {0};
+    ScannerCapacityControl small_scanner_capacity;
+    ScannerCapacityControl large_scanner_capacity;
+    small_scanner_capacity.active_workers.store(small_metadata_threads, std::memory_order_relaxed);
+    large_scanner_capacity.active_workers.store(large_metadata_threads, std::memory_order_relaxed);
     auto make_morphing_large_file_provider =
         [](DataReadFileQueue& large_queue,
            DataReadFileQueue& small_queue,
@@ -6760,8 +6838,23 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 large_reader_small_priority_percent.store(
                     decision.large_reader_small_priority_percent,
                     std::memory_order_relaxed);
+                const SplitScannerCapacityDecision scanner_decision =
+                    choose_split_scanner_capacity_impl(small_metadata_threads,
+                                                       large_metadata_threads,
+                                                       large_scanner_floor,
+                                                       decision.large_reader_small_priority_percent);
+                const std::size_t small_scanners =
+                    set_scanner_active_workers(small_scanner_capacity,
+                                               scanner_decision.small_scanners,
+                                               small_metadata_worker_slots);
+                const std::size_t large_scanners =
+                    set_scanner_active_workers(large_scanner_capacity,
+                                               scanner_decision.large_scanners,
+                                               large_metadata_worker_slots);
                 std::cerr << "bucket_priority small_workers=" << applied_small
                           << " large_workers=" << applied_large
+                          << " small_scanners=" << small_scanners
+                          << " large_scanners=" << large_scanners
                           << " large_reader_small_priority_percent="
                           << decision.large_reader_small_priority_percent
                           << " small_eta_seconds=" << decision.small_eta_seconds
@@ -6808,6 +6901,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                               << " " << human_gbit_rate(large_byte_rate)
                               << " eta:" << compact_eta_duration(decision.large_eta_seconds)
                               << " , T: " << human_gbit_rate(total_byte_rate)
+                              << " , ms:" << small_scanners << '/' << large_scanners
                               << " , scan:"
                               << (production_scan_completed.load(std::memory_order_relaxed) ? "done" : "run")
                               << " recon:" << (snapshot.recon_completed ? "done" : "run")
@@ -6958,8 +7052,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     std::vector<std::thread> metadata_workers;
     std::vector<std::thread> recon_workers;
     if (dual_scan_small_large) {
-        metadata_workers.reserve(small_metadata_threads + large_metadata_threads);
-        for (std::size_t index = 0; index < small_metadata_threads; ++index) {
+        metadata_workers.reserve(small_metadata_worker_slots + large_metadata_worker_slots);
+        for (std::size_t index = 0; index < small_metadata_worker_slots; ++index) {
             metadata_workers.emplace_back(scan_filtered_split_data_read_metadata_worker,
                                           meta_config.source_root,
                                           meta_config.recursive,
@@ -6969,9 +7063,11 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                           std::ref(file_queues.small),
                                           file_queues.small_file_threshold,
                                           SplitDataReadRoute::Small,
-                                          std::ref(stats));
+                                          std::ref(stats),
+                                          &small_scanner_capacity,
+                                          index);
         }
-        for (std::size_t index = 0; index < large_metadata_threads; ++index) {
+        for (std::size_t index = 0; index < large_metadata_worker_slots; ++index) {
             metadata_workers.emplace_back(scan_filtered_split_data_read_metadata_worker,
                                           meta_config.source_root,
                                           meta_config.recursive,
@@ -6981,7 +7077,9 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                           std::ref(file_queues.large),
                                           file_queues.small_file_threshold,
                                           SplitDataReadRoute::Large,
-                                          std::ref(stats));
+                                          std::ref(stats),
+                                          &large_scanner_capacity,
+                                          index);
         }
         if (recon_scan_enabled) {
             recon_workers.reserve(recon_metadata_threads);
@@ -9056,6 +9154,17 @@ std::string read_text_file(const std::filesystem::path& path) {
 SplitBucketPriorityDecision choose_split_bucket_priority_workers(
     const SplitBucketPriorityInput& input) noexcept {
     return choose_split_bucket_priority_workers_impl(input);
+}
+
+SplitScannerCapacityDecision choose_split_scanner_capacity(
+    std::size_t base_small_scanners,
+    std::size_t base_large_scanners,
+    std::size_t large_scanner_floor,
+    std::uint32_t large_reader_small_priority_percent) noexcept {
+    return choose_split_scanner_capacity_impl(base_small_scanners,
+                                              base_large_scanners,
+                                              large_scanner_floor,
+                                              large_reader_small_priority_percent);
 }
 
 SenderRuntimeConfig::SenderRuntimeConfig()
