@@ -10132,15 +10132,24 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     report.bucket_priority_enabled = bucket_priority_enabled;
     report.split_small_file_threshold = split_small_file_threshold == 0U ? config_.small_file_threshold
                                                                          : split_small_file_threshold;
-    report.recon_meta_reader_threads =
-        recon_meta_reader_threads == 0U ? std::size_t {1} : recon_meta_reader_threads;
-    report.recon_metadata_async_depth =
-        recon_metadata_async_depth == 0U ? std::size_t {1} : recon_metadata_async_depth;
-    report.recon_page_sleep_us = recon_page_sleep_us;
     report.small_meta_reader_threads =
         small_meta_reader_threads == 0U ? report.meta_reader_threads : small_meta_reader_threads;
     report.large_meta_reader_threads =
         large_meta_reader_threads == 0U ? report.meta_reader_threads : large_meta_reader_threads;
+    const std::size_t hardware_threads =
+        std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    const std::size_t default_recon_threads =
+        report.bucket_priority_enabled
+            ? std::max<std::size_t>(report.small_meta_reader_threads,
+                                    std::min<std::size_t>(256U, hardware_threads * 2U))
+            : std::size_t {1};
+    report.recon_meta_reader_threads =
+        recon_meta_reader_threads == 0U ? default_recon_threads : recon_meta_reader_threads;
+    report.recon_metadata_async_depth =
+        recon_metadata_async_depth == 0U
+            ? (report.bucket_priority_enabled ? report.metadata_async_depth : std::size_t {1})
+            : recon_metadata_async_depth;
+    report.recon_page_sleep_us = recon_page_sleep_us;
     const bool data_pipeline_autoscale = report.split_small_large && (pipeline_autoscale || large_reader_autoscale);
     const std::size_t auto_worker_capacity = default_autoscale_max_workers();
     report.small_data_reader_threads =
