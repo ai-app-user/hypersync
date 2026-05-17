@@ -3994,7 +3994,7 @@ private:
 
         const std::string rel_prefix = normalize_path(batch.folder.rel_path);
         auto* private_directory = reinterpret_cast<LibNfsPrivateDir*>(directory);
-        if (private_directory != nullptr && private_directory->fh.val != nullptr &&
+        if (page_visitor && private_directory != nullptr && private_directory->fh.val != nullptr &&
             private_directory->fh.len > 0) {
             nfs_fh3 directory_handle {};
             directory_handle.data.data_len = static_cast<u_int>(private_directory->fh.len);

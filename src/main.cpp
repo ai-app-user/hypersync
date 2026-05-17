@@ -271,9 +271,9 @@ void print_synthetic_profile(std::ostream& out,
 
 struct DataReadProfileConfig {
     bool enabled = false;
-    std::uint64_t sample_rate = 100'000;
-    std::uint64_t max_samples_per_phase = 10'000;
-    std::uint64_t max_sample_bytes_per_phase = 1024ULL * 1024ULL * 1024ULL;
+    std::uint64_t sample_rate = 1'000'000'000;
+    std::uint64_t max_samples_per_phase = 1;
+    std::uint64_t max_sample_bytes_per_phase = 64ULL * 1024ULL * 1024ULL;
     std::uint64_t large_sample_bytes = hypersync::kLargeChunkBytes;
     std::size_t outstanding_requests = 1;
     std::size_t pool_slots = 64;
@@ -513,7 +513,7 @@ void add_data_read_sample_to_fixed_phase(FixedPhaseAccumulator& accumulator,
                                          const DataReadProfileConfig& config,
                                          std::uint64_t small_threshold) {
     const std::uint64_t file_size = file.declared_size != 0U ? file.declared_size : file.content.size();
-    if (file_size == 0U || file.nfs_handle.empty()) {
+    if (file_size == 0U) {
         return;
     }
 
@@ -725,6 +725,8 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
         std::max<std::uint64_t>(1U, (max_records + accumulators.size() - 1U) / accumulators.size());
     const auto started = std::chrono::steady_clock::now();
     std::atomic<bool> progress_done {false};
+    std::mutex progress_mutex;
+    std::condition_variable progress_cv;
 
     const auto should_stop = [&]() {
         return files_reserved.load(std::memory_order_acquire) >= max_records;
@@ -736,7 +738,15 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
             std::uint64_t previous_files = 0;
             auto previous_time = started;
             while (!progress_done.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::seconds(stats_interval_seconds));
+                {
+                    std::unique_lock<std::mutex> lock(progress_mutex);
+                    progress_cv.wait_for(lock, std::chrono::seconds(stats_interval_seconds), [&]() {
+                        return progress_done.load(std::memory_order_acquire);
+                    });
+                }
+                if (progress_done.load(std::memory_order_acquire)) {
+                    break;
+                }
                 const auto now = std::chrono::steady_clock::now();
                 const std::uint64_t files = files_recorded.load(std::memory_order_relaxed);
                 const std::uint64_t folders = folders_observed.load(std::memory_order_relaxed);
@@ -883,6 +893,7 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
         worker.join();
     }
     progress_done.store(true, std::memory_order_release);
+    progress_cv.notify_all();
     if (progress_thread.joinable()) {
         progress_thread.join();
     }

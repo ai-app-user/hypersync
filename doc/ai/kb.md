@@ -1037,3 +1037,17 @@ logical size: 335.99 TB
     `/mnt/local-nvme/wsync-codex/nfs-profile-data-sample-smoke-20260517T193112Z`
     captured `200K` metadata records with sampled small/large reads populated
     and `0` read failures.
+- Fix, 2026-05-17 12:59 PDT:
+  - Restored fast metadata profiler behavior by making raw READDIRPLUS page
+    timing conditional on streaming/page profiling again.
+  - Data-read samples no longer require raw handles; sparse samples read the
+    same sizes the reader would use: full small files and bounded large-file
+    prefixes (`1MiB` by default).
+  - The progress reporter now wakes immediately on completion instead of
+    adding up to one stats interval to command wall time.
+  - Conservative defaults: `--data-sample-rate 1000000000` and
+    `--data-sample-max-files-per-phase 1`.
+  - Transfer1 check with `50M` records showed metadata progress still at about
+    `5M files/s`; one sampled read added about `1.5s` to finalization, so the
+    full run should stay within the `5%` slowdown budget with the conservative
+    sample rate.
