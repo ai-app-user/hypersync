@@ -68,7 +68,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--keep-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
@@ -1284,6 +1284,7 @@ int main(int argc, char** argv) {
             bool dual_scan_small_large = false;
             bool recon_scan_enabled = false;
             bool morph_large_readers_to_small = false;
+            bool bucket_priority_enabled = false;
             std::uint64_t split_small_file_threshold = 0;
             std::size_t recon_meta_reader_threads = 0;
             std::size_t recon_metadata_async_depth = 0;
@@ -1350,6 +1351,11 @@ int main(int argc, char** argv) {
                     dual_scan_small_large = true;
                     split_small_large = true;
                 } else if (args[i] == "--morph-large-readers-to-small") {
+                    morph_large_readers_to_small = true;
+                    dual_scan_small_large = true;
+                    split_small_large = true;
+                } else if (args[i] == "--bucket-priority") {
+                    bucket_priority_enabled = true;
                     morph_large_readers_to_small = true;
                     dual_scan_small_large = true;
                     split_small_large = true;
@@ -1463,6 +1469,7 @@ int main(int argc, char** argv) {
                                                                     dual_scan_small_large,
                                                                     recon_scan_enabled,
                                                                     morph_large_readers_to_small,
+                                                                    bucket_priority_enabled,
                                                                     split_small_file_threshold,
                                                                     recon_meta_reader_threads,
                                                                     recon_metadata_async_depth,
@@ -1524,6 +1531,7 @@ int main(int argc, char** argv) {
                       << " dual_scan_small_large=" << (report.dual_scan_small_large ? "true" : "false")
                       << " recon_scan_enabled=" << (report.recon_scan_enabled ? "true" : "false")
                       << " morph_large_readers_to_small=" << (report.morph_large_readers_to_small ? "true" : "false")
+                      << " bucket_priority_enabled=" << (report.bucket_priority_enabled ? "true" : "false")
                       << " split_small_file_threshold=" << report.split_small_file_threshold
                       << " recon_meta_reader_threads=" << report.recon_meta_reader_threads
                       << " recon_metadata_async_depth=" << report.recon_metadata_async_depth

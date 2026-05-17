@@ -109,6 +109,7 @@ struct DataReadBenchmarkReport {
     bool dual_scan_small_large = false;
     bool recon_scan_enabled = false;
     bool morph_large_readers_to_small = false;
+    bool bucket_priority_enabled = false;
     std::uint64_t split_small_file_threshold = 0;
     std::size_t recon_meta_reader_threads = 0;
     std::size_t recon_metadata_async_depth = 0;
@@ -152,6 +153,29 @@ struct DataReadBenchmarkReport {
     double async_close_avg_latency_ms = 0.0;
     double async_close_max_latency_ms = 0.0;
 };
+
+struct SplitBucketPriorityInput {
+    std::uint64_t small_total = 0;
+    std::uint64_t large_total = 0;
+    std::uint64_t small_done = 0;
+    std::uint64_t large_done = 0;
+    double small_files_per_second = 0.0;
+    double large_files_per_second = 0.0;
+    std::size_t current_small_workers = 1;
+    std::size_t current_large_workers = 1;
+    std::size_t max_small_workers = 1;
+    std::size_t max_large_workers = 1;
+};
+
+struct SplitBucketPriorityDecision {
+    std::size_t small_workers = 1;
+    std::size_t large_workers = 1;
+    double small_eta_seconds = 0.0;
+    double large_eta_seconds = 0.0;
+};
+
+[[nodiscard]] SplitBucketPriorityDecision choose_split_bucket_priority_workers(
+    const SplitBucketPriorityInput& input) noexcept;
 
 struct DataHashBenchmarkReport {
     std::size_t files_found = 0;
@@ -378,6 +402,7 @@ public:
                                                                        bool dual_scan_small_large = false,
                                                                        bool recon_scan_enabled = false,
                                                                        bool morph_large_readers_to_small = false,
+                                                                       bool bucket_priority_enabled = false,
                                                                        std::uint64_t split_small_file_threshold = 0,
                                                                        std::size_t recon_meta_reader_threads = 0,
                                                                        std::size_t recon_metadata_async_depth = 0,

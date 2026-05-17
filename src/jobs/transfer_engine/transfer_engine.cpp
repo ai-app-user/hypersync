@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <cmath>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -313,6 +314,77 @@ std::filesystem::path default_autoscale_settings_path() {
         return std::filesystem::path(home) / ".config" / "hypersync" / "autoscale.yaml";
     }
     return std::filesystem::path("hypersync-autoscale.yaml");
+}
+
+SplitBucketPriorityDecision choose_split_bucket_priority_workers(
+    const SplitBucketPriorityInput& input) noexcept {
+    const std::size_t max_small = std::max<std::size_t>(1, input.max_small_workers);
+    const std::size_t max_large = std::max<std::size_t>(1, input.max_large_workers);
+    const std::size_t total_workers = std::max<std::size_t>(
+        2,
+        std::max<std::size_t>(1, input.current_small_workers) +
+            std::max<std::size_t>(1, input.current_large_workers));
+    const std::uint64_t small_remaining =
+        input.small_total > input.small_done ? input.small_total - input.small_done : 0U;
+    const std::uint64_t large_remaining =
+        input.large_total > input.large_done ? input.large_total - input.large_done : 0U;
+
+    auto eta = [](std::uint64_t remaining, double rate) {
+        if (remaining == 0U) {
+            return 0.0;
+        }
+        return rate > 0.0 ? static_cast<double>(remaining) / rate
+                          : std::numeric_limits<double>::infinity();
+    };
+
+    SplitBucketPriorityDecision decision;
+    decision.small_eta_seconds = eta(small_remaining, input.small_files_per_second);
+    decision.large_eta_seconds = eta(large_remaining, input.large_files_per_second);
+    if (small_remaining == 0U && large_remaining == 0U) {
+        decision.small_workers = std::min(max_small, std::max<std::size_t>(1, input.current_small_workers));
+        decision.large_workers = std::min(max_large, std::max<std::size_t>(1, input.current_large_workers));
+        return decision;
+    }
+    if (large_remaining == 0U) {
+        decision.small_workers = std::min(max_small, std::max<std::size_t>(1, total_workers - 1U));
+        decision.large_workers = 1U;
+        return decision;
+    }
+    if (small_remaining == 0U) {
+        decision.small_workers = 1U;
+        decision.large_workers = std::min(max_large, std::max<std::size_t>(1, total_workers - 1U));
+        return decision;
+    }
+
+    const double small_per_worker =
+        input.small_files_per_second > 0.0
+            ? input.small_files_per_second / static_cast<double>(std::max<std::size_t>(1, input.current_small_workers))
+            : 1.0;
+    const double large_per_worker =
+        input.large_files_per_second > 0.0
+            ? input.large_files_per_second / static_cast<double>(std::max<std::size_t>(1, input.current_large_workers))
+            : 1.0;
+    const double small_demand = static_cast<double>(small_remaining) / std::max(1.0, small_per_worker);
+    const double large_demand = static_cast<double>(large_remaining) / std::max(1.0, large_per_worker);
+    const double total_demand = small_demand + large_demand;
+    std::size_t small_workers =
+        total_demand > 0.0
+            ? static_cast<std::size_t>(std::llround(static_cast<double>(total_workers) *
+                                                    small_demand / total_demand))
+            : std::max<std::size_t>(1, input.current_small_workers);
+    small_workers = std::clamp<std::size_t>(small_workers, 1U, max_small);
+    std::size_t large_workers = total_workers > small_workers ? total_workers - small_workers : 1U;
+    if (large_workers > max_large) {
+        large_workers = max_large;
+        small_workers = std::min(max_small, std::max<std::size_t>(1, total_workers - large_workers));
+    }
+    if (small_workers > max_small) {
+        small_workers = max_small;
+        large_workers = std::min(max_large, std::max<std::size_t>(1, total_workers - small_workers));
+    }
+    decision.small_workers = std::max<std::size_t>(1, small_workers);
+    decision.large_workers = std::max<std::size_t>(1, large_workers);
+    return decision;
 }
 
 std::string metadata_part_suffix(std::size_t index) {
@@ -6108,6 +6180,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                                             std::size_t recon_metadata_async_depth,
                                                             std::uint64_t recon_page_sleep_us,
                                                             bool morph_large_readers_to_small,
+                                                            bool bucket_priority_enabled,
                                                             std::size_t small_meta_reader_threads,
                                                             std::size_t large_meta_reader_threads,
                                                             std::size_t data_buffer_slots,
@@ -6368,7 +6441,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
 
     std::unique_ptr<JobAutoScaleRunner> large_autoscaler;
     std::unique_ptr<PipelineAutoScaleRunner> pipeline_autoscaler;
-    if (autoscale_config.pipeline_enabled) {
+    if (autoscale_config.pipeline_enabled && !bucket_priority_enabled) {
         pipeline_autoscaler = std::make_unique<PipelineAutoScaleRunner>(
             std::vector<PipelineAutoScaleRunner::Stage> {
                 PipelineAutoScaleRunner::Stage {
@@ -6399,7 +6472,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << " advanced=" << (decision.stage_advanced ? "true" : "false") << '\n';
             }
         });
-    } else if (autoscale_config.large_enabled) {
+    } else if (autoscale_config.large_enabled && !bucket_priority_enabled) {
         large_autoscaler = std::make_unique<JobAutoScaleRunner>(
             large_reader_job,
             make_reader_policy(
@@ -6419,6 +6492,99 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << decision.active_workers
                           << " max_workers=" << large_reader_job.worker_count()
                           << " reason=" << decision.reason << '\n';
+            }
+        });
+    }
+
+    struct PrioritySample {
+        std::chrono::steady_clock::time_point at;
+        std::uint64_t small_read = 0;
+        std::uint64_t large_read = 0;
+    };
+    std::atomic<bool> bucket_priority_stop {false};
+    std::thread bucket_priority_coordinator;
+    if (bucket_priority_enabled) {
+        bucket_priority_coordinator = std::thread([&]() {
+            std::deque<PrioritySample> samples;
+            const auto sample_window = std::chrono::minutes(10);
+            while (!bucket_priority_stop.load(std::memory_order_relaxed)) {
+                const auto now = std::chrono::steady_clock::now();
+                const DataReadBenchmarkSnapshot snapshot =
+                    snapshot_data_read_stats(stats, recon_scan_enabled ? &recon_stats : nullptr);
+                samples.push_back(PrioritySample {
+                    now,
+                    static_cast<std::uint64_t>(snapshot.small_files_read),
+                    static_cast<std::uint64_t>(snapshot.large_files_read),
+                });
+                while (samples.size() > 2U && now - samples.front().at > sample_window) {
+                    samples.pop_front();
+                }
+
+                double small_rate = snapshot.small_files_per_second;
+                double large_rate = snapshot.large_files_per_second;
+                if (samples.size() >= 2U) {
+                    const auto& oldest = samples.front();
+                    const double elapsed = std::chrono::duration<double>(now - oldest.at).count();
+                    if (elapsed > 0.0) {
+                        small_rate = static_cast<double>(
+                                         snapshot.small_files_read - oldest.small_read) / elapsed;
+                        large_rate = static_cast<double>(
+                                         snapshot.large_files_read - oldest.large_read) / elapsed;
+                    }
+                }
+
+                const std::size_t queued_small = queued_data_read_files(file_queues.small);
+                const std::size_t queued_large = queued_data_read_files(file_queues.large);
+                const std::uint64_t small_total = std::max<std::uint64_t>(
+                    {static_cast<std::uint64_t>(snapshot.small_files_found),
+                     static_cast<std::uint64_t>(snapshot.recon_small_files_found),
+                     static_cast<std::uint64_t>(snapshot.small_files_read + queued_small)});
+                const std::uint64_t large_total = std::max<std::uint64_t>(
+                    {static_cast<std::uint64_t>(snapshot.large_files_found),
+                     static_cast<std::uint64_t>(snapshot.recon_large_files_found),
+                     static_cast<std::uint64_t>(snapshot.large_files_read + queued_large)});
+
+                SplitBucketPriorityInput input;
+                input.small_total = small_total;
+                input.large_total = large_total;
+                input.small_done = snapshot.small_files_read;
+                input.large_done = snapshot.large_files_read;
+                input.small_files_per_second = small_rate;
+                input.large_files_per_second = large_rate;
+                input.current_small_workers = small_reader_job.active_worker_limit();
+                input.current_large_workers = large_reader_job.active_worker_limit();
+                input.max_small_workers = small_reader_job.worker_count();
+                input.max_large_workers = large_reader_job.worker_count();
+                const SplitBucketPriorityDecision decision =
+                    choose_split_bucket_priority_workers(input);
+                const std::size_t applied_small =
+                    small_reader_job.set_active_worker_limit(decision.small_workers);
+                const std::size_t applied_large =
+                    large_reader_job.set_active_worker_limit(decision.large_workers);
+                std::cerr << "bucket_priority small_workers=" << applied_small
+                          << " large_workers=" << applied_large
+                          << " small_eta_seconds=" << decision.small_eta_seconds
+                          << " large_eta_seconds=" << decision.large_eta_seconds
+                          << " small_rate_files_per_second=" << small_rate
+                          << " large_rate_files_per_second=" << large_rate
+                          << " small_remaining="
+                          << (small_total > snapshot.small_files_read
+                                  ? small_total - snapshot.small_files_read
+                                  : 0U)
+                          << " large_remaining="
+                          << (large_total > snapshot.large_files_read
+                                  ? large_total - snapshot.large_files_read
+                                  : 0U)
+                          << " queued_small_files=" << queued_small
+                          << " queued_large_files=" << queued_large
+                          << " recon_completed=" << (snapshot.recon_completed ? "true" : "false")
+                          << '\n';
+
+                for (int tick = 0; tick < 50 &&
+                                   !bucket_priority_stop.load(std::memory_order_relaxed);
+                     ++tick) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
             }
         });
     }
@@ -6529,6 +6695,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                       << " recon_completed=" << (snapshot.recon_completed ? "true" : "false")
                       << " queued_small_files=" << queued_data_read_files(file_queues.small)
                       << " queued_large_files=" << queued_data_read_files(file_queues.large)
+                      << " small_reader_workers=" << small_reader_job.active_worker_limit()
+                      << " large_reader_workers=" << large_reader_job.active_worker_limit()
                       << " small_output_depth=" << small_reader_to_discard.size()
                       << " large_output_depth=" << large_reader_to_discard.size()
                       << " elapsed_seconds=" << snapshot.elapsed_seconds << '\n';
@@ -6617,6 +6785,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     }
     if (pipeline_autoscaler) {
         pipeline_autoscaler->stop();
+    }
+    bucket_priority_stop.store(true, std::memory_order_relaxed);
+    if (bucket_priority_coordinator.joinable()) {
+        bucket_priority_coordinator.join();
     }
     if (autoscale_profile_store) {
         autoscale_profile_store->update_learned_workers(autoscale_config.profile_name,
@@ -9442,6 +9614,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                                      bool dual_scan_small_large,
                                                                      bool recon_scan_enabled,
                                                                      bool morph_large_readers_to_small,
+                                                                     bool bucket_priority_enabled,
                                                                      std::uint64_t split_small_file_threshold,
                                                                      std::size_t recon_meta_reader_threads,
                                                                      std::size_t recon_metadata_async_depth,
@@ -9516,6 +9689,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     report.dual_scan_small_large = dual_scan_small_large;
     report.recon_scan_enabled = recon_scan_enabled;
     report.morph_large_readers_to_small = morph_large_readers_to_small;
+    report.bucket_priority_enabled = bucket_priority_enabled;
     report.split_small_file_threshold = split_small_file_threshold == 0U ? config_.small_file_threshold
                                                                          : split_small_file_threshold;
     report.recon_meta_reader_threads =
@@ -9583,6 +9757,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
                                                      report.recon_metadata_async_depth,
                                                      report.recon_page_sleep_us,
                                                      report.morph_large_readers_to_small,
+                                                     report.bucket_priority_enabled,
                                                      report.small_meta_reader_threads,
                                                      report.large_meta_reader_threads,
                                                      data_buffer_slots,

@@ -81,12 +81,15 @@ using hypersync::NfsDataReader;
 using hypersync::NfsMetaReader;
 using hypersync::RecBuf;
 using hypersync::ScanIndex;
+using hypersync::SplitBucketPriorityDecision;
+using hypersync::SplitBucketPriorityInput;
 using hypersync::ScanWriter;
 using hypersync::SpscRing;
 using hypersync::TransferEngine;
 using hypersync::ThreadedJob;
 using hypersync::kDataBufferPoolId;
 using hypersync::kMetadataBufferPoolId;
+using hypersync::choose_split_bucket_priority_workers;
 
 namespace {
 
@@ -785,6 +788,50 @@ void test_pipeline_autoscaler_tunes_one_stage_then_advances() {
     EXPECT_EQ(runner.active_stage_index(), 1U);
     EXPECT_EQ(first.active_worker_limit(), 8U);
     EXPECT_TRUE(second.active_worker_limit() > 2U);
+}
+
+void test_split_bucket_priority_balances_eta() {
+    SplitBucketPriorityInput input;
+    input.small_total = 10'000'000;
+    input.large_total = 200'000;
+    input.small_done = 1'000'000;
+    input.large_done = 100'000;
+    input.small_files_per_second = 30'000.0;
+    input.large_files_per_second = 2'000.0;
+    input.current_small_workers = 96;
+    input.current_large_workers = 64;
+    input.max_small_workers = 128;
+    input.max_large_workers = 64;
+
+    SplitBucketPriorityDecision decision = choose_split_bucket_priority_workers(input);
+    EXPECT_TRUE(decision.small_eta_seconds > decision.large_eta_seconds);
+    EXPECT_TRUE(decision.small_workers > input.current_small_workers);
+    EXPECT_TRUE(decision.large_workers < input.current_large_workers);
+
+    input.small_total = 1'100'000;
+    input.large_total = 10'000'000;
+    input.small_done = 1'000'000;
+    input.large_done = 1'000'000;
+    input.small_files_per_second = 50'000.0;
+    input.large_files_per_second = 500.0;
+    input.current_small_workers = 120;
+    input.current_large_workers = 40;
+    decision = choose_split_bucket_priority_workers(input);
+    EXPECT_TRUE(decision.large_eta_seconds > decision.small_eta_seconds);
+    EXPECT_TRUE(decision.large_workers > input.current_large_workers);
+    EXPECT_TRUE(decision.small_workers < input.current_small_workers);
+
+    input.small_total = 5'000'000;
+    input.large_total = 1'000'000;
+    input.small_done = 1'000'000;
+    input.large_done = 1'000'000;
+    input.small_files_per_second = 20'000.0;
+    input.large_files_per_second = 1'000.0;
+    input.current_small_workers = 96;
+    input.current_large_workers = 64;
+    decision = choose_split_bucket_priority_workers(input);
+    EXPECT_EQ(decision.large_workers, 1U);
+    EXPECT_TRUE(decision.small_workers > 96U);
 }
 
 void test_autoscale_profile_store_defaults_and_persists_learned_workers() {
@@ -4381,6 +4428,9 @@ int main(int argc, char** argv) {
         {"pipeline_autoscaler_tunes_one_stage_then_advances",
          TestSuite::unit,
          test_pipeline_autoscaler_tunes_one_stage_then_advances},
+        {"split_bucket_priority_balances_eta",
+         TestSuite::unit,
+         test_split_bucket_priority_balances_eta},
         {"autoscale_profile_store_defaults_and_persists_learned_workers",
          TestSuite::unit,
          test_autoscale_profile_store_defaults_and_persists_learned_workers},
