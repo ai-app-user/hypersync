@@ -5,6 +5,11 @@ This document defines general development principles for the application. It sho
 ## Core Principles
 
 - Keep requirements, UX, design, implementation, and tests separate.
+- Use `dev` as the default working branch for every project repository. Push
+  normal iteration commits to `dev` after each completed iteration.
+- Merge or push changes back to `main` only when the maintainer explicitly asks
+  for a main merge or release promotion. Do not treat successful tests or a
+  finished task as implicit permission to update `main`.
 - Prefer simple, observable behavior over hidden cleverness.
 - Make every long-running workflow interruptible, measurable, and resumable where practical.
 - Treat failures as first-class output: count them, report them, and make strict versus best-effort behavior explicit.
