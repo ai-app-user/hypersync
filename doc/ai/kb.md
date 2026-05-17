@@ -865,3 +865,26 @@ logical size: 335.99 TB
     avg latency `14.45 ms`, max `308.76 ms`.
   - Conclusion: not a 4KB partial-read problem. Packed mode is slower because
     read completions have much higher latency and a long tail.
+
+## Synthetic Profiler Benchmark, 2026-05-17 10:49 PDT
+
+- Added CLI command:
+  `hypersync benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]`.
+- Purpose: benchmark compact phase-aware profile capture from generated
+  metadata observations. This is not live NFS capture yet.
+- Transfer1 release run:
+  - Run dir:
+    `/mnt/local-nvme/wsync-codex/synthetic-profiler-100m-20260517T174453Z`
+  - Command:
+    `./build/release/hypersync benchmark-synthetic-profile --file-count 100000000 --block-file-count 1000000 --small-ratio-shift-threshold 0.05 --output <run>/profile.txt`
+  - Result: `100,000,000` files in `1.721s`, `58.1M files/s`,
+    max RSS `3,840 KB`.
+  - Compact profile output had 3 phases:
+    - phase 0: `35M` files, small ratio `0.960`
+    - phase 1: `35M` files, small ratio `0.650`
+    - phase 2: `30M` files, small ratio `0.200`
+  - Total generated logical size: `16,958,577,138,586,000` bytes.
+- Verification:
+  - `make unit-test`: `67/67` passed before CLI smoke addition.
+  - `make integration-test`: `20/20` passed after adding
+    `main_cli_benchmark_synthetic_profile_smoke`.

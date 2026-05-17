@@ -1,8 +1,11 @@
 #include "hypersync.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -55,6 +58,101 @@ double parse_positive_double_option(const std::string& value, std::string_view f
     return parsed;
 }
 
+hypersync::SyntheticObservedFile synthetic_profiler_observation(std::uint64_t file_id,
+                                                                std::uint64_t file_count,
+                                                                std::uint64_t seed) {
+    const std::uint64_t phase_cut_a = file_count * 35U / 100U;
+    const std::uint64_t phase_cut_b = file_count * 70U / 100U;
+    const std::uint64_t random = hypersync::synthetic_splitmix64(seed ^ file_id);
+    const std::uint64_t pick = random % 1000U;
+
+    hypersync::SyntheticObservedFile file;
+    if (file_id < phase_cut_a) {
+        file.size_bytes = pick < 960U
+                              ? 1U + (random % (64U * 1024U))
+                              : (1U * 1024U * 1024U) + (random % (16U * 1024U * 1024U));
+    } else if (file_id < phase_cut_b) {
+        file.size_bytes = pick < 650U
+                              ? 1U + (random % (128U * 1024U))
+                              : (1U * 1024U * 1024U) + (random % (128U * 1024U * 1024U));
+    } else {
+        file.size_bytes = pick < 200U
+                              ? 1U + (random % (128U * 1024U))
+                              : (128U * 1024U * 1024ULL) + (random % (1024U * 1024U * 1024ULL));
+    }
+    file.uid = static_cast<std::uint32_t>(1000U + (random % 128U));
+    file.gid = static_cast<std::uint32_t>(1000U + ((random >> 8U) % 64U));
+    file.mode = 0644;
+    file.filename_length = static_cast<std::uint16_t>(8U + (random % 80U));
+    file.depth = static_cast<std::uint16_t>(1U + ((random >> 12U) % 8U));
+    file.files_in_folder = static_cast<std::uint32_t>(1U + ((file_id / 4096U) % 100000U));
+    return file;
+}
+
+void print_synthetic_profile(std::ostream& out,
+                             const hypersync::SyntheticWorkloadProfile& profile,
+                             std::uint64_t files_observed,
+                             double elapsed_seconds) {
+    std::uint64_t total_bytes = 0;
+    std::uint64_t total_small = 0;
+    std::uint64_t total_large = 0;
+    for (const auto& phase : profile.phases) {
+        total_bytes += phase.logical_size_bytes;
+        total_small += phase.small_file_count;
+        total_large += phase.large_file_count;
+    }
+
+    out << std::fixed << std::setprecision(3)
+        << "synthetic_profile_benchmark files_observed=" << files_observed
+        << " phases=" << profile.phases.size()
+        << " elapsed_s=" << elapsed_seconds
+        << " files_per_second=" << (elapsed_seconds > 0.0 ? static_cast<double>(files_observed) / elapsed_seconds : 0.0)
+        << " logical_size_bytes=" << total_bytes
+        << " small_files=" << total_small
+        << " large_files=" << total_large << '\n';
+
+    const auto bounds = hypersync::synthetic_size_bucket_bounds();
+    for (std::size_t phase_index = 0; phase_index < profile.phases.size(); ++phase_index) {
+        const auto& phase = profile.phases[phase_index];
+        const double small_ratio = phase.file_count == 0U
+                                       ? 0.0
+                                       : static_cast<double>(phase.small_file_count) /
+                                             static_cast<double>(phase.file_count);
+        const double average_filename_length = phase.file_count == 0U
+                                                   ? 0.0
+                                                   : static_cast<double>(phase.filename_length_sum) /
+                                                         static_cast<double>(phase.file_count);
+        const double average_depth = phase.file_count == 0U
+                                         ? 0.0
+                                         : static_cast<double>(phase.depth_sum) /
+                                               static_cast<double>(phase.file_count);
+        out << "phase index=" << phase_index
+            << " name=" << phase.name
+            << " files=" << phase.file_count
+            << " small=" << phase.small_file_count
+            << " large=" << phase.large_file_count
+            << " small_ratio=" << small_ratio
+            << " logical_size_bytes=" << phase.logical_size_bytes
+            << " avg_filename_len=" << average_filename_length
+            << " avg_depth=" << average_depth
+            << " size_buckets=";
+        for (std::size_t bucket = 0; bucket < bounds.size(); ++bucket) {
+            if (bucket != 0U) {
+                out << ',';
+            }
+            out << "<=";
+            if (bounds[bucket] == hypersync::kSyntheticUnboundedSize) {
+                out << "inf";
+            } else {
+                out << bounds[bucket];
+            }
+            out << ':' << phase.size_file_counts[bucket]
+                << '/' << phase.size_logical_bytes[bucket];
+        }
+        out << '\n';
+    }
+}
+
 void print_usage() {
     std::cerr
         << "Usage:\n"
@@ -70,6 +168,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-fake-diff [--file-count <n>] [--folder-count <n>] [--average-file-size <bytes>] [--source-threads <n>] [--fake-remote-threads <n>] [--checker-threads <n>] [--remote-delay-us <n>] [--request-queue-depth <n>] [--batch-queue-depth <n>] [--stats-interval-seconds <n>]\n"
@@ -139,6 +238,59 @@ int main(int argc, char** argv) {
             }
         }
         hypersync::TransferEngine engine(engine_config, config_store);
+
+        if (command == "benchmark-synthetic-profile") {
+            std::uint64_t file_count = 100'000'000ULL;
+            hypersync::SyntheticProfileCaptureConfig capture_config;
+            std::filesystem::path output_path;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--file-count") {
+                    file_count = parse_u64_option(require_option(args, i, "--file-count"),
+                                                  "--file-count");
+                } else if (args[i] == "--block-file-count") {
+                    capture_config.block_file_count =
+                        parse_u64_option(require_option(args, i, "--block-file-count"),
+                                         "--block-file-count");
+                } else if (args[i] == "--small-ratio-shift-threshold") {
+                    capture_config.small_ratio_shift_threshold =
+                        parse_positive_double_option(
+                            require_option(args, i, "--small-ratio-shift-threshold"),
+                            "--small-ratio-shift-threshold");
+                } else if (args[i] == "--seed") {
+                    capture_config.seed = parse_u64_option(require_option(args, i, "--seed"),
+                                                           "--seed");
+                } else if (args[i] == "--output") {
+                    output_path = require_option(args, i, "--output");
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            if (file_count == 0U) {
+                throw std::runtime_error("--file-count must be greater than zero");
+            }
+
+            hypersync::SyntheticProfileBuilder builder(capture_config);
+            const auto start = std::chrono::steady_clock::now();
+            for (std::uint64_t file_id = 0; file_id < file_count; ++file_id) {
+                builder.observe_file(
+                    synthetic_profiler_observation(file_id, file_count, capture_config.seed));
+            }
+            const hypersync::SyntheticWorkloadProfile profile = builder.finish();
+            const auto finish = std::chrono::steady_clock::now();
+            const double elapsed_seconds =
+                std::chrono::duration<double>(finish - start).count();
+
+            print_synthetic_profile(std::cout, profile, file_count, elapsed_seconds);
+            if (!output_path.empty()) {
+                std::ofstream output(output_path);
+                if (!output) {
+                    throw std::runtime_error("failed to open output: " + output_path.string());
+                }
+                print_synthetic_profile(output, profile, file_count, elapsed_seconds);
+            }
+            return 0;
+        }
 
         if (command == "receive") {
             hypersync::ReceiverRuntimeConfig runtime = hypersync::load_receiver_runtime_config(config_store);

@@ -3877,6 +3877,33 @@ void test_main_cli_benchmark_data_hash_smoke() {
     EXPECT_TRUE(output_text.find("hash_work_factor=2") != std::string::npos);
 }
 
+void test_main_cli_benchmark_synthetic_profile_smoke() {
+    TempDir output("hypersync_cli_benchmark_synthetic_profile_output");
+
+    const std::string app = (fs::current_path() / "build" / "hypersync").string();
+    const fs::path stdout_path = output.path / "synthetic_profile_stdout.txt";
+    const fs::path profile_path = output.path / "synthetic_profile.txt";
+
+    EXPECT_TRUE(command_succeeds(app + " benchmark-synthetic-profile --file-count 2000000" +
+                                 " --block-file-count 100000 --output " +
+                                 profile_path.string() + " > " + stdout_path.string() + " 2>&1"));
+    const std::string output_text = hypersync::read_file_contents(stdout_path);
+    EXPECT_TRUE(output_text.find("synthetic_profile_benchmark files_observed=2000000") !=
+                std::string::npos);
+    EXPECT_TRUE(output_text.find("phases=3") != std::string::npos);
+    EXPECT_TRUE(output_text.find("files_per_second=") != std::string::npos);
+    EXPECT_TRUE(output_text.find("phase index=0") != std::string::npos);
+    EXPECT_TRUE(output_text.find("phase index=1") != std::string::npos);
+    EXPECT_TRUE(output_text.find("phase index=2") != std::string::npos);
+
+    const std::string profile_text = hypersync::read_file_contents(profile_path);
+    EXPECT_TRUE(profile_text.find("logical_size_bytes=") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("small_ratio=0.960") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("small_ratio=0.650") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("small_ratio=0.199") != std::string::npos ||
+                profile_text.find("small_ratio=0.200") != std::string::npos);
+}
+
 void test_main_cli_benchmark_hash_smoke() {
     TempDir output("hypersync_cli_benchmark_hash_output");
 
@@ -4785,6 +4812,9 @@ int main(int argc, char** argv) {
         {"main_cli_benchmark_meta_smoke", TestSuite::integration, test_main_cli_benchmark_meta_smoke},
         {"main_cli_benchmark_data_smoke", TestSuite::integration, test_main_cli_benchmark_data_smoke},
         {"main_cli_benchmark_data_hash_smoke", TestSuite::integration, test_main_cli_benchmark_data_hash_smoke},
+        {"main_cli_benchmark_synthetic_profile_smoke",
+         TestSuite::integration,
+         test_main_cli_benchmark_synthetic_profile_smoke},
         {"main_cli_benchmark_hash_smoke", TestSuite::integration, test_main_cli_benchmark_hash_smoke},
         {"main_cli_benchmark_metadata_writer_smoke",
          TestSuite::integration,

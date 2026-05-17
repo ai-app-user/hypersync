@@ -259,3 +259,15 @@ window, CLI/config flags, and in-place packed-buffer hashing in
 build with libnfs passed. Real NFS small-file benchmark showed packed mode is
 functional but slower than the raw one-file-per-buffer path, so packed mode
 remains explicit/experimental and raw remains default.
+
+## 2026-05-17 10:49 PDT
+
+**User:** ok, let test the profiler, can you run it on 100M files, see how fast it is and what result it will produce
+
+**Codex:** Added `benchmark-synthetic-profile` CLI around the phase-aware
+synthetic profile builder, with generated observation input and optional output
+file. Ran the release build on transfer1 for 100M synthetic file observations.
+Result: `1.721s`, `58.1M files/s`, `3.8MB` max RSS, and a compact 3-phase
+profile: 35M small-heavy files, 35M mixed files, and 30M large-bulk-tail files.
+Added an integration smoke test for the CLI and recorded the result in
+`hypersync/doc/performance.md`.

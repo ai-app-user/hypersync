@@ -2047,3 +2047,51 @@ Interpretation:
   interval before the stop/tail phase.
 - Post-stop samples are not throughput evidence because the benchmark stop
   timer clears queues. Use the last interval before stop.
+
+Synthetic Profiler Smoke, 2026-05-17
+------------------------------------
+
+Purpose: verify the phase-aware synthetic profile capture path can digest a
+large metadata stream much faster than a real filesystem reader and produce a
+compact workload profile.
+
+Command, run on transfer1:
+
+```text
+./build/release/hypersync benchmark-synthetic-profile \
+  --file-count 100000000 \
+  --block-file-count 1000000 \
+  --small-ratio-shift-threshold 0.05 \
+  --output /mnt/local-nvme/wsync-codex/synthetic-profiler-100m-20260517T174453Z/profile.txt
+```
+
+Result:
+
+```text
+files_observed     100,000,000
+elapsed_s          1.721
+files_per_second   58,120,837.782
+max_rss_kb         3,840
+phases             3
+small_files        62,351,703
+large_files        37,648,297
+logical_size       16,958,577,138,586,000 bytes
+```
+
+Phase summary:
+
+```text
+phase  files       small ratio  intent
+0      35,000,000  0.960        small-file heavy front
+1      35,000,000  0.650        mixed middle
+2      30,000,000  0.200        large-file bulk tail
+```
+
+Interpretation:
+
+- The current profiler benchmark is synthetic-observation input, not live NFS
+  capture yet. It exercises the profile builder and phase compression logic.
+- Memory use stayed flat and tiny because the profiler stores aggregate
+  histograms and phase counters, not per-file paths or NFS handles.
+- This is fast enough for the intended replay/profiler control plane; next work
+  is wiring live scan capture into the same profile format.
