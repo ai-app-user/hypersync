@@ -72,9 +72,7 @@ Documentation files should have clear ownership:
 - `hypersync/doc/performance.md`: observed job-level and pipeline performance baselines.
 - `hypersync/doc/claude.md`: imported implementation notes and external design guidance.
 - `hypersync/doc/guidlines.md`: general development rules and quality bar.
-- `hypersync/doc/ai/`: tracked AI session handoff context. Keep `chat.md`
-  for timestamped User/Codex conversation history, `kb.md` for durable facts
-  and operational state, and `scripts/` for reusable session scripts.
+- `hypersync/doc/ai/`: tracked AI session handoff context.
 - `piper/doc/`: reusable pipeline infrastructure documentation.
 
 Project files should stay predictable:
@@ -86,6 +84,22 @@ Project files should stay predictable:
 ## Documentation Rules
 
 - Treat durable, non-feature-specific instructions from maintainers as project guidelines. When a maintainer gives a general rule about architecture, comments, file organization, testing, documentation, performance practices, or design principles, update this file as part of the same change.
+- Keep AI session context tracked in Git under each project using `doc/ai/`
+  (`docs/ai/` only for repositories whose documentation root is `docs/`).
+  The folder must contain `chat.md`, `kb.md`, and `scripts/`.
+- `doc/ai/chat.md` records concise timestamped conversation history with both
+  User and Codex messages. Include decisions, requests, summaries of actions,
+  and final outcomes; do not paste huge command outputs.
+- `doc/ai/kb.md` records durable handoff facts: hosts, paths, commands,
+  deployment locations, branch rules, benchmark baselines, operational state,
+  important decisions, known failures, and current next steps. Keep it useful
+  as future-session context, not as a raw transcript.
+- `doc/ai/scripts/` stores reusable scripts created or modified during AI
+  sessions. Prefer scripts here over one-off shell fragments when the operation
+  is likely to recur.
+- When the maintainer sends exactly `sync`, update `doc/ai/chat.md` and
+  `doc/ai/kb.md` with the latest conversation and current important facts,
+  then commit and push those context updates to `dev`.
 - Update `hypersync/doc/requirement.md` when scope, status, or product behavior changes.
 - Update `hypersync/doc/ux.md` when command names, options, config shape, installation, or runtime behavior changes.
 - Update design documentation when architecture, job composition, data flow, or major tradeoffs change.
