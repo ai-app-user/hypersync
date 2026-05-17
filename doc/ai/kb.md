@@ -1199,3 +1199,23 @@ logical size: 335.99 TB
     `./build/hypersync_tests --only main_cli_benchmark_meta_smoke`,
     recursive tiny scan (`2` files / `2` folders), and non-recursive tiny scan
     (`1` file / `1` folder).
+
+## Metadata Scanner Queue Split NFS Verification
+
+- 2026-05-17 16:37 PDT:
+  - Commits after the initial split:
+    - `6a50f9a Restore metadata scanner timed shutdown`
+    - `d1f58d8 Avoid metadata folder seeder starvation`
+    - `8b529ef Separate metadata folder feedback pool`
+  - Root cause of the bad first NFS attempt: folder input work and child/completion
+    feedback shared the same folder-work buffer pool. A full folder queue could
+    starve feedback handles and stall the front edge. The fix uses separate
+    bounded pools/queues for folder work and feedback.
+  - Valid transfer1 release verification on `8b529ef`:
+    - Source: `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+    - Command: `sudo -n ./build/release/hypersync benchmark-meta --source <source> --metadata-stats-discarder --meta-reader-threads 96 --metadata-async-depth 256 --max-duration-seconds 120 --stats-interval-seconds 10 --no-pipeline-autoscale --record-buffer-slots 128`
+    - Result: `797,041,501` files, `13,152,488` folders, elapsed `122.94s`,
+      final `6.48M files/s`, `async_backend=true`.
+    - Cumulative samples: `7.04M` at 80s, `7.29M` at 90s, `7.15M` at 100s.
+  - Conclusion: scanner speed on the real NFS source is back in the expected
+    baseline band after the queue split.

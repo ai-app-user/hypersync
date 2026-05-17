@@ -442,3 +442,9 @@ the old unused direct flat-metadata scan helper. Local build passed and
 **User:** Asked why the metadata generator was named `FlatFolderScannerBuffer`, observed that it mixed metadata provision and packing, then clarified that `NfsMetaReader` should get folders from a seeder, feed child folders back to the seeder, respect a non-recursive folder flag, and continue feeding the existing downstream parquet/discard pipeline unchanged.
 
 **Codex:** Split the benchmark metadata scanner front into explicit jobs and queues: folder seeding, NFS/synthetic/local metadata reading, and downstream metadata buffer packing/consumption. Added a recursive flag to `FileSpec` folder work, routed child-folder discovery through a feedback buffer queue, preserved the existing flat-folder metadata buffer output for downstream jobs, and verified recursive and non-recursive behavior locally.
+
+## 2026-05-17 16:37 PDT
+
+**User:** Asked to verify the metadata scanner did not regress on the real NFS source for at least a few minutes.
+
+**Codex:** Deployed from `dev` to transfer1 via git, found the initial queue-split build had a timed-shutdown/front-edge feedback problem, fixed it in two follow-up commits (`6a50f9a`, `d1f58d8`, `8b529ef`), and reran the real NFS scanner. The final verification on `8b529ef` processed `797,041,501` files and `13,152,488` folders in `122.94s`, `async_backend=true`, final `6.48M files/s`, with cumulative samples above `7M files/s` from 80s through 100s.

@@ -2233,3 +2233,50 @@ Interpretation:
 - The 5-minute final average is lower because the scan entered slower/tail
   regions and the timed stop/drain phase; use mid-run interval/cumulative
   samples when comparing scanner engine throughput.
+
+## Metadata Scanner Queue Split Verification, 2026-05-17 16:37 PDT
+
+Source: `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+
+Command:
+
+```text
+sudo -n ./build/release/hypersync benchmark-meta --source nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5 --metadata-stats-discarder --meta-reader-threads 96 --metadata-async-depth 256 --max-duration-seconds 120 --stats-interval-seconds 10 --no-pipeline-autoscale --record-buffer-slots 128
+```
+
+Git: `8b529ef` on `dev`.
+
+Pipeline front edge after refactor:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(BufQueue-128)->[BufferDiscarder-1]
+```
+
+Child-folder feedback uses a separate bounded buffer queue and separate pool.
+
+Result:
+
+```text
+files_seen             797,041,501
+folders_found          13,152,488
+logical_size_bytes     1,332,866,815,342,794
+async_backend          true
+elapsed_s              122.94
+final files_per_second 6.484M
+final records_per_sec  6.622M
+```
+
+Cumulative samples:
+
+```text
+50s   5.488M files/s
+60s   5.922M files/s
+70s   6.553M files/s
+80s   7.038M files/s
+90s   7.288M files/s
+100s  7.152M files/s
+110s  6.925M files/s
+120s  6.642M files/s
+```
+
+Interpretation: scanner performance is back in the expected NFS source band after splitting the folder-work and folder-feedback buffer pools. The first refactor attempt regressed because the same pool was used for folder input and completion/child feedback; a full folder queue could starve feedback handles and stall the front edge.
