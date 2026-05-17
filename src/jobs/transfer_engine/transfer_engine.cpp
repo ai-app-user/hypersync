@@ -6613,11 +6613,11 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 const std::uint64_t small_total = std::max<std::uint64_t>(
                     {static_cast<std::uint64_t>(snapshot.small_files_found),
                      static_cast<std::uint64_t>(snapshot.recon_small_files_found),
-                     static_cast<std::uint64_t>(snapshot.small_files_read + queued_small)});
+                     static_cast<std::uint64_t>(snapshot.small_files_read)});
                 const std::uint64_t large_total = std::max<std::uint64_t>(
                     {static_cast<std::uint64_t>(snapshot.large_files_found),
                      static_cast<std::uint64_t>(snapshot.recon_large_files_found),
-                     static_cast<std::uint64_t>(snapshot.large_files_read + queued_large)});
+                     static_cast<std::uint64_t>(snapshot.large_files_read)});
                 const std::uint64_t large_total_bytes = std::max<std::uint64_t>(
                     {snapshot.large_logical_size_bytes,
                      snapshot.recon_large_logical_size_bytes,
