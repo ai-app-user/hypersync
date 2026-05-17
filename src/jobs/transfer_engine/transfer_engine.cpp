@@ -348,6 +348,7 @@ SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
     if (large_remaining == 0U) {
         decision.small_workers = std::min(max_small, std::max<std::size_t>(1, total_workers - 1U));
         decision.large_workers = 1U;
+        decision.large_reader_small_priority_percent = 100U;
         return decision;
     }
     if (small_remaining == 0U) {
@@ -384,6 +385,20 @@ SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
     }
     decision.small_workers = std::max<std::size_t>(1, small_workers);
     decision.large_workers = std::max<std::size_t>(1, large_workers);
+    if (small_remaining != 0U &&
+        std::isfinite(decision.small_eta_seconds) &&
+        std::isfinite(decision.large_eta_seconds) &&
+        decision.small_eta_seconds > decision.large_eta_seconds * 1.10) {
+        const double imbalance =
+            (decision.small_eta_seconds - decision.large_eta_seconds) /
+            std::max(1.0, decision.small_eta_seconds);
+        decision.large_reader_small_priority_percent =
+            static_cast<std::uint32_t>(
+                std::clamp<std::size_t>(
+                    static_cast<std::size_t>(std::llround(imbalance * 100.0)),
+                    0U,
+                    100U));
+    }
     return decision;
 }
 
@@ -6267,17 +6282,38 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         };
     };
 
+    std::atomic<std::uint32_t> large_reader_small_priority_percent {0};
     auto make_morphing_large_file_provider =
-        [](DataReadFileQueue& large_queue, DataReadFileQueue& small_queue, bool morph_to_small) {
-            return [&large_queue, &small_queue, morph_to_small]() {
+        [](DataReadFileQueue& large_queue,
+           DataReadFileQueue& small_queue,
+           bool morph_to_small,
+           std::atomic<std::uint32_t>& small_priority_percent) {
+            return [&large_queue, &small_queue, morph_to_small, &small_priority_percent]() {
                 thread_local std::deque<std::pair<FileSpec, SplitDataReadRoute>> worker_file_batch;
                 if (worker_file_batch.empty()) {
-                    std::vector<FileSpec> next_batch = take_data_file_work_batch(large_queue, 128);
-                    for (auto& file : next_batch) {
-                        worker_file_batch.emplace_back(std::move(file), SplitDataReadRoute::Large);
+                    thread_local std::uint64_t priority_counter = 0;
+                    const std::uint32_t priority =
+                        morph_to_small
+                            ? std::min<std::uint32_t>(
+                                  100U,
+                                  small_priority_percent.load(std::memory_order_relaxed))
+                            : 0U;
+                    const bool try_small_first =
+                        priority != 0U && (priority == 100U || (priority_counter++ % 100U) < priority);
+                    if (try_small_first) {
+                        std::vector<FileSpec> next_batch = take_data_file_work_batch(small_queue, 128);
+                        for (auto& file : next_batch) {
+                            worker_file_batch.emplace_back(std::move(file), SplitDataReadRoute::Small);
+                        }
+                    }
+                    if (worker_file_batch.empty()) {
+                        std::vector<FileSpec> next_batch = take_data_file_work_batch(large_queue, 128);
+                        for (auto& file : next_batch) {
+                            worker_file_batch.emplace_back(std::move(file), SplitDataReadRoute::Large);
+                        }
                     }
                     if (worker_file_batch.empty() && morph_to_small && data_file_input_done_and_empty(large_queue)) {
-                        next_batch = take_data_file_work_batch(small_queue, 128);
+                        std::vector<FileSpec> next_batch = take_data_file_work_batch(small_queue, 128);
                         for (auto& file : next_batch) {
                             worker_file_batch.emplace_back(std::move(file), SplitDataReadRoute::Small);
                         }
@@ -6317,7 +6353,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         large_reader_to_discard,
         make_morphing_large_file_provider(file_queues.large,
                                           file_queues.small,
-                                          morph_large_readers_to_small),
+                                          morph_large_readers_to_small,
+                                          large_reader_small_priority_percent),
         [&file_queues]() {
             return data_read_timer_expired(file_queues.large) || data_read_timer_expired(file_queues.small);
         });
@@ -6561,8 +6598,13 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                     small_reader_job.set_active_worker_limit(decision.small_workers);
                 const std::size_t applied_large =
                     large_reader_job.set_active_worker_limit(decision.large_workers);
+                large_reader_small_priority_percent.store(
+                    decision.large_reader_small_priority_percent,
+                    std::memory_order_relaxed);
                 std::cerr << "bucket_priority small_workers=" << applied_small
                           << " large_workers=" << applied_large
+                          << " large_reader_small_priority_percent="
+                          << decision.large_reader_small_priority_percent
                           << " small_eta_seconds=" << decision.small_eta_seconds
                           << " large_eta_seconds=" << decision.large_eta_seconds
                           << " small_rate_files_per_second=" << small_rate
@@ -6697,6 +6739,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                       << " queued_large_files=" << queued_data_read_files(file_queues.large)
                       << " small_reader_workers=" << small_reader_job.active_worker_limit()
                       << " large_reader_workers=" << large_reader_job.active_worker_limit()
+                      << " large_reader_small_priority_percent="
+                      << large_reader_small_priority_percent.load(std::memory_order_relaxed)
                       << " small_output_depth=" << small_reader_to_discard.size()
                       << " large_output_depth=" << large_reader_to_discard.size()
                       << " elapsed_seconds=" << snapshot.elapsed_seconds << '\n';

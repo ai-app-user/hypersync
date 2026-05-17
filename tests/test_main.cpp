@@ -807,6 +807,7 @@ void test_split_bucket_priority_balances_eta() {
     EXPECT_TRUE(decision.small_eta_seconds > decision.large_eta_seconds);
     EXPECT_TRUE(decision.small_workers > input.current_small_workers);
     EXPECT_TRUE(decision.large_workers < input.current_large_workers);
+    EXPECT_TRUE(decision.large_reader_small_priority_percent > 0U);
 
     input.small_total = 1'100'000;
     input.large_total = 10'000'000;
@@ -820,6 +821,7 @@ void test_split_bucket_priority_balances_eta() {
     EXPECT_TRUE(decision.large_eta_seconds > decision.small_eta_seconds);
     EXPECT_TRUE(decision.large_workers > input.current_large_workers);
     EXPECT_TRUE(decision.small_workers < input.current_small_workers);
+    EXPECT_EQ(decision.large_reader_small_priority_percent, 0U);
 
     input.small_total = 5'000'000;
     input.large_total = 1'000'000;
@@ -832,6 +834,7 @@ void test_split_bucket_priority_balances_eta() {
     decision = choose_split_bucket_priority_workers(input);
     EXPECT_EQ(decision.large_workers, 1U);
     EXPECT_TRUE(decision.small_workers > 96U);
+    EXPECT_EQ(decision.large_reader_small_priority_percent, 100U);
 }
 
 void test_autoscale_profile_store_defaults_and_persists_learned_workers() {

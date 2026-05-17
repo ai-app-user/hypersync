@@ -170,6 +170,7 @@ struct SplitBucketPriorityInput {
 struct SplitBucketPriorityDecision {
     std::size_t small_workers = 1;
     std::size_t large_workers = 1;
+    std::uint32_t large_reader_small_priority_percent = 0;
     double small_eta_seconds = 0.0;
     double large_eta_seconds = 0.0;
 };
