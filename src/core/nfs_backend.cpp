@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -952,16 +953,102 @@ bool is_synthetic_profile_url(std::string_view path) {
     return path.rfind("synthetic-profile://", 0) == 0;
 }
 
-std::filesystem::path synthetic_profile_path_from_url(std::string_view url) {
+enum class SyntheticProfileLatencyMode {
+    off,
+    metadata,
+    data,
+    all,
+};
+
+struct SyntheticProfileBackendOptions {
+    std::filesystem::path profile_path;
+    SyntheticProfileLatencyMode latency_mode = SyntheticProfileLatencyMode::off;
+    double metadata_latency_scale = 1.0;
+    double data_latency_scale = 1.0;
+};
+
+bool synthetic_latency_includes_metadata(SyntheticProfileLatencyMode mode) noexcept {
+    return mode == SyntheticProfileLatencyMode::metadata || mode == SyntheticProfileLatencyMode::all;
+}
+
+bool synthetic_latency_includes_data(SyntheticProfileLatencyMode mode) noexcept {
+    return mode == SyntheticProfileLatencyMode::data || mode == SyntheticProfileLatencyMode::all;
+}
+
+double synthetic_positive_double_or(std::string_view value, double fallback) {
+    if (value.empty()) {
+        return fallback;
+    }
+    const double parsed = std::stod(std::string(value));
+    return parsed >= 0.0 && std::isfinite(parsed) ? parsed : fallback;
+}
+
+SyntheticProfileLatencyMode parse_synthetic_latency_mode(std::string_view value) {
+    if (value == "off" || value == "false" || value == "0") {
+        return SyntheticProfileLatencyMode::off;
+    }
+    if (value == "metadata" || value == "meta") {
+        return SyntheticProfileLatencyMode::metadata;
+    }
+    if (value == "data" || value == "read" || value == "reads") {
+        return SyntheticProfileLatencyMode::data;
+    }
+    if (value == "all" || value == "true" || value == "1") {
+        return SyntheticProfileLatencyMode::all;
+    }
+    throw std::runtime_error("unknown synthetic-profile latency mode: " + std::string(value));
+}
+
+void parse_synthetic_query_param(SyntheticProfileBackendOptions& options,
+                                 std::string_view key,
+                                 std::string_view value) {
+    if (key == "latency") {
+        options.latency_mode = parse_synthetic_latency_mode(value);
+    } else if (key == "latency-scale") {
+        const double scale = synthetic_positive_double_or(value, 1.0);
+        options.metadata_latency_scale = scale;
+        options.data_latency_scale = scale;
+    } else if (key == "metadata-latency-scale" || key == "meta-latency-scale") {
+        options.metadata_latency_scale = synthetic_positive_double_or(value, 1.0);
+    } else if (key == "data-latency-scale" || key == "read-latency-scale") {
+        options.data_latency_scale = synthetic_positive_double_or(value, 1.0);
+    } else if (!key.empty()) {
+        throw std::runtime_error("unknown synthetic-profile query parameter: " + std::string(key));
+    }
+}
+
+SyntheticProfileBackendOptions parse_synthetic_profile_url(std::string_view url) {
     constexpr std::string_view kPrefix = "synthetic-profile://";
     std::string path(url.substr(kPrefix.size()));
+    std::string query;
+    const std::size_t query_pos = path.find('?');
+    if (query_pos != std::string::npos) {
+        query = path.substr(query_pos + 1U);
+        path.resize(query_pos);
+    }
     if (path.rfind("file://", 0) == 0) {
         path.erase(0, std::string("file://").size());
     }
     if (path.empty()) {
         throw std::runtime_error("synthetic-profile URL requires a profile path");
     }
-    return std::filesystem::path(path);
+    SyntheticProfileBackendOptions options;
+    options.profile_path = std::filesystem::path(path);
+    std::size_t begin = 0;
+    while (begin < query.size()) {
+        const std::size_t end = query.find('&', begin);
+        const std::string_view item(query.data() + begin,
+                                    end == std::string::npos ? query.size() - begin : end - begin);
+        const std::size_t equals = item.find('=');
+        parse_synthetic_query_param(options,
+                                    equals == std::string_view::npos ? item : item.substr(0, equals),
+                                    equals == std::string_view::npos ? std::string_view {} : item.substr(equals + 1U));
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1U;
+    }
+    return options;
 }
 
 std::optional<std::string_view> synthetic_profile_token(std::string_view line,
@@ -983,6 +1070,21 @@ std::uint64_t synthetic_profile_u64(std::string_view line, std::string_view key)
         return 0;
     }
     return static_cast<std::uint64_t>(std::stoull(std::string(token.value())));
+}
+
+SyntheticLatencyPercentiles synthetic_profile_latency_after(std::string_view line,
+                                                            std::string_view prefix) {
+    SyntheticLatencyPercentiles latency;
+    const std::size_t begin = line.find(prefix);
+    if (begin == std::string_view::npos) {
+        return latency;
+    }
+    const std::string_view suffix = line.substr(begin);
+    latency.p50_us = synthetic_profile_u64(suffix, "p50_us=");
+    latency.p90_us = synthetic_profile_u64(suffix, "p90_us=");
+    latency.p99_us = synthetic_profile_u64(suffix, "p99_us=");
+    latency.max_us = synthetic_profile_u64(suffix, "max_us=");
+    return latency;
 }
 
 void parse_synthetic_size_buckets(std::string_view line,
@@ -1025,6 +1127,14 @@ SyntheticWorkloadProfile load_synthetic_profile_for_backend(const std::filesyste
         phase.small_file_count = synthetic_profile_u64(line, "small=");
         phase.large_file_count = synthetic_profile_u64(line, "large=");
         phase.logical_size_bytes = synthetic_profile_u64(line, "logical_size_bytes=");
+        phase.readdirplus_page_latency =
+            synthetic_profile_latency_after(line, "readdirplus_page_latency_p50_us=");
+        phase.readdirplus_decode_latency =
+            synthetic_profile_latency_after(line, "readdirplus_decode_latency_p50_us=");
+        phase.small_read_latency =
+            synthetic_profile_latency_after(line, "sampled_small_read_latency_p50_us=");
+        phase.large_read_latency =
+            synthetic_profile_latency_after(line, "sampled_large_read_latency_p50_us=");
         parse_synthetic_size_buckets(line, phase.size_file_counts, phase.size_logical_bytes);
         profile.phases.push_back(std::move(phase));
     }
@@ -1060,11 +1170,65 @@ std::optional<std::uint64_t> synthetic_batch_index_from_path(std::string_view pa
     return static_cast<std::uint64_t>(std::stoull(std::string(digits)));
 }
 
+std::optional<std::uint64_t> synthetic_file_index_from_path(std::string_view path) {
+    constexpr std::string_view kNeedle = "/file_";
+    const std::size_t begin = path.rfind(kNeedle);
+    if (begin == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::string_view digits = path.substr(begin + kNeedle.size());
+    if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](char ch) {
+            return ch >= '0' && ch <= '9';
+        })) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(std::stoull(std::string(digits)));
+}
+
+const SyntheticPhaseProfile& synthetic_phase_for_file_index(const SyntheticWorkloadProfile& profile,
+                                                            std::uint64_t file_index) {
+    std::uint64_t cursor = 0;
+    for (const SyntheticPhaseProfile& phase : profile.phases) {
+        const std::uint64_t next = cursor + phase.file_count;
+        if (file_index < next) {
+            return phase;
+        }
+        cursor = next;
+    }
+    return profile.phases.back();
+}
+
+std::uint64_t sample_synthetic_latency_us(const SyntheticLatencyPercentiles& latency,
+                                          std::uint64_t seed) noexcept {
+    const std::uint64_t pick = synthetic_splitmix64(seed) % 100U;
+    if (pick < 50U) {
+        return latency.p50_us;
+    }
+    if (pick < 90U) {
+        return latency.p90_us;
+    }
+    if (pick < 99U) {
+        return latency.p99_us;
+    }
+    return latency.max_us;
+}
+
+void sleep_synthetic_latency(std::uint64_t latency_us, double scale) {
+    if (latency_us == 0U || scale <= 0.0) {
+        return;
+    }
+    const auto scaled = static_cast<std::uint64_t>(
+        std::llround(static_cast<double>(latency_us) * scale));
+    if (scaled != 0U) {
+        std::this_thread::sleep_for(std::chrono::microseconds(scaled));
+    }
+}
+
 class SyntheticProfileBackend final : public NfsBackend {
 public:
     explicit SyntheticProfileBackend(std::string profile_url)
-        : profile_path_(synthetic_profile_path_from_url(profile_url)),
-          profile_(load_synthetic_profile_for_backend(profile_path_)) {}
+        : options_(parse_synthetic_profile_url(profile_url)),
+          profile_(load_synthetic_profile_for_backend(options_.profile_path)) {}
 
     [[nodiscard]] std::vector<FileSpec> list_files(bool recursive) const override {
         std::vector<FileSpec> result;
@@ -1142,6 +1306,7 @@ public:
             batch_index = *requested_batch;
         }
         while (!(should_stop && should_stop())) {
+            const std::uint64_t batch_first_file = emitted_files;
             FlatFolderScanBatch batch;
             batch.folder.rel_path = "synthetic/batch_" + std::to_string(batch_index++);
             batch.folder.mode = 0755;
@@ -1160,6 +1325,14 @@ public:
             }
             if (batch.files.empty()) {
                 return;
+            }
+            if (synthetic_latency_includes_metadata(options_.latency_mode)) {
+                const SyntheticPhaseProfile& phase =
+                    synthetic_phase_for_file_index(profile_, batch_first_file);
+                const std::uint64_t page_latency_us =
+                    sample_synthetic_latency_us(phase.readdirplus_page_latency,
+                                                profile_.seed ^ (batch_first_file * 131U));
+                sleep_synthetic_latency(page_latency_us, options_.metadata_latency_scale);
             }
             batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
             folder_visitor(std::move(batch));
@@ -1190,8 +1363,8 @@ public:
         std::uint64_t declared_size,
         std::size_t outstanding_requests,
         const std::function<void(std::uint64_t)>& bytes_visitor) const override {
-        (void)rel_path;
         (void)outstanding_requests;
+        apply_data_latency(rel_path, declared_size);
         std::uint64_t remaining = declared_size;
         while (remaining != 0U) {
             const std::uint64_t chunk = std::min<std::uint64_t>(remaining, kLargeChunkBytes);
@@ -1207,7 +1380,7 @@ public:
                                                std::uint64_t declared_size,
                                                std::byte* destination,
                                                std::size_t destination_bytes) const override {
-        (void)rel_path;
+        apply_data_latency(rel_path, declared_size);
         const std::size_t bytes = static_cast<std::size_t>(
             std::min<std::uint64_t>(declared_size, destination_bytes));
         if (bytes != 0U) {
@@ -1224,8 +1397,8 @@ public:
         const std::function<void(RawFileChunk&&)>& data_visitor,
         const std::function<bool()>& should_stop,
         bool copy_payload_to_buffer) const override {
-        (void)rel_path;
         (void)outstanding_requests;
+        apply_data_latency(rel_path, declared_size);
         std::uint64_t total = 0;
         while (total < declared_size && !(should_stop && should_stop())) {
             const std::size_t chunk_size = static_cast<std::size_t>(
@@ -1233,7 +1406,18 @@ public:
             if (should_stop && should_stop()) {
                 break;
             }
-            BufferHandle handle = pool.acquire_spin();
+            std::optional<BufferHandle> acquired;
+            while (!(should_stop && should_stop())) {
+                acquired = pool.try_acquire();
+                if (acquired.has_value()) {
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (!acquired.has_value()) {
+                break;
+            }
+            BufferHandle handle = *acquired;
             if (should_stop && should_stop()) {
                 pool.release(handle);
                 break;
@@ -1282,11 +1466,25 @@ public:
     }
 
     [[nodiscard]] std::string description() const override {
-        return "synthetic-profile://" + profile_path_.string();
+        return "synthetic-profile://" + options_.profile_path.string();
     }
 
 private:
-    std::filesystem::path profile_path_;
+    void apply_data_latency(std::string_view rel_path, std::uint64_t declared_size) const {
+        if (!synthetic_latency_includes_data(options_.latency_mode)) {
+            return;
+        }
+        const std::uint64_t file_index = synthetic_file_index_from_path(rel_path).value_or(0U);
+        const SyntheticPhaseProfile& phase = synthetic_phase_for_file_index(profile_, file_index);
+        const SyntheticLatencyPercentiles& latency =
+            declared_size <= profile_.small_file_threshold_bytes ? phase.small_read_latency
+                                                                 : phase.large_read_latency;
+        const std::uint64_t latency_us =
+            sample_synthetic_latency_us(latency, profile_.seed ^ (file_index * 31U));
+        sleep_synthetic_latency(latency_us, options_.data_latency_scale);
+    }
+
+    SyntheticProfileBackendOptions options_;
     SyntheticWorkloadProfile profile_;
 };
 

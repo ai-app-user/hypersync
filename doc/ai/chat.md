@@ -407,3 +407,9 @@ records from the archived NFS profile in `1.03s` at `9.69M files/s`.
 **User:** ok , we need to make a generator job(s) that generate nfs metadata and nfs data based on ptovided profile, we should be able to do regular opeartion like scan , read, diff etc using generator based on profile
 
 **Codex:** Added an initial `synthetic-profile://<profile-path>` backend so existing scan/data/diff-style flows can consume a saved profiler output as a source. The backend streams synthetic flat-folder metadata from `SyntheticReplayCursor`, preserves deterministic synthetic NFS handles, and generates zero-copy-style raw data chunks from declared sizes without storage I/O. Also fixed timed data benchmarks so `--max-duration-seconds` stops synthetic data readers promptly instead of waiting on a drained file queue.
+
+## 2026-05-17 14:29 PDT
+
+**User:** agreed , implement it
+
+**Codex:** Added configurable latency emulation to the `synthetic-profile://` backend. The default remains unthrottled. The backend now supports query parameters such as `?latency=metadata`, `?latency=data`, `?latency=all`, `?latency-scale=...`, `?metadata-latency-scale=...`, and `?data-latency-scale=...`. Metadata scan sleeps use profile READDIRPLUS page latency percentiles; data reads use sampled small/large read latency percentiles. Added a focused test that verifies both metadata and data latency emulation.

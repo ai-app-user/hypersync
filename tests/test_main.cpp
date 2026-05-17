@@ -1096,6 +1096,70 @@ void test_synthetic_profile_backend_streams_metadata_and_data() {
     EXPECT_EQ(bytes_read, files.front().declared_size);
 }
 
+void test_synthetic_profile_backend_can_emulate_profile_latency() {
+    TempDir root("synthetic_profile_backend_latency");
+    const fs::path profile_path = root.path / "profile.txt";
+    write_file(profile_path,
+               "synthetic_profile_benchmark files_observed=1 phases=1 elapsed_s=0 files_per_second=0 "
+               "logical_size_bytes=4096 small_files=1 large_files=0\n"
+               "phase index=0 name=phase_0 files=1 folders=1 small=1 large=0 "
+               "logical_size_bytes=4096 "
+               "readdirplus_page_latency_p50_us=5000 p90_us=5000 p99_us=5000 max_us=5000 "
+               "sampled_small_read_latency_p50_us=5000 p90_us=5000 p99_us=5000 "
+               "sampled_large_read_latency_p50_us=0 p90_us=0 p99_us=0 "
+               "size_buckets=<=0:0/0,<=4096:1/4096,<=16384:0/0,<=65536:0/0,"
+               "<=131072:0/0,<=1048576:0/0,<=16777216:0/0,"
+               "<=134217728:0/0,<=1073741824:0/0,<=inf:0/0\n");
+
+    const std::string url = "synthetic-profile://" + profile_path.string() +
+                            "?latency=all&latency-scale=1.0";
+    auto backend = hypersync::make_nfs_backend(url);
+
+    std::vector<FileSpec> files;
+    bool root_consumed = false;
+    const auto scan_started = std::chrono::steady_clock::now();
+    backend->scan_flat_folders(
+        1,
+        [&](bool) -> std::optional<FileSpec> {
+            if (root_consumed) {
+                return std::nullopt;
+            }
+            root_consumed = true;
+            return FileSpec {};
+        },
+        [] {
+            return false;
+        },
+        [&](hypersync::FlatFolderScanBatch batch) {
+            files = std::move(batch.files);
+        });
+    const double scan_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - scan_started).count();
+    EXPECT_TRUE(scan_seconds >= 0.003);
+    EXPECT_EQ(files.size(), 1U);
+
+    RawBufferPool pool(kDataBufferPoolId,
+                       2,
+                       sizeof(hypersync::DataBuffer),
+                       alignof(hypersync::DataBuffer));
+    const auto read_started = std::chrono::steady_clock::now();
+    const std::uint64_t streamed = backend->read_file_raw_chunks_by_handle(
+        files.front(),
+        1,
+        pool,
+        [&](hypersync::RawFileChunk&& chunk) {
+            pool.release(chunk.handle);
+        },
+        [] {
+            return false;
+        },
+        false);
+    const double read_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - read_started).count();
+    EXPECT_EQ(streamed, files.front().declared_size);
+    EXPECT_TRUE(read_seconds >= 0.003);
+}
+
 void test_synthetic_payload_pool_returns_preallocated_blocks() {
     SyntheticPayloadPool pool(4096, 1024 * 1024, SyntheticPayloadPattern::repeated, 7);
     EXPECT_EQ(pool.small_block_bytes(), 4096U);
@@ -4825,6 +4889,9 @@ int main(int argc, char** argv) {
         {"synthetic_profile_backend_streams_metadata_and_data",
          TestSuite::unit,
          test_synthetic_profile_backend_streams_metadata_and_data},
+        {"synthetic_profile_backend_can_emulate_profile_latency",
+         TestSuite::unit,
+         test_synthetic_profile_backend_can_emulate_profile_latency},
         {"synthetic_payload_pool_returns_preallocated_blocks",
          TestSuite::unit,
          test_synthetic_payload_pool_returns_preallocated_blocks},

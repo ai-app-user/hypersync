@@ -1124,3 +1124,18 @@ logical size: 335.99 TB
       clean timer shutdown.
     - Summary diff synthetic-profile vs itself: `1000` same, `0` new,
       `0` changed, `0` target-only.
+
+## Synthetic Profile Latency Emulation
+
+- 2026-05-17 14:29 PDT:
+  - `synthetic-profile://<profile>` remains unthrottled by default.
+  - Optional query parameters:
+    - `latency=off|metadata|data|read|all` (`read` aliases `data`).
+    - `latency-scale=<double>` applies to both metadata and data latency.
+    - `metadata-latency-scale=<double>` / `meta-latency-scale=<double>`.
+    - `data-latency-scale=<double>` / `read-latency-scale=<double>`.
+  - Metadata latency uses per-phase `readdirplus_page_latency_p50/p90/p99/max`.
+  - Data latency uses per-phase sampled small/large read latency percentiles and
+    picks small vs large from the synthetic file declared size.
+  - Example:
+    `synthetic-profile:////path/profile.txt?latency=all&latency-scale=1.0`
