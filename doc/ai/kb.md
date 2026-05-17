@@ -965,6 +965,13 @@ logical size: 335.99 TB
   - Phase sizing: `10B / 100 = 100M files per phase`.
   - Status at about `16.5m`: still running; `4.713B` files,
     `44.8M` folders, `0` failed folders, cumulative `~4.81M files/s`.
+- Completion observed later:
+  - `profile.txt` was finalized by the old metadata-only binary.
+  - Final: `5,473,804,389` files, `93,280,540` folders,
+    `0` failed folders.
+  - Wall time: `1970.15s`; max RSS: `33,263,404 KB`.
+  - Note: this output does not include replay-quality topology/data-read fields
+    because the run started before those profiler upgrades.
 - How to check:
   - `ssh ubuntu@216.86.168.191 'run=$(cat /tmp/hypersync-last-whole-profile-run); tail -20 "$run/stderr.txt"; ps -eo pid,ppid,etime,args | awk "/[.]\\/build\\/release\\/hypersync benchmark-nfs-profile/ {print}"'`
 
