@@ -22,7 +22,7 @@ Last updated: 2026-05-12 21:00 PDT
   - `piper/`: reusable asynchronous pipeline infrastructure.
   - `hypersync/`: WSync app-specific implementation.
 - The IDE may still show stale `aspipe/` paths; the intended reusable library name is `piper`.
-- Version reported by current release builds: `hypersync 0.0.2`.
+- Version reported by current release builds: `hypersync 0.0.3`.
 
 ## Workspace GitHub Projects
 

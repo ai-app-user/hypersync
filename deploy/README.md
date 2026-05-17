@@ -55,7 +55,7 @@ Useful installer overrides:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ai-app-user/hypersync/main/deploy/install-hypersync.sh | \
-  HYPERSYNC_VERSION=0.0.2 INSTALL_DIR=/opt/hypersync sh
+  HYPERSYNC_VERSION=0.0.3 INSTALL_DIR=/opt/hypersync sh
 ```
 
 After install, users run:

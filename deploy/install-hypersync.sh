@@ -10,7 +10,7 @@ info() {
   echo "install-hypersync: $*"
 }
 
-version="${HYPERSYNC_VERSION:-0.0.2}"
+version="${HYPERSYNC_VERSION:-0.0.3}"
 arch="${HYPERSYNC_ARCH:-$(uname -m)}"
 install_dir="${INSTALL_DIR:-$HOME/hypersync}"
 archive_name="${HYPERSYNC_ARCHIVE_NAME:-hypersync-linux-$arch.tar.gz}"
