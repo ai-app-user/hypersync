@@ -353,3 +353,19 @@ buckets/percentiles. Added CLI knobs for sample rate, per-phase file/byte caps,
 large read bytes, outstanding read requests, and pool slots. Verified local
 integration tests (`21/21`) and a transfer1 root NFS smoke run with populated
 sampled small/large read metrics and zero read failures.
+
+## 2026-05-17 13:05 PDT
+
+**User:** ok, you have to fix it, just take less data samples, but make sure
+that data samples are corresponding to real sizes that we would do with a
+reader
+
+**Codex:** Fixed the profiler so data-read sampling stays off the metadata hot
+path. Restored the fast metadata scan path unless explicit page timing is
+needed, made sparse data samples read real reader-sized payloads (small files
+fully and large files as bounded `1MiB` prefixes by default), and pushed the
+fix to `hypersync/dev` as `40215d6`. Deployed the release on transfer1 and
+started a full source profiler run with `--profile-data-reads` but conservative
+sampling (`1` sample per 1B files and max `1` sample per phase). Early progress
+was healthy: `501.7M` files in `70s`, `7.17M files/s` cumulative, no failed
+folders, no `NFS3ERR_PERM`.

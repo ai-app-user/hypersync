@@ -1051,3 +1051,18 @@ logical size: 335.99 TB
     `5M files/s`; one sampled read added about `1.5s` to finalization, so the
     full run should stay within the `5%` slowdown budget with the conservative
     sample rate.
+  - Committed and pushed to `hypersync/dev` as `40215d6`:
+    `Keep data profiling off profiler hot path`.
+  - Deployed `40215d6` on transfer1 and started full source profile with sparse
+    data-read sampling:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-data-sampled-fastpath-20260517T200342Z`
+  - Source:
+    `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+  - Runtime settings: `96` metadata reader threads, async depth `256`,
+    READDIRPLUS page `262144`, `--profile-data-reads`,
+    `--data-sample-rate 1000000000`,
+    `--data-sample-max-files-per-phase 1`,
+    `--data-sample-max-bytes-per-phase 67108864`,
+    `--data-sample-large-read-bytes 1048576`, stats interval `10s`.
+  - First healthy progress: `501.7M` files in `70s` (`7.17M files/s`
+    cumulative), `0` failed folders, `0` permission errors.
