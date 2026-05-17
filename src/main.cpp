@@ -349,7 +349,8 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                                             std::size_t readdirplus_page_bytes,
                                             std::uint64_t max_records,
                                             std::size_t phase_count,
-                                            std::uint64_t small_threshold) {
+                                            std::uint64_t small_threshold,
+                                            std::uint32_t stats_interval_seconds) {
     NfsProfileWorkQueue queue;
     queue.folders.push_back(hypersync::FileSpec {});
     std::vector<FixedPhaseAccumulator> accumulators(std::max<std::size_t>(1U, phase_count));
@@ -361,10 +362,47 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
     const std::uint64_t records_per_phase =
         std::max<std::uint64_t>(1U, (max_records + accumulators.size() - 1U) / accumulators.size());
     const auto started = std::chrono::steady_clock::now();
+    std::atomic<bool> progress_done {false};
 
     const auto should_stop = [&]() {
         return files_reserved.load(std::memory_order_acquire) >= max_records;
     };
+
+    std::thread progress_thread;
+    if (stats_interval_seconds != 0U) {
+        progress_thread = std::thread([&]() {
+            std::uint64_t previous_files = 0;
+            auto previous_time = started;
+            while (!progress_done.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::seconds(stats_interval_seconds));
+                const auto now = std::chrono::steady_clock::now();
+                const std::uint64_t files = files_recorded.load(std::memory_order_relaxed);
+                const std::uint64_t folders = folders_observed.load(std::memory_order_relaxed);
+                const std::uint64_t failed = failed_folders.load(std::memory_order_relaxed);
+                const double elapsed = std::chrono::duration<double>(now - started).count();
+                const double interval_elapsed = std::chrono::duration<double>(now - previous_time).count();
+                const double cumulative_files_per_second =
+                    elapsed > 0.0 ? static_cast<double>(files) / elapsed : 0.0;
+                const double interval_files_per_second =
+                    interval_elapsed > 0.0
+                        ? static_cast<double>(files - previous_files) / interval_elapsed
+                        : 0.0;
+                const std::uint64_t phase_index =
+                    std::min<std::uint64_t>(accumulators.size() - 1U, files / records_per_phase);
+                std::cerr << "nfs_profile_progress elapsed_s=" << elapsed
+                          << " files=" << files
+                          << " folders=" << folders
+                          << " failed_folders=" << failed
+                          << " cumulative_files_per_second=" << cumulative_files_per_second
+                          << " interval_files_per_second=" << interval_files_per_second
+                          << " phase_index=" << phase_index
+                          << " phase_file_offset=" << (files % records_per_phase)
+                          << '\n';
+                previous_files = files;
+                previous_time = now;
+            }
+        });
+    }
 
     std::vector<std::thread> workers;
     workers.reserve(std::max<std::size_t>(1U, meta_reader_threads));
@@ -454,6 +492,10 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
     for (auto& worker : workers) {
         worker.join();
     }
+    progress_done.store(true, std::memory_order_release);
+    if (progress_thread.joinable()) {
+        progress_thread.join();
+    }
     if (queue.error) {
         std::rethrow_exception(queue.error);
     }
@@ -484,7 +526,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--output <profile.txt>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--stats-interval-seconds <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-fake-diff [--file-count <n>] [--folder-count <n>] [--average-file-size <bytes>] [--source-threads <n>] [--fake-remote-threads <n>] [--checker-threads <n>] [--remote-delay-us <n>] [--request-queue-depth <n>] [--batch-queue-depth <n>] [--stats-interval-seconds <n>]\n"
@@ -617,6 +659,7 @@ int main(int argc, char** argv) {
             std::size_t metadata_async_depth = 256;
             std::size_t readdirplus_page_bytes = 256U * 1024U;
             std::uint64_t small_threshold = hypersync::kSmallFileThreshold;
+            std::uint32_t stats_interval_seconds = 10;
             std::filesystem::path output_path;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
@@ -646,6 +689,10 @@ int main(int argc, char** argv) {
                     small_threshold =
                         parse_u64_option(require_option(args, i, "--small-file-threshold-bytes"),
                                          "--small-file-threshold-bytes");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
                 } else if (args[i] == "--output") {
                     output_path = require_option(args, i, "--output");
                 } else {
@@ -666,7 +713,8 @@ int main(int argc, char** argv) {
                                                                        readdirplus_page_bytes,
                                                                        max_records,
                                                                        phase_count,
-                                                                       small_threshold);
+                                                                       small_threshold,
+                                                                       stats_interval_seconds);
             print_synthetic_profile(std::cout,
                                     result.profile,
                                     result.files_observed,
@@ -677,6 +725,7 @@ int main(int argc, char** argv) {
                       << " meta_reader_threads=" << meta_reader_threads
                       << " metadata_async_depth=" << metadata_async_depth
                       << " readdirplus_page_bytes=" << readdirplus_page_bytes
+                      << " stats_interval_seconds=" << stats_interval_seconds
                       << " recursive=" << (recursive ? "true" : "false") << '\n';
             if (!output_path.empty()) {
                 std::ofstream output(output_path);
@@ -693,6 +742,7 @@ int main(int argc, char** argv) {
                        << " meta_reader_threads=" << meta_reader_threads
                        << " metadata_async_depth=" << metadata_async_depth
                        << " readdirplus_page_bytes=" << readdirplus_page_bytes
+                       << " stats_interval_seconds=" << stats_interval_seconds
                        << " recursive=" << (recursive ? "true" : "false") << '\n';
             }
             return 0;

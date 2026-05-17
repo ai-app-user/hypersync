@@ -943,3 +943,27 @@ logical size: 335.99 TB
 - Conclusion: scanner-only is still close to/above the old `~7M/s` territory
   during mid-run intervals. Final 5-minute average is lower due to slower/tail
   regions and timed stop/drain.
+
+## Whole-Source NFS Profiler, 100M-File Phases, 2026-05-17 11:57 PDT
+
+- Added live progress to `benchmark-nfs-profile`:
+  - Option: `--stats-interval-seconds <n>`; default `10`.
+  - Emits `nfs_profile_progress` records to stderr with elapsed seconds,
+    files, folders, failed folders, cumulative files/sec, interval files/sec,
+    phase index, and phase offset.
+- Verification before remote run:
+  - Local `make app && make integration-test`: `21/21` passed.
+  - Transfer1 release build succeeded after patching `src/main.cpp`.
+- Current running profile:
+  - Host: transfer1 `ubuntu@216.86.168.191`, running as root via `sudo -n`.
+  - Run dir:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-20260517T184054Z`
+  - Source:
+    `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+  - Command settings:
+    `--max-records 10000000000 --phase-count 100 --meta-reader-threads 96 --metadata-async-depth 256 --readdirplus-page-bytes 262144 --stats-interval-seconds 10`
+  - Phase sizing: `10B / 100 = 100M files per phase`.
+  - Status at about `16.5m`: still running; `4.713B` files,
+    `44.8M` folders, `0` failed folders, cumulative `~4.81M files/s`.
+- How to check:
+  - `ssh ubuntu@216.86.168.191 'run=$(cat /tmp/hypersync-last-whole-profile-run); tail -20 "$run/stderr.txt"; ps -eo pid,ppid,etime,args | awk "/[.]\\/build\\/release\\/hypersync benchmark-nfs-profile/ {print}"'`

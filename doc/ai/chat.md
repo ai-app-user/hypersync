@@ -307,3 +307,18 @@ transfer1 for 5 minutes using direct libnfs, 96 metadata workers, async depth
 `1.484B` files and `29.6M` folders in `314.329s`, cumulative best
 `6.58M files/s` at 100s, and peak 10-second intervals around `8.86M files/s`.
 Recorded the baseline in `hypersync/doc/performance.md`.
+
+## 2026-05-17 11:57 PDT
+
+**User:** ok, start profiler on the whole source now, keep it running, it will take a while, we will check it periodically, make one phase for each 100M files
+
+**Codex:** Added live 10-second progress reporting to `benchmark-nfs-profile`
+so long profile captures expose current and cumulative files/sec while they run.
+Verified local integration tests (`21/21`), patched and built the release
+binary on transfer1, then started a root whole-source direct-libnfs profile run
+against `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`.
+The run uses `--max-records 10000000000 --phase-count 100`, giving 100M-file
+phase buckets. Run directory:
+`/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-20260517T184054Z`.
+At 16.5 minutes it was still running, with `4.713B` files and `44.8M` folders
+observed, `0` failed folders, and cumulative throughput around `4.81M files/s`.
