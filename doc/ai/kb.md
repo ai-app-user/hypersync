@@ -1139,3 +1139,7 @@ logical size: 335.99 TB
     picks small vs large from the synthetic file declared size.
   - Example:
     `synthetic-profile:////path/profile.txt?latency=all&latency-scale=1.0`
+  - Transfer1 release smoke after deploy of `4771e87`: tiny synthetic latency
+    profile with `?latency=all&latency-scale=1.0` completed `benchmark-data`
+    with `10` files read and elapsed `0.012s`, matching the injected 1ms
+    metadata page plus 10 x 1ms data-read sleeps.
