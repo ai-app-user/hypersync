@@ -4099,13 +4099,23 @@ protected:
         BufferHandle feedback;
         while (active_folders_ != 0U && !stop_requested() && !expired()) {
             bool progressed = false;
-            if (!pending_folders.empty()) {
-                if (try_emit_folder(worker_index, pending_folders.front())) {
+            std::size_t emitted = 0;
+            while (!pending_folders.empty() && emitted < 4096U) {
+                const FolderEmitResult emit_result = try_emit_folder(worker_index, pending_folders.front());
+                if (emit_result == FolderEmitResult::emitted) {
                     pending_folders.pop_front();
                     progressed = true;
+                    ++emitted;
+                    continue;
                 }
+                if (emit_result == FolderEmitResult::stopped) {
+                    pending_folders.clear();
+                }
+                break;
             }
-            while (feedback_input_.try_pop(feedback)) {
+            std::size_t feedback_drained = 0;
+            while (feedback_drained < 4096U && feedback_input_.try_pop(feedback)) {
+                ++feedback_drained;
                 progressed = true;
                 MetadataBuffer& buffer = metadata_buffer(folder_pool_, feedback);
                 const FolderWorkKind kind = folder_work_kind(buffer);
@@ -4147,18 +4157,24 @@ protected:
     }
 
 private:
+    enum class FolderEmitResult {
+        emitted,
+        blocked,
+        stopped,
+    };
+
     [[nodiscard]] bool expired() const {
         return stop_at_.has_value() && std::chrono::steady_clock::now() >= *stop_at_;
     }
 
-    bool try_emit_folder(std::size_t worker_index, const FileSpec& folder) {
+    FolderEmitResult try_emit_folder(std::size_t worker_index, const FileSpec& folder) {
         if (stop_requested() || expired()) {
-            return true;
+            return FolderEmitResult::stopped;
         }
         std::optional<BufferHandle> maybe_handle = folder_pool_.try_acquire();
         if (!maybe_handle.has_value()) {
             auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_pool_empty);
-            return false;
+            return FolderEmitResult::blocked;
         }
         const BufferHandle handle = *maybe_handle;
         reset_folder_work_buffer(metadata_buffer(folder_pool_, handle),
@@ -4168,10 +4184,10 @@ private:
         if (!folder_output_.try_push(handle)) {
             folder_pool_.release(handle);
             auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_output_full);
-            return false;
+            return FolderEmitResult::blocked;
         }
         (void)worker_index;
-        return true;
+        return FolderEmitResult::emitted;
     }
 
     bool recursive_ = true;
