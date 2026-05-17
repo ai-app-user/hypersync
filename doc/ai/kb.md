@@ -967,6 +967,10 @@ logical size: 335.99 TB
     `44.8M` folders, `0` failed folders, cumulative `~4.81M files/s`.
 - Completion observed later:
   - `profile.txt` was finalized by the old metadata-only binary.
+  - Saved in repo:
+    `hypersync/doc/profiles/source-nfs-whole-100mphase-20260517T184054Z.profile.txt`
+    and timing in
+    `hypersync/doc/profiles/source-nfs-whole-100mphase-20260517T184054Z.time.txt`.
   - Final: `5,473,804,389` files, `93,280,540` folders,
     `0` failed folders.
   - Wall time: `1970.15s`; max RSS: `33,263,404 KB`.
