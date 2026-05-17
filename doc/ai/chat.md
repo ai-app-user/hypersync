@@ -379,3 +379,13 @@ and start the long test
 performance path and left it running as the long test. Current status was
 `1.409B` files in `220s`, `6.40M files/s` cumulative, `0` failed folders, and
 `0` permission errors.
+
+## 2026-05-17 13:48 PDT
+
+**User:** did you recorded detail profile with data profiling as well
+
+**Codex:** Confirmed the completed full profile includes the sampled data-read
+fields. The sparse run recorded `3` small-file read samples and `1` large-file
+read sample, all with `0` failures, while preserving fast metadata performance.
+Archived the resulting profile and timing file under `hypersync/doc/profiles/`
+so they can be tracked by git.

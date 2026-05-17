@@ -1069,3 +1069,12 @@ logical size: 335.99 TB
   - 2026-05-17 13:07 PDT status: still running; `1.409B` files in `220s`,
     `6.40M files/s` cumulative, `0` failed folders, `0` permission errors.
     Decision: performance is good enough, so keep this as the full long test.
+  - Completed full run:
+    `files=5,474,075,969`, `folders=103,286,279`, `failed_folders=0`,
+    `wall_seconds=1790.99`, `max_rss_kb=43,530,436`.
+  - Data-read sampling was enabled and recorded sparse samples:
+    `3` small-file samples (`202,580` bytes total) and `1` large-file sample
+    (`254,056` bytes), with `0` sample read failures.
+  - Archived in git under:
+    `doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt`
+    and matching `.time.txt`.
