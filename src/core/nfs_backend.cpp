@@ -1125,6 +1125,8 @@ struct RawReaddirplusState {
     std::size_t entries = 0;
     std::size_t files = 0;
     std::size_t directories = 0;
+    std::uint64_t page_latency_ns = 0;
+    std::uint64_t decode_latency_ns = 0;
 };
 
 struct AsyncRawHandleReadState {
@@ -1352,6 +1354,17 @@ void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, v
         ++state->files;
     }
     const auto callback_finished_at = std::chrono::steady_clock::now();
+    state->page_latency_ns = steady_latency_ns(state->queued_at, callback_started_at);
+    state->decode_latency_ns = steady_latency_ns(callback_started_at, callback_finished_at);
+    state->batch->readdirplus_page_count += 1U;
+    state->batch->readdirplus_page_entries += state->entries;
+    state->batch->readdirplus_page_requested_bytes += state->requested_bytes;
+    state->batch->readdirplus_page_latency_ns += state->page_latency_ns;
+    state->batch->readdirplus_decode_latency_ns += state->decode_latency_ns;
+    state->batch->readdirplus_page_max_latency_ns =
+        std::max(state->batch->readdirplus_page_max_latency_ns, state->page_latency_ns);
+    state->batch->readdirplus_decode_max_latency_ns =
+        std::max(state->batch->readdirplus_decode_max_latency_ns, state->decode_latency_ns);
     record_readdirplus_page_completed(state->queued_at,
                                       callback_started_at,
                                       callback_finished_at,
@@ -3981,7 +3994,7 @@ private:
 
         const std::string rel_prefix = normalize_path(batch.folder.rel_path);
         auto* private_directory = reinterpret_cast<LibNfsPrivateDir*>(directory);
-        if (page_visitor && private_directory != nullptr && private_directory->fh.val != nullptr &&
+        if (private_directory != nullptr && private_directory->fh.val != nullptr &&
             private_directory->fh.len > 0) {
             nfs_fh3 directory_handle {};
             directory_handle.data.data_len = static_cast<u_int>(private_directory->fh.len);

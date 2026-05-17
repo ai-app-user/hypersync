@@ -30,6 +30,13 @@ struct FlatFolderScanBatch {
     std::vector<FileSpec> directories;
     std::uint64_t scan_started_unix_ns = 0;
     std::uint64_t scan_finished_unix_ns = 0;
+    std::uint64_t readdirplus_page_count = 0;
+    std::uint64_t readdirplus_page_entries = 0;
+    std::uint64_t readdirplus_page_requested_bytes = 0;
+    std::uint64_t readdirplus_page_latency_ns = 0;
+    std::uint64_t readdirplus_page_max_latency_ns = 0;
+    std::uint64_t readdirplus_decode_latency_ns = 0;
+    std::uint64_t readdirplus_decode_max_latency_ns = 0;
     bool complete = true;
     bool failed = false;
     std::string error;

@@ -967,3 +967,29 @@ logical size: 335.99 TB
     `44.8M` folders, `0` failed folders, cumulative `~4.81M files/s`.
 - How to check:
   - `ssh ubuntu@216.86.168.191 'run=$(cat /tmp/hypersync-last-whole-profile-run); tail -20 "$run/stderr.txt"; ps -eo pid,ppid,etime,args | awk "/[.]\\/build\\/release\\/hypersync benchmark-nfs-profile/ {print}"'`
+
+## Replay-Quality Profiler Topology Capture, 2026-05-17 12:17 PDT
+
+- Extended `benchmark-nfs-profile` output to capture compact topology and page
+  behavior needed to mimic real NFS later:
+  - true `files_per_folder_buckets`
+  - `subdirs_per_folder_buckets`
+  - `folder_depth_buckets`
+  - `empty_folders`, `near_empty_folders`, `directories`, `max_depth`
+  - `entries_per_page_buckets`
+  - `readdirplus_pages`, `readdirplus_entries`,
+    `readdirplus_requested_bytes`
+  - approximate READDIRPLUS page/decode latency percentiles and latency buckets
+- Important implementation detail:
+  - Full-folder scans now use raw NFSv3 READDIRPLUS when the directory file
+    handle is available, even when no streaming page visitor is supplied. This
+    lets the profiler keep complete folder fanout while recording page timing.
+- Validation:
+  - Local tests: `make unit-test` `67/67`, `make integration-test` `21/21`.
+  - Transfer1 separate binary:
+    `/mnt/local-nvme/src/wsync/build/release/hypersync-profiler-topology`
+    built successfully with libnfs while the old long profiler kept running.
+  - Transfer1 smoke run:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-topology-smoke-20260517T191735Z`
+    captured `1M` records as root and showed populated topology plus
+    READDIRPLUS page latency fields.

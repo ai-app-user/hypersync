@@ -15,6 +15,9 @@ inline constexpr std::uint64_t kSyntheticUnboundedSize =
     std::numeric_limits<std::uint64_t>::max();
 inline constexpr std::size_t kSyntheticSizeBucketCount = 10;
 inline constexpr std::size_t kSyntheticFolderFanoutBucketCount = 8;
+inline constexpr std::size_t kSyntheticFolderDepthBucketCount = 10;
+inline constexpr std::size_t kSyntheticEntriesPerPageBucketCount = 8;
+inline constexpr std::size_t kSyntheticLatencyBucketCount = 8;
 inline constexpr std::size_t kSyntheticHandleBytes = 64;
 inline constexpr std::size_t kSyntheticPathBytes = 256;
 
@@ -35,9 +38,25 @@ struct SyntheticPhaseProfile {
     std::array<std::uint64_t, kSyntheticSizeBucketCount> size_file_counts {};
     std::array<std::uint64_t, kSyntheticSizeBucketCount> size_logical_bytes {};
     std::array<std::uint64_t, kSyntheticFolderFanoutBucketCount> folder_fanout_counts {};
+    std::array<std::uint64_t, kSyntheticFolderFanoutBucketCount> files_per_folder_counts {};
+    std::array<std::uint64_t, kSyntheticFolderFanoutBucketCount> subdirs_per_folder_counts {};
+    std::array<std::uint64_t, kSyntheticFolderDepthBucketCount> folder_depth_counts {};
+    std::array<std::uint64_t, kSyntheticEntriesPerPageBucketCount> entries_per_page_counts {};
+    std::array<std::uint64_t, kSyntheticLatencyBucketCount> readdirplus_page_latency_counts {};
+    std::array<std::uint64_t, kSyntheticLatencyBucketCount> readdirplus_decode_latency_counts {};
     std::uint64_t filename_length_sum = 0;
     std::uint64_t depth_sum = 0;
+    std::uint64_t empty_folder_count = 0;
+    std::uint64_t near_empty_folder_count = 0;
+    std::uint64_t directory_count = 0;
+    std::uint64_t max_depth = 0;
+    std::uint64_t readdirplus_page_count = 0;
+    std::uint64_t readdirplus_page_entries = 0;
+    std::uint64_t readdirplus_page_requested_bytes = 0;
+    std::uint64_t readdirplus_page_latency_sum_us = 0;
+    std::uint64_t readdirplus_decode_latency_sum_us = 0;
     SyntheticLatencyPercentiles readdirplus_page_latency;
+    SyntheticLatencyPercentiles readdirplus_decode_latency;
     SyntheticLatencyPercentiles small_read_latency;
     SyntheticLatencyPercentiles large_read_latency;
 };
@@ -77,8 +96,23 @@ public:
         std::array<std::uint64_t, kSyntheticSizeBucketCount> size_file_counts {};
         std::array<std::uint64_t, kSyntheticSizeBucketCount> size_logical_bytes {};
         std::array<std::uint64_t, kSyntheticFolderFanoutBucketCount> folder_fanout_counts {};
+        std::array<std::uint64_t, kSyntheticFolderFanoutBucketCount> files_per_folder_counts {};
+        std::array<std::uint64_t, kSyntheticFolderFanoutBucketCount> subdirs_per_folder_counts {};
+        std::array<std::uint64_t, kSyntheticFolderDepthBucketCount> folder_depth_counts {};
+        std::array<std::uint64_t, kSyntheticEntriesPerPageBucketCount> entries_per_page_counts {};
+        std::array<std::uint64_t, kSyntheticLatencyBucketCount> readdirplus_page_latency_counts {};
+        std::array<std::uint64_t, kSyntheticLatencyBucketCount> readdirplus_decode_latency_counts {};
         std::uint64_t filename_length_sum = 0;
         std::uint64_t depth_sum = 0;
+        std::uint64_t empty_folder_count = 0;
+        std::uint64_t near_empty_folder_count = 0;
+        std::uint64_t directory_count = 0;
+        std::uint64_t max_depth = 0;
+        std::uint64_t readdirplus_page_count = 0;
+        std::uint64_t readdirplus_page_entries = 0;
+        std::uint64_t readdirplus_page_requested_bytes = 0;
+        std::uint64_t readdirplus_page_latency_sum_us = 0;
+        std::uint64_t readdirplus_decode_latency_sum_us = 0;
     };
 
     explicit SyntheticProfileBuilder(SyntheticProfileCaptureConfig config = {});
@@ -183,8 +217,13 @@ private:
 
 [[nodiscard]] std::array<std::uint64_t, kSyntheticSizeBucketCount>
 synthetic_size_bucket_bounds() noexcept;
+[[nodiscard]] std::array<std::uint64_t, kSyntheticLatencyBucketCount>
+synthetic_latency_bucket_bounds_us() noexcept;
 [[nodiscard]] std::size_t synthetic_size_bucket_index(std::uint64_t size_bytes) noexcept;
 [[nodiscard]] std::size_t synthetic_folder_fanout_bucket_index(std::uint64_t files_in_folder) noexcept;
+[[nodiscard]] std::size_t synthetic_folder_depth_bucket_index(std::uint64_t depth) noexcept;
+[[nodiscard]] std::size_t synthetic_entries_per_page_bucket_index(std::uint64_t entries) noexcept;
+[[nodiscard]] std::size_t synthetic_latency_bucket_index_us(std::uint64_t latency_us) noexcept;
 [[nodiscard]] std::uint64_t synthetic_splitmix64(std::uint64_t value) noexcept;
 
 }  // namespace hypersync

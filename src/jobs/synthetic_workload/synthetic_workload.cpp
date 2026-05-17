@@ -49,6 +49,18 @@ void subtract_accumulator(SyntheticProfileBuilder::Accumulator& target,
     target.large_file_count -= std::min(target.large_file_count, value.large_file_count);
     target.filename_length_sum -= std::min(target.filename_length_sum, value.filename_length_sum);
     target.depth_sum -= std::min(target.depth_sum, value.depth_sum);
+    target.empty_folder_count -= std::min(target.empty_folder_count, value.empty_folder_count);
+    target.near_empty_folder_count -= std::min(target.near_empty_folder_count, value.near_empty_folder_count);
+    target.directory_count -= std::min(target.directory_count, value.directory_count);
+    target.max_depth = std::max(target.max_depth, value.max_depth);
+    target.readdirplus_page_count -= std::min(target.readdirplus_page_count, value.readdirplus_page_count);
+    target.readdirplus_page_entries -= std::min(target.readdirplus_page_entries, value.readdirplus_page_entries);
+    target.readdirplus_page_requested_bytes -=
+        std::min(target.readdirplus_page_requested_bytes, value.readdirplus_page_requested_bytes);
+    target.readdirplus_page_latency_sum_us -=
+        std::min(target.readdirplus_page_latency_sum_us, value.readdirplus_page_latency_sum_us);
+    target.readdirplus_decode_latency_sum_us -=
+        std::min(target.readdirplus_decode_latency_sum_us, value.readdirplus_decode_latency_sum_us);
     for (std::size_t index = 0; index < target.size_file_counts.size(); ++index) {
         target.size_file_counts[index] -= std::min(target.size_file_counts[index], value.size_file_counts[index]);
         target.size_logical_bytes[index] -= std::min(target.size_logical_bytes[index], value.size_logical_bytes[index]);
@@ -56,6 +68,24 @@ void subtract_accumulator(SyntheticProfileBuilder::Accumulator& target,
     for (std::size_t index = 0; index < target.folder_fanout_counts.size(); ++index) {
         target.folder_fanout_counts[index] -=
             std::min(target.folder_fanout_counts[index], value.folder_fanout_counts[index]);
+        target.files_per_folder_counts[index] -=
+            std::min(target.files_per_folder_counts[index], value.files_per_folder_counts[index]);
+        target.subdirs_per_folder_counts[index] -=
+            std::min(target.subdirs_per_folder_counts[index], value.subdirs_per_folder_counts[index]);
+    }
+    for (std::size_t index = 0; index < target.folder_depth_counts.size(); ++index) {
+        target.folder_depth_counts[index] -=
+            std::min(target.folder_depth_counts[index], value.folder_depth_counts[index]);
+    }
+    for (std::size_t index = 0; index < target.entries_per_page_counts.size(); ++index) {
+        target.entries_per_page_counts[index] -=
+            std::min(target.entries_per_page_counts[index], value.entries_per_page_counts[index]);
+    }
+    for (std::size_t index = 0; index < target.readdirplus_page_latency_counts.size(); ++index) {
+        target.readdirplus_page_latency_counts[index] -=
+            std::min(target.readdirplus_page_latency_counts[index], value.readdirplus_page_latency_counts[index]);
+        target.readdirplus_decode_latency_counts[index] -=
+            std::min(target.readdirplus_decode_latency_counts[index], value.readdirplus_decode_latency_counts[index]);
     }
 }
 
@@ -92,6 +122,10 @@ std::array<std::uint64_t, kSyntheticSizeBucketCount> synthetic_size_bucket_bound
     };
 }
 
+std::array<std::uint64_t, kSyntheticLatencyBucketCount> synthetic_latency_bucket_bounds_us() noexcept {
+    return {100, 500, 1'000, 5'000, 10'000, 50'000, 100'000, kSyntheticUnboundedSize};
+}
+
 std::size_t synthetic_size_bucket_index(std::uint64_t size_bytes) noexcept {
     const auto bounds = synthetic_size_bucket_bounds();
     for (std::size_t index = 0; index < bounds.size(); ++index) {
@@ -107,6 +141,38 @@ std::size_t synthetic_folder_fanout_bucket_index(std::uint64_t files_in_folder) 
         0, 10, 100, 1'000, 10'000, 100'000, 1'000'000, kSyntheticUnboundedSize};
     for (std::size_t index = 0; index < bounds.size(); ++index) {
         if (files_in_folder <= bounds[index]) {
+            return index;
+        }
+    }
+    return bounds.size() - 1U;
+}
+
+std::size_t synthetic_folder_depth_bucket_index(std::uint64_t depth) noexcept {
+    constexpr std::array<std::uint64_t, kSyntheticFolderDepthBucketCount> bounds {
+        0, 1, 2, 3, 4, 6, 8, 12, 16, kSyntheticUnboundedSize};
+    for (std::size_t index = 0; index < bounds.size(); ++index) {
+        if (depth <= bounds[index]) {
+            return index;
+        }
+    }
+    return bounds.size() - 1U;
+}
+
+std::size_t synthetic_entries_per_page_bucket_index(std::uint64_t entries) noexcept {
+    constexpr std::array<std::uint64_t, kSyntheticEntriesPerPageBucketCount> bounds {
+        0, 16, 64, 256, 512, 1024, 4096, kSyntheticUnboundedSize};
+    for (std::size_t index = 0; index < bounds.size(); ++index) {
+        if (entries <= bounds[index]) {
+            return index;
+        }
+    }
+    return bounds.size() - 1U;
+}
+
+std::size_t synthetic_latency_bucket_index_us(std::uint64_t latency_us) noexcept {
+    const auto bounds = synthetic_latency_bucket_bounds_us();
+    for (std::size_t index = 0; index < bounds.size(); ++index) {
+        if (latency_us <= bounds[index]) {
             return index;
         }
     }
@@ -185,8 +251,23 @@ SyntheticPhaseProfile SyntheticProfileBuilder::make_phase(const Accumulator& acc
     phase.size_file_counts = accumulator.size_file_counts;
     phase.size_logical_bytes = accumulator.size_logical_bytes;
     phase.folder_fanout_counts = accumulator.folder_fanout_counts;
+    phase.files_per_folder_counts = accumulator.files_per_folder_counts;
+    phase.subdirs_per_folder_counts = accumulator.subdirs_per_folder_counts;
+    phase.folder_depth_counts = accumulator.folder_depth_counts;
+    phase.entries_per_page_counts = accumulator.entries_per_page_counts;
+    phase.readdirplus_page_latency_counts = accumulator.readdirplus_page_latency_counts;
+    phase.readdirplus_decode_latency_counts = accumulator.readdirplus_decode_latency_counts;
     phase.filename_length_sum = accumulator.filename_length_sum;
     phase.depth_sum = accumulator.depth_sum;
+    phase.empty_folder_count = accumulator.empty_folder_count;
+    phase.near_empty_folder_count = accumulator.near_empty_folder_count;
+    phase.directory_count = accumulator.directory_count;
+    phase.max_depth = accumulator.max_depth;
+    phase.readdirplus_page_count = accumulator.readdirplus_page_count;
+    phase.readdirplus_page_entries = accumulator.readdirplus_page_entries;
+    phase.readdirplus_page_requested_bytes = accumulator.readdirplus_page_requested_bytes;
+    phase.readdirplus_page_latency_sum_us = accumulator.readdirplus_page_latency_sum_us;
+    phase.readdirplus_decode_latency_sum_us = accumulator.readdirplus_decode_latency_sum_us;
     return phase;
 }
 

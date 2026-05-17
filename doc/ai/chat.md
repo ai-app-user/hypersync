@@ -322,3 +322,20 @@ phase buckets. Run directory:
 `/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-20260517T184054Z`.
 At 16.5 minutes it was still running, with `4.713B` files and `44.8M` folders
 observed, `0` failed folders, and cumulative throughput around `4.81M files/s`.
+
+## 2026-05-17 12:17 PDT
+
+**User:** ok, update the profiler to capture all of it, we want to be able to mimic the same behaviour later as much as possible
+
+**Codex:** Extended the compact profiler schema so real NFS captures retain
+folder topology and READDIRPLUS behavior needed for replay: true
+files-per-folder and subdirs-per-folder histograms, folder depth histograms,
+empty/near-empty folder counts, max depth, directory counts, entries-per-page
+histograms, requested page bytes, and approximate page/decode latency
+percentiles plus latency buckets. Fixed full-folder scans to use raw
+READDIRPLUS even without streaming page visitors, so the profiler can capture
+page latency while still producing complete per-folder fanout. Verified local
+unit and integration tests (`67/67`, `21/21`), built a separate transfer1
+binary (`build/release/hypersync-profiler-topology`) without stopping the
+active old run, and validated a 1M-record root NFS smoke profile with populated
+topology and page-latency fields.
