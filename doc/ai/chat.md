@@ -419,3 +419,20 @@ records from the archived NFS profile in `1.03s` at `9.69M files/s`.
 **User:** ok, let test metadata generator speed by connecting it to discarder
 
 **Codex:** Ran `benchmark-meta` on transfer1 with the archived full-source profile as `synthetic-profile://...`, latency disabled, and `--metadata-stats-discarder`. The synthetic metadata generator plus stats discarder sustained about `4.89M files/s` for 10 seconds and processed `48,948,328` files. Also tried the checker discard route, but it did not produce timely progress in this synthetic setup, so it was stopped.
+
+## 2026-05-17 14:51 PDT
+
+**User:** that is against our architecture principles, you have to remember
+ALWAYS follow them unless specifically asked not to for some good reason, all
+non pipeline options should be converted into jobs or removed
+
+**Codex:** Tightened the mandatory architecture docs and converted
+`benchmark-meta` off the legacy direct checker path. `--discard-after-checker`
+is now a compatibility alias for a real buffer pipeline:
+`FlatFolderScannerBufferJob -> BufQueue -> BufferDiscarderJob`.
+`--keep-after-checker` now errors because it implied retaining typed records
+outside the pipeline. The stats/writer branch was also moved onto buffer
+ownership: scanner emits flat-folder metadata buffers, and a metadata consumer
+job decodes buffers, updates stats/writers, and releases the handles. Removed
+the old unused direct flat-metadata scan helper. Local build passed and
+`main_cli_benchmark_meta_smoke` passed.

@@ -1153,3 +1153,27 @@ logical size: 335.99 TB
     logical bytes `116,501,691,159,702`, latency disabled.
   - Interval rate was stable around `4.90M files/s`.
   - A `--discard-after-checker` probe did not emit timely progress in the synthetic setup and was stopped.
+
+## Architecture Enforcement: No Non-Pipeline Options
+
+- 2026-05-17 14:51 PDT:
+  - Maintainer rule: ALWAYS follow the mandatory architecture principles unless
+    explicitly asked not to for a specific approved reason.
+  - All production, benchmark, and performance-isolation options must be
+    expressed as jobs connected by queue ownership transfer. Non-pipeline
+    options must be converted into jobs or removed.
+  - `benchmark-meta --discard-after-checker` was converted from the old direct
+    `NfsMetaReader::publish_tree() -> Checker::queue_checked_record()` path to
+    a real buffer pipeline:
+    `FlatFolderScannerBufferJob -> BufQueue<BufferHandle> -> BufferDiscarderJob`.
+  - `--keep-after-checker` was removed as behavior and now errors, because it
+    implied retaining typed records outside the buffer pipeline.
+  - The stats/writer benchmark path now consumes flat-folder metadata buffers
+    through a `FlatFolderMetadataConsumerJob`, updates `MetadataStatsDiscarder`
+    and optional metadata writers, and releases handles back to the pool.
+  - Default metadata discard buffer slots are `128` unless overridden by
+    `--record-buffer-slots`, preventing tiny benchmark runs from allocating a
+    huge autoscale-sized 1MiB metadata buffer pool.
+  - Local verification: `make build/hypersync build/hypersync_tests`, manual
+    tiny `benchmark-meta --discard-after-checker --no-pipeline-autoscale`,
+    and `./build/hypersync_tests --only main_cli_benchmark_meta_smoke` passed.

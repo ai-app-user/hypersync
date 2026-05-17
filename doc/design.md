@@ -36,6 +36,13 @@ opaque buffer handles.
 The only allowed communication between Jobs is ownership transfer of existing
 buffers through queues.
 
+Command-line modes, benchmarks, and diagnostic performance paths are not exempt
+from this rule. An option that bypasses the pipeline by directly invoking a
+specific downstream job, retaining typed records outside buffer ownership, or
+using a private non-queue side channel must be converted into normal Jobs or
+removed. Compatibility flags may remain only as aliases for the compliant
+pipeline topology.
+
 ### 0.2 Queues Carry Ownership, Not Bytes
 
 Queues store only buffer handles. A queue does not store file records, paths,

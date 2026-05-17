@@ -83,6 +83,7 @@ namespace hypersync {
 namespace {
 
 inline constexpr std::size_t kMetadataPartitionTransportPoolSlots = 1024U;
+inline constexpr std::size_t kMetadataDiscardDefaultBufferSlots = 128U;
 
 enum class PriorityMessageType : std::uint32_t {
     session_start = 1,
@@ -4116,6 +4117,111 @@ private:
     std::atomic<std::uint64_t> logical_size_ {0};
 };
 
+std::string child_path_for_flat_folder(std::string_view folder_path, std::string_view child_name) {
+    if (folder_path.empty()) {
+        return std::string(child_name);
+    }
+    std::string path;
+    path.reserve(folder_path.size() + 1U + child_name.size());
+    path.append(folder_path);
+    path.push_back('/');
+    path.append(child_name);
+    return path;
+}
+
+class FlatFolderMetadataConsumerJob final : public BufferConsumerJob {
+public:
+    FlatFolderMetadataConsumerJob(BufQueue& input,
+                                  const BufferPoolRegistry& registry,
+                                  MetadataStatsDiscarder* stats_discarder,
+                                  MetadataRecordWriter* record_writer,
+                                  PartitionedMetadataWriter* partitioned_writer)
+        : BufferConsumerJob(1U, input, registry),
+          stats_discarder_(stats_discarder),
+          record_writer_(record_writer),
+          partitioned_writer_(partitioned_writer) {}
+
+protected:
+    void process_buffer(const BufferHandle& handle, RawBufferPool& pool) override {
+        if (handle.pool_id != kMetadataBatchBufferPoolId) {
+            pool.release(handle);
+            throw std::runtime_error("flat metadata consumer received non-metadata buffer");
+        }
+
+        const MetadataBatchBuffer& buffer = metadata_batch_buffer(pool, handle);
+        if (!is_flat_folder_buffer(buffer)) {
+            pool.release(handle);
+            throw std::runtime_error("flat metadata consumer received non-flat-folder metadata buffer");
+        }
+
+        const FlatFolderBufferInfo info = flat_folder_buffer_info(buffer);
+        std::size_t files_found = 0;
+        std::size_t folders_found = 0;
+        std::uint64_t logical_size_bytes = 0;
+        std::vector<FileSpec> files;
+        std::vector<MetadataFolderRecord> folder_records;
+        const bool write_records = record_writer_ != nullptr || partitioned_writer_ != nullptr;
+        if (write_records) {
+            files.reserve(info.child_record_count);
+        }
+
+        visit_flat_folder_children(buffer, [&](FlatFolderChildView child) {
+            if (child.is_file) {
+                ++files_found;
+                logical_size_bytes += child.logical_size;
+                if (write_records) {
+                    FileSpec file;
+                    file.rel_path = child_path_for_flat_folder(info.folder_path, child.name);
+                    file.declared_size = child.logical_size;
+                    file.mtime = child.mtime;
+                    file.mode = child.mode;
+                    file.uid = child.uid;
+                    file.gid = child.gid;
+                    files.push_back(std::move(file));
+                }
+            } else {
+                ++folders_found;
+            }
+        });
+
+        if (stats_discarder_ != nullptr) {
+            stats_discarder_->record_batch(files_found, logical_size_bytes, folders_found);
+        }
+
+        if (write_records && info.final_batch) {
+            MetadataFolderRecord folder_record;
+            folder_record.spec.rel_path = std::string(info.folder_path);
+            folder_record.spec.mode = info.folder_mode;
+            folder_record.spec.uid = info.folder_uid;
+            folder_record.spec.gid = info.folder_gid;
+            folder_record.flat_file_count = static_cast<std::size_t>(info.total_file_count);
+            folder_record.flat_logical_size_bytes = info.total_logical_size_bytes;
+            folder_records.push_back(std::move(folder_record));
+        }
+
+        if (record_writer_ != nullptr && (!files.empty() || !folder_records.empty())) {
+            record_writer_->write_batch(files, folder_records);
+        } else if (partitioned_writer_ != nullptr && (!files.empty() || !folder_records.empty())) {
+            MetadataFolderRecord folder_record;
+            if (!folder_records.empty()) {
+                folder_record = std::move(folder_records.front());
+            } else {
+                folder_record.spec.rel_path = std::string(info.folder_path);
+                folder_record.flat_file_count = static_cast<std::size_t>(info.total_file_count);
+                folder_record.flat_logical_size_bytes = info.total_logical_size_bytes;
+            }
+            partitioned_writer_->write_batch(files, folder_record);
+        }
+
+        pool.release(handle);
+    }
+
+private:
+    MetadataStatsDiscarder* stats_discarder_ = nullptr;
+    MetadataRecordWriter* record_writer_ = nullptr;
+    PartitionedMetadataWriter* partitioned_writer_ = nullptr;
+};
+
 std::size_t shard_for_folder_hash(std::uint64_t folder_hash, std::size_t shard_count) {
     return shard_count == 0U ? 0U : static_cast<std::size_t>(folder_hash % shard_count);
 }
@@ -5355,322 +5461,6 @@ void mark_data_file_input_done(DataReadFileQueue& queue) {
     }
     queue.cv_not_empty.notify_all();
     queue.cv_not_full.notify_all();
-}
-
-void record_flat_metadata_batch(bool recursive,
-                                FlatMetadataWorkQueue& queue,
-                                MetadataStatsDiscarder& stats_discarder,
-                                MetadataRecordWriter* record_writer,
-                                PartitionedMetadataWriter* partitioned_writer,
-                                FlatFolderScanBatch batch) {
-    if (batch.failed) {
-        std::cerr << "metadata scan skipped folder '"
-                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
-                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
-        if (batch.folder.rel_path.empty()) {
-            const std::string message =
-                batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
-            fail_flat_folder_work(queue, std::make_exception_ptr(std::runtime_error(message)));
-            return;
-        }
-        finish_flat_folder_work(queue);
-        return;
-    }
-
-    std::uint64_t logical_size_bytes = 0;
-    for (const auto& file : batch.files) {
-        logical_size_bytes += file.declared_size != 0 ? file.declared_size : file.content.size();
-    }
-
-    const bool track_unique_folders = stats_discarder.config().track_unique_folders;
-    std::vector<std::string> folders_found;
-    if (track_unique_folders) {
-        folders_found.reserve(batch.directories.size());
-    }
-    std::vector<FileSpec> child_work;
-    if (recursive && !flat_metadata_scan_should_stop(queue)) {
-        child_work.reserve(batch.directories.size());
-    }
-
-    for (auto& directory : batch.directories) {
-        directory.rel_path = normalize_path(directory.rel_path);
-        if (track_unique_folders) {
-            folders_found.push_back(directory.rel_path);
-        }
-        if (recursive && !flat_metadata_scan_should_stop(queue)) {
-            child_work.push_back(directory);
-        }
-    }
-
-    if (track_unique_folders) {
-        stats_discarder.record_batch(batch.files.size(), logical_size_bytes, folders_found);
-    } else {
-        stats_discarder.record_batch(batch.files.size(), logical_size_bytes, batch.directories.size());
-    }
-    if (record_writer != nullptr) {
-        MetadataFolderRecord folder_record;
-        folder_record.spec = std::move(batch.folder);
-        folder_record.flat_file_count = batch.files.size();
-        folder_record.flat_logical_size_bytes = logical_size_bytes;
-        record_writer->write_batch(batch.files, std::vector<MetadataFolderRecord>{std::move(folder_record)});
-    } else if (partitioned_writer != nullptr) {
-        MetadataFolderRecord folder_record;
-        folder_record.spec = std::move(batch.folder);
-        folder_record.flat_file_count = batch.files.size();
-        folder_record.flat_logical_size_bytes = logical_size_bytes;
-        partitioned_writer->write_batch(batch.files, folder_record);
-    }
-    enqueue_flat_folder_work(queue, std::move(child_work));
-    finish_flat_folder_work(queue);
-}
-
-class FlatMetadataScanJob final : public ThreadedJob {
-public:
-    FlatMetadataScanJob(const NfsMetaReaderConfig& reader_config,
-                        FlatMetadataWorkQueue& queue,
-                        MetadataStatsDiscarder& stats_discarder,
-                        MetadataRecordWriter* record_writer,
-                        PartitionedMetadataWriter* partitioned_writer)
-        : ThreadedJob(std::max<std::size_t>(1U, reader_config.worker_count)),
-          source_root_(reader_config.source_root),
-          recursive_(reader_config.recursive),
-          async_directory_depth_(std::max<std::size_t>(1U, reader_config.async_directory_depth)),
-          queue_(queue),
-          stats_discarder_(stats_discarder),
-          record_writer_(record_writer),
-          partitioned_writer_(partitioned_writer) {}
-
-protected:
-    void run_worker(std::size_t worker_index) override {
-        auto backend = make_nfs_backend(source_root_);
-        auto io_scope = runtime_state_scope(worker_index, RuntimeState::wait_io);
-        backend->scan_flat_folders(
-            async_directory_depth_,
-            [this, worker_index](bool wait_for_work) {
-                if (!wait_until_worker_active(worker_index)) {
-                    return std::optional<FileSpec> {};
-                }
-                return take_flat_folder_work(queue_, wait_for_work);
-            },
-            [this] {
-                return stop_requested() || flat_metadata_scan_should_stop(queue_);
-            },
-            [this](FlatFolderScanBatch batch) {
-                record_flat_metadata_batch(recursive_,
-                                           queue_,
-                                           stats_discarder_,
-                                           record_writer_,
-                                           partitioned_writer_,
-                                           std::move(batch));
-            });
-        if (flat_metadata_scan_should_stop(queue_)) {
-            request_flat_folder_stop(queue_);
-        }
-    }
-
-    void on_stop_requested() override {
-        request_flat_folder_stop(queue_);
-    }
-
-private:
-    std::string source_root_;
-    bool recursive_ = true;
-    std::size_t async_directory_depth_ = 1;
-    FlatMetadataWorkQueue& queue_;
-    MetadataStatsDiscarder& stats_discarder_;
-    MetadataRecordWriter* record_writer_ = nullptr;
-    PartitionedMetadataWriter* partitioned_writer_ = nullptr;
-};
-
-void run_parallel_flat_metadata_scan(const NfsMetaReaderConfig& reader_config,
-                                     MetadataStatsDiscarder& stats_discarder,
-                                     MetadataRecordWriter* record_writer,
-                                     PartitionedMetadataWriter* partitioned_writer,
-                                     double max_duration_seconds,
-                                     const std::filesystem::path& status_socket_path,
-                                     bool pipeline_autoscale,
-                                     const std::string& autoscale_profile,
-                                     const std::filesystem::path& autoscale_settings_path,
-                                     std::uint64_t autoscale_interval_ms,
-                                     std::size_t* learned_workers_out) {
-    FlatMetadataWorkQueue queue;
-    queue.folders.push_back(FileSpec{});
-    if (max_duration_seconds > 0.0) {
-        queue.stop_at = std::chrono::steady_clock::now() +
-                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                            std::chrono::duration<double>(max_duration_seconds));
-    }
-    stats_discarder.record_folder("");
-
-    const std::size_t thread_count = std::max<std::size_t>(1, reader_config.worker_count);
-    FlatMetadataScanJob scanner(reader_config,
-                                queue,
-                                stats_discarder,
-                                record_writer,
-                                partitioned_writer);
-    std::unique_ptr<AutoScaleProfileStore> autoscale_profile_store;
-    std::unique_ptr<JobAutoScaleRunner> scanner_autoscaler;
-    auto learned_workers = std::make_shared<std::atomic<std::size_t>>(scanner.active_worker_limit());
-    std::shared_ptr<std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>> autoscale_samples;
-    if (pipeline_autoscale) {
-        autoscale_profile_store = std::make_unique<AutoScaleProfileStore>(autoscale_settings_path);
-        AutoScalePolicy policy = autoscale_profile_store->job_policy(autoscale_profile,
-                                                                     "nfs_meta_reader",
-                                                                     scanner.worker_count());
-        policy.scale_up_input_fullness = 0.0;
-        policy.scale_down_input_fullness = 0.01;
-        policy.output_blocked_fullness = 0.95;
-        policy.scale_up_output_fullness_limit = 0.95;
-        policy.busy_scale_up = 0.20;
-        policy.idle_scale_down = 0.80;
-        policy.min_improvement_ratio = 0.02;
-        policy.cooldown_samples = 1;
-        policy.max_cooldown_samples = std::max<std::uint64_t>(
-            1U,
-            (5000U + std::max<std::uint64_t>(1U, autoscale_interval_ms) - 1U) /
-                std::max<std::uint64_t>(1U, autoscale_interval_ms));
-        autoscale_samples =
-            std::make_shared<std::deque<std::pair<std::chrono::steady_clock::time_point, std::uint64_t>>>();
-        scanner_autoscaler = std::make_unique<JobAutoScaleRunner>(
-            scanner,
-            policy,
-            [&scanner, &queue, &stats_discarder, autoscale_samples] {
-                const auto now = std::chrono::steady_clock::now();
-                const MetadataStatsSnapshot stats = stats_discarder.snapshot();
-                const std::uint64_t records = stats.files_found + stats.folders_found;
-                autoscale_samples->emplace_back(now, records);
-                while (autoscale_samples->size() > 2U &&
-                       std::chrono::duration<double>(now - autoscale_samples->front().first).count() > 5.0) {
-                    autoscale_samples->pop_front();
-                }
-
-                std::size_t queued = 0;
-                std::size_t active = 0;
-                bool done = false;
-                {
-                    std::lock_guard<std::mutex> lock(queue.mutex);
-                    queued = queue.folders.size();
-                    active = queue.active;
-                    done = queue.done;
-                }
-
-                AutoScaleMetrics metrics;
-                const std::size_t active_limit = std::max<std::size_t>(1U, scanner.active_worker_limit());
-                metrics.input_fullness = done ? 0.0 : 1.0;
-                metrics.input_available_ratio =
-                    (queued + active) >= active_limit
-                        ? 1.0
-                        : static_cast<double>(queued + active) / static_cast<double>(active_limit);
-                metrics.output_fullness = 0.0;
-                const RuntimeMetricsSnapshot runtime = scanner.runtime_metrics().snapshot();
-                if (runtime.total_wall_ns != 0U) {
-                    metrics.busy_ratio = done ? 0.0 : 1.0;
-                    metrics.wait_output_ratio =
-                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_output_full)]) /
-                        static_cast<double>(runtime.total_wall_ns);
-                    metrics.wait_input_ratio =
-                        static_cast<double>(runtime.state_wall_ns[runtime_state_index(RuntimeState::wait_input_empty)]) /
-                        static_cast<double>(runtime.total_wall_ns);
-                }
-                if (autoscale_samples->size() >= 2U) {
-                    const auto& oldest = autoscale_samples->front();
-                    const double elapsed = std::chrono::duration<double>(now - oldest.first).count();
-                    metrics.throughput_per_second =
-                        elapsed > 0.0 ? static_cast<double>(records - oldest.second) / elapsed : 0.0;
-                }
-                return metrics;
-            },
-            std::chrono::milliseconds(std::max<std::uint64_t>(100U, autoscale_interval_ms)));
-        learned_workers->store(scanner_autoscaler->active_workers(), std::memory_order_relaxed);
-        scanner_autoscaler->set_decision_callback([learned_workers](const AutoScaleDecision& decision) {
-            if (std::string_view(decision.reason) != "shutdown") {
-                learned_workers->store(decision.active_workers, std::memory_order_relaxed);
-            }
-            if (decision.changed) {
-                std::cerr << "autoscale job=nfs_meta_reader active_workers="
-                          << decision.active_workers
-                          << " reason=" << decision.reason << '\n';
-            }
-        });
-    }
-    StatusRegistry status_registry;
-    std::unique_ptr<StatusServer> status_server;
-    if (!status_socket_path.empty()) {
-        status_registry.register_job("nfs_meta_reader", [&stats_discarder, &scanner]() {
-            const MetadataStatsSnapshot stats = stats_discarder.snapshot();
-            MonitorJobSnapshot snapshot;
-            snapshot.name = "nfs_meta_reader";
-            snapshot.running = scanner.running();
-            snapshot.worker_count = scanner.worker_count();
-            snapshot.processed_count = stats.files_found + stats.folders_found;
-            snapshot.byte_count = stats.logical_size_bytes;
-            snapshot.count_unit = "records";
-            snapshot.has_runtime_metrics = true;
-            snapshot.runtime_metrics = scanner.runtime_metrics().snapshot();
-            snapshot.detail = "files=" + std::to_string(stats.files_found) +
-                              " folders=" + std::to_string(stats.folders_found);
-            return snapshot;
-        });
-        status_registry.register_job("metadata_stats_discarder", [&stats_discarder]() {
-            const MetadataStatsSnapshot stats = stats_discarder.snapshot();
-            const JobStats job = stats_discarder.stats();
-            MonitorJobSnapshot snapshot;
-            snapshot.name = "metadata_stats_discarder";
-            snapshot.running = job.running;
-            snapshot.worker_count = 1;
-            snapshot.processed_count = stats.files_found + stats.folders_found;
-            snapshot.byte_count = stats.logical_size_bytes;
-            snapshot.count_unit = "records";
-            snapshot.detail = "files=" + std::to_string(stats.files_found) +
-                              " folders=" + std::to_string(stats.folders_found);
-            return snapshot;
-        });
-        if (record_writer != nullptr) {
-            status_registry.register_job("metadata_record_writer", [record_writer]() {
-                MonitorJobSnapshot snapshot;
-                snapshot.name = "metadata_record_writer";
-                snapshot.running = true;
-                snapshot.worker_count = 1;
-                snapshot.processed_count = record_writer->files_written() + record_writer->folders_written();
-                snapshot.count_unit = "records";
-                snapshot.detail = "files_written=" + std::to_string(record_writer->files_written()) +
-                                  " folders_written=" + std::to_string(record_writer->folders_written());
-                return snapshot;
-            });
-        }
-        status_registry.register_queue("folder_work_queue", [&queue]() {
-            return monitor_flat_folder_queue("folder_work_queue", queue);
-        });
-        status_server = std::make_unique<StatusServer>(status_socket_path, status_registry);
-        status_server->start();
-    }
-
-    scanner.start();
-    if (scanner_autoscaler) {
-        scanner_autoscaler->start();
-    }
-    scanner.wait();
-    if (scanner_autoscaler) {
-        scanner_autoscaler->stop();
-        const std::size_t learned = learned_workers->load(std::memory_order_relaxed);
-        if (autoscale_profile_store) {
-            autoscale_profile_store->update_learned_workers(autoscale_profile,
-                                                            "nfs_meta_reader",
-                                                            learned);
-            autoscale_profile_store->save();
-        }
-        if (learned_workers_out != nullptr) {
-            *learned_workers_out = learned;
-        }
-    } else if (learned_workers_out != nullptr) {
-        *learned_workers_out = thread_count;
-    }
-    if (queue.error) {
-        std::rethrow_exception(queue.error);
-    }
-    if (status_server) {
-        status_server->stop();
-    }
 }
 
 void record_data_read_metadata_batch(bool recursive,
@@ -10023,6 +9813,7 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                                                     std::string autoscale_profile,
                                                                     std::filesystem::path autoscale_settings_path,
                                                                     std::uint64_t autoscale_interval_ms) const {
+    (void)discard_after_checker;
     NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
     reader_config.source_root = source_root.string();
     reader_config.recursive = recursive;
@@ -10050,10 +9841,6 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         autoscale_interval_ms = std::max<std::uint64_t>(100U, autoscale_interval_ms);
     }
     NfsMetaReader reader(reader_config);
-
-    CheckerConfig checker_config = load_checker_config(config_store_);
-    checker_config.discard_checked_records = discard_after_checker;
-    Checker checker(checker_config);
 
     MetadataBenchmarkReport report;
     report.meta_reader_async = reader.using_async_backend();
@@ -10131,20 +9918,37 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         } else if (writer_config.enabled) {
             record_writer.emplace(writer_config);
         }
+        const std::size_t flat_slots =
+            record_buffer_slots == 0U
+                ? kMetadataDiscardDefaultBufferSlots
+                : std::max<std::size_t>(1U, record_buffer_slots);
+        report.record_buffer_slots = flat_slots;
+
+        RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
+        BufferPoolRegistry registry;
+        registry.register_pool(metadata_pool);
+        BufQueue metadata_queue(flat_slots);
+        FlatFolderScannerBufferJob scanner(source_root.string(),
+                                           recursive,
+                                           "size",
+                                           report.meta_reader_threads,
+                                           report.metadata_async_depth,
+                                           metadata_pool,
+                                           metadata_queue,
+                                           max_duration_seconds);
+        FlatFolderMetadataConsumerJob metadata_consumer(metadata_queue,
+                                                        registry,
+                                                        &stats_discarder,
+                                                        record_writer.has_value() ? &*record_writer : nullptr,
+                                                        partitioned_writer.get());
+
         stats_discarder.start();
-        std::size_t learned_workers = report.meta_reader_threads;
-        run_parallel_flat_metadata_scan(reader_config,
-                                        stats_discarder,
-                                        record_writer.has_value() ? &*record_writer : nullptr,
-                                        partitioned_writer.get(),
-                                        max_duration_seconds,
-                                        status_socket_path,
-                                        pipeline_autoscale,
-                                        autoscale_profile,
-                                        autoscale_settings_path,
-                                        autoscale_interval_ms,
-                                        &learned_workers);
-        report.learned_meta_reader_threads = learned_workers;
+        stats_discarder.record_folder("");
+        metadata_consumer.start();
+        scanner.start();
+        scanner.wait();
+        metadata_consumer.wait();
+        report.learned_meta_reader_threads = report.meta_reader_threads;
         stats_discarder.stop();
         const MetadataStatsSnapshot stats = stats_discarder.snapshot();
         report.files_seen = stats.files_found;
@@ -10163,19 +9967,39 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
             report.metadata_folders_written = partitioned_writer->folders_written();
         }
     } else {
-        reader.publish_tree();
-        JobMessage message;
-        while (reader.pull(message)) {
-            RecBuf record = message_as<RecBuf>(message);
-            ++report.files_seen;
-            (void)checker.should_skip(record);
-            checker.queue_checked_record(std::move(record));
-        }
+        const std::size_t flat_slots =
+            record_buffer_slots == 0U
+                ? kMetadataDiscardDefaultBufferSlots
+                : std::max<std::size_t>(1U, record_buffer_slots);
+        report.record_buffer_slots = flat_slots;
 
-        while (checker.pull(message)) {
-            ++report.checker_emitted;
-        }
-        report.checker_discarded = checker.stats().deferred;
+        RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
+        BufferPoolRegistry registry;
+        registry.register_pool(metadata_pool);
+        BufQueue metadata_to_discard(flat_slots);
+
+        FlatFolderScannerBufferJob scanner(source_root.string(),
+                                           recursive,
+                                           "size",
+                                           report.meta_reader_threads,
+                                           report.metadata_async_depth,
+                                           metadata_pool,
+                                           metadata_to_discard,
+                                           max_duration_seconds);
+        BufferDiscarderJob discarder(BufferDiscarderConfig(1U), metadata_to_discard, registry);
+
+        discarder.start();
+        scanner.start();
+        scanner.wait();
+        discarder.wait();
+
+        const DistributedDiffRunReport scanner_stats = scanner.stats();
+        report.files_seen = static_cast<std::size_t>(scanner_stats.files_compared);
+        report.checker_emitted = 0;
+        report.checker_discarded = report.files_seen;
+        report.folders_found = static_cast<std::size_t>(scanner_stats.folders_sent);
+        report.logical_size_bytes = scanner_stats.source_logical_size_bytes;
+        report.learned_meta_reader_threads = report.meta_reader_threads;
     }
 
     report.elapsed_seconds =

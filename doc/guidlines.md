@@ -15,6 +15,11 @@ This document defines general development principles for the application. It sho
 - Treat failures as first-class output: count them, report them, and make strict versus best-effort behavior explicit.
 - Prefer reusable jobs and shared libraries over command-specific one-off code.
 - Keep pipeline jobs independent: a job receives typed input, performs its own work with its own threading, and emits typed output without knowing which job produced the input or which job will consume the output.
+- All production, benchmark, and performance-isolation workflows must be built
+  as reusable jobs connected by pipeline queues. A command-line option must not
+  create a side path that calls another job directly, bypasses queue ownership,
+  or introduces a private non-pipeline execution model. If an old option cannot
+  be expressed as jobs connected by queues, convert it or remove it.
 - Keep generic job lifecycle mechanics in shared abstractions. Concrete jobs should implement payload-specific work and queue/pool ownership behavior, not duplicate start/stop/wait/thread bookkeeping.
 - Keep generic producer mechanics in shared abstractions. Concrete buffer producers should not duplicate count limiting, sequence assignment, buffer acquisition, output queue push, or release-on-failed-push behavior.
 - Keep generic consumer mechanics in shared abstractions. Concrete buffer consumers should not duplicate input queue pop/drain loops, queue wakeup, pool lookup, or common consumed-buffer stats.
@@ -29,6 +34,9 @@ This document defines general development principles for the application. It sho
   files.
 - Move file payload buffers by ownership between jobs; do not copy data bytes into queue messages.
 - New hot-path pipeline jobs should consume and emit `BufferHandle` values through `BufQueue` and operate on `RawBufferPool` slots. Typed payload interpretation belongs at the element/view level only.
+- Generic discard/sink behavior must use the generic buffer discarder. The
+  discarder accepts opaque buffer handles from registered pools and must not
+  become record-type-specific.
 - Preallocate payload buffers for high-volume data paths; do not allocate or free per-chunk payload memory during steady-state reads, writes, hashing, or transfer.
 - Do not create large payload buffers as stack temporaries. Reset or initialize
   preallocated buffers by updating their small headers/counters and only clear
