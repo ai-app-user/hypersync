@@ -1499,20 +1499,6 @@ std::string human_count_rate(double value) {
     return human_count(value, "/s");
 }
 
-std::string human_bytes(std::uint64_t bytes) {
-    const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
-    double value = static_cast<double>(bytes);
-    std::size_t unit_index = 0;
-    while (value >= 1000.0 && unit_index + 1U < std::size(units)) {
-        value /= 1000.0;
-        ++unit_index;
-    }
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(unit_index == 0U ? 0 : 1)
-        << value << units[unit_index];
-    return out.str();
-}
-
 std::string human_capacity(std::uint64_t bytes) {
     const char* units[] = {"B", "K", "M", "G", "T", "P"};
     double value = static_cast<double>(bytes);
