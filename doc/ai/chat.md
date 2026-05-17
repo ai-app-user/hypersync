@@ -339,3 +339,17 @@ unit and integration tests (`67/67`, `21/21`), built a separate transfer1
 binary (`build/release/hypersync-profiler-topology`) without stopping the
 active old run, and validated a 1M-record root NFS smoke profile with populated
 topology and page-latency fields.
+
+## 2026-05-17 12:33 PDT
+
+**User:** ok, looks good, add an option for the profiler to record data reading like you described
+
+**Codex:** Added optional sampled data-read profiling to `benchmark-nfs-profile`
+behind `--profile-data-reads`. The profiler now deterministically samples
+files by hash/rate, caps sample files and sample bytes per phase, reads small
+sampled files fully, reads bounded large-file prefixes by raw NFS handle, and
+records per-phase sampled small/large files, bytes, failures, and latency
+buckets/percentiles. Added CLI knobs for sample rate, per-phase file/byte caps,
+large read bytes, outstanding read requests, and pool slots. Verified local
+integration tests (`21/21`) and a transfer1 root NFS smoke run with populated
+sampled small/large read metrics and zero read failures.

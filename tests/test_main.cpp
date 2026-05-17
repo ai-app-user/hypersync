@@ -3924,6 +3924,9 @@ void test_main_cli_benchmark_nfs_profile_smoke() {
                                  source.path.string() +
                                  " --max-records 30 --phase-count 10" +
                                  " --meta-reader-threads 2 --metadata-async-depth 2" +
+                                 " --profile-data-reads --data-sample-rate 1" +
+                                 " --data-sample-max-files-per-phase 4" +
+                                 " --data-sample-large-read-bytes 1048576" +
                                  " --output " + profile_path.string() +
                                  " > " + stdout_path.string() + " 2>&1"));
     const std::string output_text = hypersync::read_file_contents(stdout_path);
@@ -3932,6 +3935,7 @@ void test_main_cli_benchmark_nfs_profile_smoke() {
     EXPECT_TRUE(output_text.find("phases=10") != std::string::npos);
     EXPECT_TRUE(output_text.find("nfs_profile source=") != std::string::npos);
     EXPECT_TRUE(output_text.find("failed_folders=0") != std::string::npos);
+    EXPECT_TRUE(output_text.find("profile_data_reads=true") != std::string::npos);
 
     const std::string profile_text = hypersync::read_file_contents(profile_path);
     EXPECT_TRUE(profile_text.find("phase index=0") != std::string::npos);
@@ -3939,6 +3943,9 @@ void test_main_cli_benchmark_nfs_profile_smoke() {
     EXPECT_TRUE(profile_text.find("small_files=") != std::string::npos);
     EXPECT_TRUE(profile_text.find("large_files=") != std::string::npos);
     EXPECT_TRUE(profile_text.find("<=1048576:") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("sampled_small_read_files=") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("sampled_large_read_files=") != std::string::npos);
+    EXPECT_TRUE(profile_text.find("sampled_small_read_latency_buckets_us=") != std::string::npos);
 }
 
 void test_main_cli_benchmark_hash_smoke() {

@@ -993,3 +993,36 @@ logical size: 335.99 TB
     `/mnt/local-nvme/wsync-codex/nfs-profile-topology-smoke-20260517T191735Z`
     captured `1M` records as root and showed populated topology plus
     READDIRPLUS page latency fields.
+
+## Sampled Data-Read Profiler, 2026-05-17 12:33 PDT
+
+- Added optional data-read sampling to `benchmark-nfs-profile`.
+- Default is metadata-only; data reads are enabled with `--profile-data-reads`.
+- Sampling model:
+  - deterministic sampling via `synthetic_splitmix64(global_file_index) % sample_rate`
+  - per-phase sample count cap
+  - per-phase sampled byte cap
+  - small files are read fully
+  - large files read only a bounded prefix, default `1MiB`
+  - reads use raw NFS handles when available and `copy_payload_to_buffer=false`
+    so payload copy is avoided; buffers are discarded immediately
+- CLI knobs:
+  - `--data-sample-rate <n>`
+  - `--data-sample-max-files-per-phase <n>`
+  - `--data-sample-max-bytes-per-phase <n>`
+  - `--data-sample-large-read-bytes <n>`
+  - `--data-sample-outstanding-requests <n>`
+  - `--data-sample-pool-slots <n>`
+- Profile output adds per phase:
+  - `sampled_small_read_files`, `sampled_small_read_bytes`,
+    `sampled_small_read_failures`, latency percentiles/buckets
+  - `sampled_large_read_files`, `sampled_large_read_bytes`,
+    `sampled_large_read_failures`, latency percentiles/buckets
+- Validation:
+  - Local integration tests: `21/21`.
+  - Transfer1 separate binary:
+    `/mnt/local-nvme/src/wsync/build/release/hypersync-profiler-data-sampling`
+  - Transfer1 root smoke:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-data-sample-smoke-20260517T193112Z`
+    captured `200K` metadata records with sampled small/large reads populated
+    and `0` read failures.

@@ -61,6 +61,14 @@ void subtract_accumulator(SyntheticProfileBuilder::Accumulator& target,
         std::min(target.readdirplus_page_latency_sum_us, value.readdirplus_page_latency_sum_us);
     target.readdirplus_decode_latency_sum_us -=
         std::min(target.readdirplus_decode_latency_sum_us, value.readdirplus_decode_latency_sum_us);
+    target.sampled_small_read_files -= std::min(target.sampled_small_read_files, value.sampled_small_read_files);
+    target.sampled_large_read_files -= std::min(target.sampled_large_read_files, value.sampled_large_read_files);
+    target.sampled_small_read_bytes -= std::min(target.sampled_small_read_bytes, value.sampled_small_read_bytes);
+    target.sampled_large_read_bytes -= std::min(target.sampled_large_read_bytes, value.sampled_large_read_bytes);
+    target.sampled_small_read_failures -=
+        std::min(target.sampled_small_read_failures, value.sampled_small_read_failures);
+    target.sampled_large_read_failures -=
+        std::min(target.sampled_large_read_failures, value.sampled_large_read_failures);
     for (std::size_t index = 0; index < target.size_file_counts.size(); ++index) {
         target.size_file_counts[index] -= std::min(target.size_file_counts[index], value.size_file_counts[index]);
         target.size_logical_bytes[index] -= std::min(target.size_logical_bytes[index], value.size_logical_bytes[index]);
@@ -86,6 +94,10 @@ void subtract_accumulator(SyntheticProfileBuilder::Accumulator& target,
             std::min(target.readdirplus_page_latency_counts[index], value.readdirplus_page_latency_counts[index]);
         target.readdirplus_decode_latency_counts[index] -=
             std::min(target.readdirplus_decode_latency_counts[index], value.readdirplus_decode_latency_counts[index]);
+        target.sampled_small_read_latency_counts[index] -=
+            std::min(target.sampled_small_read_latency_counts[index], value.sampled_small_read_latency_counts[index]);
+        target.sampled_large_read_latency_counts[index] -=
+            std::min(target.sampled_large_read_latency_counts[index], value.sampled_large_read_latency_counts[index]);
     }
 }
 
@@ -95,6 +107,36 @@ double small_ratio(const SyntheticProfileBuilder::Accumulator& accumulator) noex
     }
     return static_cast<double>(accumulator.small_file_count) /
            static_cast<double>(accumulator.file_count);
+}
+
+SyntheticLatencyPercentiles approximate_latency_percentiles(
+    const std::array<std::uint64_t, kSyntheticLatencyBucketCount>& buckets,
+    std::uint64_t max_us) noexcept {
+    SyntheticLatencyPercentiles result;
+    result.max_us = max_us;
+    std::uint64_t total = 0;
+    for (const std::uint64_t count : buckets) {
+        total += count;
+    }
+    if (total == 0U) {
+        return result;
+    }
+    const auto bounds = synthetic_latency_bucket_bounds_us();
+    const auto pick = [&](std::uint64_t numerator) {
+        const std::uint64_t rank = std::max<std::uint64_t>(1U, (total * numerator + 99U) / 100U);
+        std::uint64_t cursor = 0;
+        for (std::size_t index = 0; index < buckets.size(); ++index) {
+            cursor += buckets[index];
+            if (cursor >= rank) {
+                return bounds[index] == kSyntheticUnboundedSize ? max_us : bounds[index];
+            }
+        }
+        return max_us;
+    };
+    result.p50_us = pick(50U);
+    result.p90_us = pick(90U);
+    result.p99_us = pick(99U);
+    return result;
 }
 
 std::uint64_t scaled_count(std::uint64_t value, double scale) noexcept {
@@ -268,6 +310,18 @@ SyntheticPhaseProfile SyntheticProfileBuilder::make_phase(const Accumulator& acc
     phase.readdirplus_page_requested_bytes = accumulator.readdirplus_page_requested_bytes;
     phase.readdirplus_page_latency_sum_us = accumulator.readdirplus_page_latency_sum_us;
     phase.readdirplus_decode_latency_sum_us = accumulator.readdirplus_decode_latency_sum_us;
+    phase.sampled_small_read_files = accumulator.sampled_small_read_files;
+    phase.sampled_large_read_files = accumulator.sampled_large_read_files;
+    phase.sampled_small_read_bytes = accumulator.sampled_small_read_bytes;
+    phase.sampled_large_read_bytes = accumulator.sampled_large_read_bytes;
+    phase.sampled_small_read_failures = accumulator.sampled_small_read_failures;
+    phase.sampled_large_read_failures = accumulator.sampled_large_read_failures;
+    phase.sampled_small_read_latency_counts = accumulator.sampled_small_read_latency_counts;
+    phase.sampled_large_read_latency_counts = accumulator.sampled_large_read_latency_counts;
+    phase.small_read_latency =
+        approximate_latency_percentiles(accumulator.sampled_small_read_latency_counts, 0);
+    phase.large_read_latency =
+        approximate_latency_percentiles(accumulator.sampled_large_read_latency_counts, 0);
     return phase;
 }
 

@@ -159,6 +159,18 @@ void print_synthetic_profile(std::ostream& out,
             << " p90_us=" << phase.readdirplus_decode_latency.p90_us
             << " p99_us=" << phase.readdirplus_decode_latency.p99_us
             << " max_us=" << phase.readdirplus_decode_latency.max_us
+            << " sampled_small_read_files=" << phase.sampled_small_read_files
+            << " sampled_small_read_bytes=" << phase.sampled_small_read_bytes
+            << " sampled_small_read_failures=" << phase.sampled_small_read_failures
+            << " sampled_small_read_latency_p50_us=" << phase.small_read_latency.p50_us
+            << " p90_us=" << phase.small_read_latency.p90_us
+            << " p99_us=" << phase.small_read_latency.p99_us
+            << " sampled_large_read_files=" << phase.sampled_large_read_files
+            << " sampled_large_read_bytes=" << phase.sampled_large_read_bytes
+            << " sampled_large_read_failures=" << phase.sampled_large_read_failures
+            << " sampled_large_read_latency_p50_us=" << phase.large_read_latency.p50_us
+            << " p90_us=" << phase.large_read_latency.p90_us
+            << " p99_us=" << phase.large_read_latency.p99_us
             << " size_buckets=";
         for (std::size_t bucket = 0; bucket < bounds.size(); ++bucket) {
             if (bucket != 0U) {
@@ -227,9 +239,45 @@ void print_synthetic_profile(std::ostream& out,
             }
             out << ':' << phase.readdirplus_decode_latency_counts[bucket];
         }
+        out << " sampled_small_read_latency_buckets_us=";
+        for (std::size_t bucket = 0; bucket < phase.sampled_small_read_latency_counts.size(); ++bucket) {
+            if (bucket != 0U) {
+                out << ',';
+            }
+            out << "<=";
+            if (latency_bounds[bucket] == hypersync::kSyntheticUnboundedSize) {
+                out << "inf";
+            } else {
+                out << latency_bounds[bucket];
+            }
+            out << ':' << phase.sampled_small_read_latency_counts[bucket];
+        }
+        out << " sampled_large_read_latency_buckets_us=";
+        for (std::size_t bucket = 0; bucket < phase.sampled_large_read_latency_counts.size(); ++bucket) {
+            if (bucket != 0U) {
+                out << ',';
+            }
+            out << "<=";
+            if (latency_bounds[bucket] == hypersync::kSyntheticUnboundedSize) {
+                out << "inf";
+            } else {
+                out << latency_bounds[bucket];
+            }
+            out << ':' << phase.sampled_large_read_latency_counts[bucket];
+        }
         out << '\n';
     }
 }
+
+struct DataReadProfileConfig {
+    bool enabled = false;
+    std::uint64_t sample_rate = 100'000;
+    std::uint64_t max_samples_per_phase = 10'000;
+    std::uint64_t max_sample_bytes_per_phase = 1024ULL * 1024ULL * 1024ULL;
+    std::uint64_t large_sample_bytes = hypersync::kLargeChunkBytes;
+    std::size_t outstanding_requests = 1;
+    std::size_t pool_slots = 64;
+};
 
 struct NfsProfileWorkQueue {
     std::mutex mutex;
@@ -268,6 +316,16 @@ struct FixedPhaseAccumulator {
     std::uint64_t readdirplus_page_max_latency_us = 0;
     std::uint64_t readdirplus_decode_latency_sum_us = 0;
     std::uint64_t readdirplus_decode_max_latency_us = 0;
+    std::uint64_t sampled_small_read_files = 0;
+    std::uint64_t sampled_large_read_files = 0;
+    std::uint64_t sampled_small_read_bytes = 0;
+    std::uint64_t sampled_large_read_bytes = 0;
+    std::uint64_t sampled_small_read_failures = 0;
+    std::uint64_t sampled_large_read_failures = 0;
+    std::uint64_t sampled_small_read_max_latency_us = 0;
+    std::uint64_t sampled_large_read_max_latency_us = 0;
+    std::array<std::uint64_t, hypersync::kSyntheticLatencyBucketCount> sampled_small_read_latency_counts {};
+    std::array<std::uint64_t, hypersync::kSyntheticLatencyBucketCount> sampled_large_read_latency_counts {};
 };
 
 void merge_fixed_phase_accumulator(FixedPhaseAccumulator& target,
@@ -292,6 +350,16 @@ void merge_fixed_phase_accumulator(FixedPhaseAccumulator& target,
     target.readdirplus_decode_latency_sum_us += source.readdirplus_decode_latency_sum_us;
     target.readdirplus_decode_max_latency_us =
         std::max(target.readdirplus_decode_max_latency_us, source.readdirplus_decode_max_latency_us);
+    target.sampled_small_read_files += source.sampled_small_read_files;
+    target.sampled_large_read_files += source.sampled_large_read_files;
+    target.sampled_small_read_bytes += source.sampled_small_read_bytes;
+    target.sampled_large_read_bytes += source.sampled_large_read_bytes;
+    target.sampled_small_read_failures += source.sampled_small_read_failures;
+    target.sampled_large_read_failures += source.sampled_large_read_failures;
+    target.sampled_small_read_max_latency_us =
+        std::max(target.sampled_small_read_max_latency_us, source.sampled_small_read_max_latency_us);
+    target.sampled_large_read_max_latency_us =
+        std::max(target.sampled_large_read_max_latency_us, source.sampled_large_read_max_latency_us);
     for (std::size_t index = 0; index < target.size_file_counts.size(); ++index) {
         target.size_file_counts[index] += source.size_file_counts[index];
         target.size_logical_bytes[index] += source.size_logical_bytes[index];
@@ -310,6 +378,8 @@ void merge_fixed_phase_accumulator(FixedPhaseAccumulator& target,
     for (std::size_t index = 0; index < target.readdirplus_page_latency_counts.size(); ++index) {
         target.readdirplus_page_latency_counts[index] += source.readdirplus_page_latency_counts[index];
         target.readdirplus_decode_latency_counts[index] += source.readdirplus_decode_latency_counts[index];
+        target.sampled_small_read_latency_counts[index] += source.sampled_small_read_latency_counts[index];
+        target.sampled_large_read_latency_counts[index] += source.sampled_large_read_latency_counts[index];
     }
 }
 
@@ -436,6 +506,63 @@ void add_folder_to_fixed_phase(FixedPhaseAccumulator& accumulator,
         batch.readdirplus_page_count;
 }
 
+void add_data_read_sample_to_fixed_phase(FixedPhaseAccumulator& accumulator,
+                                         const hypersync::FileSpec& file,
+                                         const hypersync::NfsBackend& backend,
+                                         hypersync::RawBufferPool& pool,
+                                         const DataReadProfileConfig& config,
+                                         std::uint64_t small_threshold) {
+    const std::uint64_t file_size = file.declared_size != 0U ? file.declared_size : file.content.size();
+    if (file_size == 0U || file.nfs_handle.empty()) {
+        return;
+    }
+
+    hypersync::FileSpec sample = file;
+    const bool small = file_size <= small_threshold;
+    const std::uint64_t requested_bytes = small ? file_size : std::min(file_size, config.large_sample_bytes);
+    sample.declared_size = requested_bytes;
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        const std::uint64_t bytes_read = backend.read_file_raw_chunks_by_handle(
+            sample,
+            config.outstanding_requests,
+            pool,
+            [&](hypersync::RawFileChunk&& chunk) {
+                pool.release(chunk.handle);
+            },
+            {},
+            false);
+        const std::uint64_t latency_us = ns_to_us_ceil(static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - started).count()));
+        if (small) {
+            ++accumulator.sampled_small_read_files;
+            accumulator.sampled_small_read_bytes += bytes_read;
+            accumulator.sampled_small_read_max_latency_us =
+                std::max(accumulator.sampled_small_read_max_latency_us, latency_us);
+            ++accumulator.sampled_small_read_latency_counts[hypersync::synthetic_latency_bucket_index_us(latency_us)];
+            if (bytes_read != requested_bytes) {
+                ++accumulator.sampled_small_read_failures;
+            }
+        } else {
+            ++accumulator.sampled_large_read_files;
+            accumulator.sampled_large_read_bytes += bytes_read;
+            accumulator.sampled_large_read_max_latency_us =
+                std::max(accumulator.sampled_large_read_max_latency_us, latency_us);
+            ++accumulator.sampled_large_read_latency_counts[hypersync::synthetic_latency_bucket_index_us(latency_us)];
+            if (bytes_read != requested_bytes) {
+                ++accumulator.sampled_large_read_failures;
+            }
+        }
+    } catch (...) {
+        if (small) {
+            ++accumulator.sampled_small_read_failures;
+        } else {
+            ++accumulator.sampled_large_read_failures;
+        }
+    }
+}
+
 hypersync::SyntheticWorkloadProfile make_fixed_phase_profile(
     const std::vector<FixedPhaseAccumulator>& accumulators,
     std::uint64_t small_threshold) {
@@ -477,6 +604,20 @@ hypersync::SyntheticWorkloadProfile make_fixed_phase_profile(
         phase.readdirplus_decode_latency =
             approximate_latency_percentiles(accumulator.readdirplus_decode_latency_counts,
                                             accumulator.readdirplus_decode_max_latency_us);
+        phase.sampled_small_read_files = accumulator.sampled_small_read_files;
+        phase.sampled_large_read_files = accumulator.sampled_large_read_files;
+        phase.sampled_small_read_bytes = accumulator.sampled_small_read_bytes;
+        phase.sampled_large_read_bytes = accumulator.sampled_large_read_bytes;
+        phase.sampled_small_read_failures = accumulator.sampled_small_read_failures;
+        phase.sampled_large_read_failures = accumulator.sampled_large_read_failures;
+        phase.sampled_small_read_latency_counts = accumulator.sampled_small_read_latency_counts;
+        phase.sampled_large_read_latency_counts = accumulator.sampled_large_read_latency_counts;
+        phase.small_read_latency =
+            approximate_latency_percentiles(accumulator.sampled_small_read_latency_counts,
+                                            accumulator.sampled_small_read_max_latency_us);
+        phase.large_read_latency =
+            approximate_latency_percentiles(accumulator.sampled_large_read_latency_counts,
+                                            accumulator.sampled_large_read_max_latency_us);
         profile.phases.push_back(std::move(phase));
     }
     return profile;
@@ -568,11 +709,14 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                                             std::uint64_t max_records,
                                             std::size_t phase_count,
                                             std::uint64_t small_threshold,
-                                            std::uint32_t stats_interval_seconds) {
+                                            std::uint32_t stats_interval_seconds,
+                                            const DataReadProfileConfig& data_read_config) {
     NfsProfileWorkQueue queue;
     queue.folders.push_back(hypersync::FileSpec {});
     std::vector<FixedPhaseAccumulator> accumulators(std::max<std::size_t>(1U, phase_count));
     std::vector<std::mutex> accumulator_mutexes(accumulators.size());
+    std::vector<std::atomic<std::uint64_t>> data_sample_counts(accumulators.size());
+    std::vector<std::atomic<std::uint64_t>> data_sample_bytes(accumulators.size());
     std::atomic<std::uint64_t> files_reserved {0};
     std::atomic<std::uint64_t> files_recorded {0};
     std::atomic<std::uint64_t> folders_observed {0};
@@ -631,6 +775,11 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                 auto backend = hypersync::make_nfs_backend(source_root.string(),
                                                            hypersync::kNfsEndpointAny,
                                                            readdirplus_page_bytes);
+                hypersync::RawBufferPool data_sample_pool(
+                    hypersync::kDataBufferPoolId,
+                    std::max<std::size_t>(1U, data_read_config.pool_slots),
+                    sizeof(hypersync::DataBuffer),
+                    alignof(hypersync::DataBuffer));
                 backend->scan_flat_folders(
                     std::max<std::size_t>(1U, metadata_async_depth),
                     [&queue](bool wait_for_work) {
@@ -673,6 +822,29 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                                                     batch.files[static_cast<std::size_t>(offset)],
                                                     small_threshold,
                                                     folder_file_count);
+                            if (data_read_config.enabled && data_read_config.sample_rate != 0U &&
+                                hypersync::synthetic_splitmix64(global_index) % data_read_config.sample_rate == 0U) {
+                                const hypersync::FileSpec& file = batch.files[static_cast<std::size_t>(offset)];
+                                const std::uint64_t file_size =
+                                    file.declared_size != 0U ? file.declared_size : file.content.size();
+                                const std::uint64_t requested_bytes =
+                                    file_size <= small_threshold
+                                        ? file_size
+                                        : std::min(file_size, data_read_config.large_sample_bytes);
+                                const std::uint64_t previous_samples =
+                                    data_sample_counts[phase_index].fetch_add(1U, std::memory_order_relaxed);
+                                const std::uint64_t previous_bytes =
+                                    data_sample_bytes[phase_index].fetch_add(requested_bytes, std::memory_order_relaxed);
+                                if (previous_samples < data_read_config.max_samples_per_phase &&
+                                    previous_bytes + requested_bytes <= data_read_config.max_sample_bytes_per_phase) {
+                                    add_data_read_sample_to_fixed_phase(local[phase_index],
+                                                                        file,
+                                                                        *backend,
+                                                                        data_sample_pool,
+                                                                        data_read_config,
+                                                                        small_threshold);
+                                }
+                            }
                         }
                         const std::size_t folder_phase_index = std::min<std::size_t>(
                             accumulators.size() - 1U,
@@ -744,7 +916,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--stats-interval-seconds <n>] [--output <profile.txt>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--profile-data-reads] [--data-sample-rate <n>] [--data-sample-max-files-per-phase <n>] [--data-sample-max-bytes-per-phase <n>] [--data-sample-large-read-bytes <n>] [--data-sample-outstanding-requests <n>] [--stats-interval-seconds <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-fake-diff [--file-count <n>] [--folder-count <n>] [--average-file-size <bytes>] [--source-threads <n>] [--fake-remote-threads <n>] [--checker-threads <n>] [--remote-delay-us <n>] [--request-queue-depth <n>] [--batch-queue-depth <n>] [--stats-interval-seconds <n>]\n"
@@ -878,6 +1050,7 @@ int main(int argc, char** argv) {
             std::size_t readdirplus_page_bytes = 256U * 1024U;
             std::uint64_t small_threshold = hypersync::kSmallFileThreshold;
             std::uint32_t stats_interval_seconds = 10;
+            DataReadProfileConfig data_read_config;
             std::filesystem::path output_path;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
@@ -911,6 +1084,31 @@ int main(int argc, char** argv) {
                     stats_interval_seconds = static_cast<std::uint32_t>(
                         parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
                                             "--stats-interval-seconds"));
+                } else if (args[i] == "--profile-data-reads") {
+                    data_read_config.enabled = true;
+                } else if (args[i] == "--data-sample-rate") {
+                    data_read_config.sample_rate =
+                        parse_u64_option(require_option(args, i, "--data-sample-rate"), "--data-sample-rate");
+                } else if (args[i] == "--data-sample-max-files-per-phase") {
+                    data_read_config.max_samples_per_phase =
+                        parse_u64_option(require_option(args, i, "--data-sample-max-files-per-phase"),
+                                         "--data-sample-max-files-per-phase");
+                } else if (args[i] == "--data-sample-max-bytes-per-phase") {
+                    data_read_config.max_sample_bytes_per_phase =
+                        parse_u64_option(require_option(args, i, "--data-sample-max-bytes-per-phase"),
+                                         "--data-sample-max-bytes-per-phase");
+                } else if (args[i] == "--data-sample-large-read-bytes") {
+                    data_read_config.large_sample_bytes =
+                        parse_u64_option(require_option(args, i, "--data-sample-large-read-bytes"),
+                                         "--data-sample-large-read-bytes");
+                } else if (args[i] == "--data-sample-outstanding-requests") {
+                    data_read_config.outstanding_requests =
+                        parse_size_t_option(require_option(args, i, "--data-sample-outstanding-requests"),
+                                            "--data-sample-outstanding-requests");
+                } else if (args[i] == "--data-sample-pool-slots") {
+                    data_read_config.pool_slots =
+                        parse_size_t_option(require_option(args, i, "--data-sample-pool-slots"),
+                                            "--data-sample-pool-slots");
                 } else if (args[i] == "--output") {
                     output_path = require_option(args, i, "--output");
                 } else {
@@ -932,7 +1130,8 @@ int main(int argc, char** argv) {
                                                                        max_records,
                                                                        phase_count,
                                                                        small_threshold,
-                                                                       stats_interval_seconds);
+                                                                       stats_interval_seconds,
+                                                                       data_read_config);
             print_synthetic_profile(std::cout,
                                     result.profile,
                                     result.files_observed,
@@ -944,6 +1143,12 @@ int main(int argc, char** argv) {
                       << " metadata_async_depth=" << metadata_async_depth
                       << " readdirplus_page_bytes=" << readdirplus_page_bytes
                       << " stats_interval_seconds=" << stats_interval_seconds
+                      << " profile_data_reads=" << (data_read_config.enabled ? "true" : "false")
+                      << " data_sample_rate=" << data_read_config.sample_rate
+                      << " data_sample_max_files_per_phase=" << data_read_config.max_samples_per_phase
+                      << " data_sample_max_bytes_per_phase=" << data_read_config.max_sample_bytes_per_phase
+                      << " data_sample_large_read_bytes=" << data_read_config.large_sample_bytes
+                      << " data_sample_outstanding_requests=" << data_read_config.outstanding_requests
                       << " recursive=" << (recursive ? "true" : "false") << '\n';
             if (!output_path.empty()) {
                 std::ofstream output(output_path);
@@ -961,6 +1166,12 @@ int main(int argc, char** argv) {
                        << " metadata_async_depth=" << metadata_async_depth
                        << " readdirplus_page_bytes=" << readdirplus_page_bytes
                        << " stats_interval_seconds=" << stats_interval_seconds
+                       << " profile_data_reads=" << (data_read_config.enabled ? "true" : "false")
+                       << " data_sample_rate=" << data_read_config.sample_rate
+                       << " data_sample_max_files_per_phase=" << data_read_config.max_samples_per_phase
+                       << " data_sample_max_bytes_per_phase=" << data_read_config.max_sample_bytes_per_phase
+                       << " data_sample_large_read_bytes=" << data_read_config.large_sample_bytes
+                       << " data_sample_outstanding_requests=" << data_read_config.outstanding_requests
                        << " recursive=" << (recursive ? "true" : "false") << '\n';
             }
             return 0;

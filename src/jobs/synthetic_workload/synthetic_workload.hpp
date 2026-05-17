@@ -55,6 +55,14 @@ struct SyntheticPhaseProfile {
     std::uint64_t readdirplus_page_requested_bytes = 0;
     std::uint64_t readdirplus_page_latency_sum_us = 0;
     std::uint64_t readdirplus_decode_latency_sum_us = 0;
+    std::uint64_t sampled_small_read_files = 0;
+    std::uint64_t sampled_large_read_files = 0;
+    std::uint64_t sampled_small_read_bytes = 0;
+    std::uint64_t sampled_large_read_bytes = 0;
+    std::uint64_t sampled_small_read_failures = 0;
+    std::uint64_t sampled_large_read_failures = 0;
+    std::array<std::uint64_t, kSyntheticLatencyBucketCount> sampled_small_read_latency_counts {};
+    std::array<std::uint64_t, kSyntheticLatencyBucketCount> sampled_large_read_latency_counts {};
     SyntheticLatencyPercentiles readdirplus_page_latency;
     SyntheticLatencyPercentiles readdirplus_decode_latency;
     SyntheticLatencyPercentiles small_read_latency;
@@ -113,6 +121,14 @@ public:
         std::uint64_t readdirplus_page_requested_bytes = 0;
         std::uint64_t readdirplus_page_latency_sum_us = 0;
         std::uint64_t readdirplus_decode_latency_sum_us = 0;
+        std::uint64_t sampled_small_read_files = 0;
+        std::uint64_t sampled_large_read_files = 0;
+        std::uint64_t sampled_small_read_bytes = 0;
+        std::uint64_t sampled_large_read_bytes = 0;
+        std::uint64_t sampled_small_read_failures = 0;
+        std::uint64_t sampled_large_read_failures = 0;
+        std::array<std::uint64_t, kSyntheticLatencyBucketCount> sampled_small_read_latency_counts {};
+        std::array<std::uint64_t, kSyntheticLatencyBucketCount> sampled_large_read_latency_counts {};
     };
 
     explicit SyntheticProfileBuilder(SyntheticProfileCaptureConfig config = {});
