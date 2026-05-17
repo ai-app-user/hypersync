@@ -301,6 +301,8 @@ struct ReconScanStats {
     std::atomic<std::size_t> small_files_found {0};
     std::atomic<std::size_t> large_files_found {0};
     std::atomic<std::uint64_t> logical_size_bytes {0};
+    std::atomic<std::uint64_t> small_logical_size_bytes {0};
+    std::atomic<std::uint64_t> large_logical_size_bytes {0};
     std::atomic<bool> completed {false};
 };
 
@@ -327,7 +329,9 @@ SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
     const std::uint64_t small_remaining =
         input.small_total > input.small_done ? input.small_total - input.small_done : 0U;
     const std::uint64_t large_remaining =
-        input.large_total > input.large_done ? input.large_total - input.large_done : 0U;
+        input.large_total_bytes > input.large_done_bytes
+            ? input.large_total_bytes - input.large_done_bytes
+            : 0U;
 
     auto eta = [](std::uint64_t remaining, double rate) {
         if (remaining == 0U) {
@@ -339,7 +343,7 @@ SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
 
     SplitBucketPriorityDecision decision;
     decision.small_eta_seconds = eta(small_remaining, input.small_files_per_second);
-    decision.large_eta_seconds = eta(large_remaining, input.large_files_per_second);
+    decision.large_eta_seconds = eta(large_remaining, input.large_bytes_per_second);
     if (small_remaining == 0U && large_remaining == 0U) {
         decision.small_workers = std::min(max_small, std::max<std::size_t>(1, input.current_small_workers));
         decision.large_workers = std::min(max_large, std::max<std::size_t>(1, input.current_large_workers));
@@ -362,8 +366,8 @@ SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
             ? input.small_files_per_second / static_cast<double>(std::max<std::size_t>(1, input.current_small_workers))
             : 1.0;
     const double large_per_worker =
-        input.large_files_per_second > 0.0
-            ? input.large_files_per_second / static_cast<double>(std::max<std::size_t>(1, input.current_large_workers))
+        input.large_bytes_per_second > 0.0
+            ? input.large_bytes_per_second / static_cast<double>(std::max<std::size_t>(1, input.current_large_workers))
             : 1.0;
     const double small_demand = static_cast<double>(small_remaining) / std::max(1.0, small_per_worker);
     const double large_demand = static_cast<double>(large_remaining) / std::max(1.0, large_per_worker);
@@ -808,6 +812,10 @@ struct DataReadBenchmarkSnapshot {
     std::size_t recon_small_files_found = 0;
     std::size_t recon_large_files_found = 0;
     std::uint64_t recon_logical_size_bytes = 0;
+    std::uint64_t small_logical_size_bytes = 0;
+    std::uint64_t large_logical_size_bytes = 0;
+    std::uint64_t recon_small_logical_size_bytes = 0;
+    std::uint64_t recon_large_logical_size_bytes = 0;
     bool recon_completed = false;
 };
 
@@ -824,6 +832,8 @@ struct DataReadBenchmarkStats {
     std::atomic<std::size_t> large_files_read {0};
     std::atomic<std::uint64_t> small_bytes_read {0};
     std::atomic<std::uint64_t> large_bytes_read {0};
+    std::atomic<std::uint64_t> small_logical_size_bytes {0};
+    std::atomic<std::uint64_t> large_logical_size_bytes {0};
     std::uint32_t print_interval_seconds = 5;
     std::chrono::steady_clock::time_point started_at {};
     std::chrono::steady_clock::time_point last_print_at {};
@@ -1884,6 +1894,8 @@ DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats&
     snapshot.large_files_read = stats.large_files_read.load(std::memory_order_relaxed);
     snapshot.small_bytes_read = stats.small_bytes_read.load(std::memory_order_relaxed);
     snapshot.large_bytes_read = stats.large_bytes_read.load(std::memory_order_relaxed);
+    snapshot.small_logical_size_bytes = stats.small_logical_size_bytes.load(std::memory_order_relaxed);
+    snapshot.large_logical_size_bytes = stats.large_logical_size_bytes.load(std::memory_order_relaxed);
     snapshot.elapsed_seconds = elapsed;
     snapshot.bytes_per_second = elapsed > 0.0 ? static_cast<double>(snapshot.bytes_read) / elapsed : 0.0;
     snapshot.gigabits_per_second = snapshot.bytes_per_second * 8.0 / 1'000'000'000.0;
@@ -1904,6 +1916,10 @@ DataReadBenchmarkSnapshot snapshot_data_read_stats(const DataReadBenchmarkStats&
         snapshot.recon_small_files_found = recon_stats->small_files_found.load(std::memory_order_relaxed);
         snapshot.recon_large_files_found = recon_stats->large_files_found.load(std::memory_order_relaxed);
         snapshot.recon_logical_size_bytes = recon_stats->logical_size_bytes.load(std::memory_order_relaxed);
+        snapshot.recon_small_logical_size_bytes =
+            recon_stats->small_logical_size_bytes.load(std::memory_order_relaxed);
+        snapshot.recon_large_logical_size_bytes =
+            recon_stats->large_logical_size_bytes.load(std::memory_order_relaxed);
         snapshot.recon_completed = recon_stats->completed.load(std::memory_order_relaxed);
     }
     return snapshot;
@@ -5542,12 +5558,16 @@ void record_split_data_read_metadata_batch(bool recursive,
     small_files.reserve(batch.files.size());
     large_files.reserve(batch.files.size());
     std::uint64_t logical_size_bytes = 0;
+    std::uint64_t small_logical_size_bytes = 0;
+    std::uint64_t large_logical_size_bytes = 0;
     for (auto& file : batch.files) {
         const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
         logical_size_bytes += logical_size;
         if (logical_size <= file_queues.small_file_threshold) {
+            small_logical_size_bytes += logical_size;
             small_files.push_back(std::move(file));
         } else {
+            large_logical_size_bytes += logical_size;
             large_files.push_back(std::move(file));
         }
     }
@@ -5565,6 +5585,8 @@ void record_split_data_read_metadata_batch(bool recursive,
                               batch.directories.size(), logical_size_bytes);
     stats.small_files_found.fetch_add(small_files.size(), std::memory_order_relaxed);
     stats.large_files_found.fetch_add(large_files.size(), std::memory_order_relaxed);
+    stats.small_logical_size_bytes.fetch_add(small_logical_size_bytes, std::memory_order_relaxed);
+    stats.large_logical_size_bytes.fetch_add(large_logical_size_bytes, std::memory_order_relaxed);
 
     if (!enqueue_data_read_files(file_queues.small, std::move(small_files)) ||
         !enqueue_data_read_files(file_queues.large, std::move(large_files))) {
@@ -5629,8 +5651,10 @@ void record_filtered_split_data_read_metadata_batch(bool recursive,
     record_data_read_metadata(stats, files_to_read.size(), batch.directories.size(), logical_size_bytes);
     if (route == SplitDataReadRoute::Small) {
         stats.small_files_found.fetch_add(files_to_read.size(), std::memory_order_relaxed);
+        stats.small_logical_size_bytes.fetch_add(logical_size_bytes, std::memory_order_relaxed);
     } else {
         stats.large_files_found.fetch_add(files_to_read.size(), std::memory_order_relaxed);
+        stats.large_logical_size_bytes.fetch_add(logical_size_bytes, std::memory_order_relaxed);
     }
 
     if (!enqueue_data_read_files(file_queue, std::move(files_to_read))) {
@@ -5673,13 +5697,17 @@ void record_recon_metadata_batch(bool recursive,
     std::size_t small_files = 0;
     std::size_t large_files = 0;
     std::uint64_t logical_size_bytes = 0;
+    std::uint64_t small_logical_size_bytes = 0;
+    std::uint64_t large_logical_size_bytes = 0;
     for (const auto& file : batch.files) {
         const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
         logical_size_bytes += logical_size;
         if (logical_size <= small_file_threshold) {
             ++small_files;
+            small_logical_size_bytes += logical_size;
         } else {
             ++large_files;
+            large_logical_size_bytes += logical_size;
         }
     }
 
@@ -5697,6 +5725,8 @@ void record_recon_metadata_batch(bool recursive,
     recon_stats.small_files_found.fetch_add(small_files, std::memory_order_relaxed);
     recon_stats.large_files_found.fetch_add(large_files, std::memory_order_relaxed);
     recon_stats.logical_size_bytes.fetch_add(logical_size_bytes, std::memory_order_relaxed);
+    recon_stats.small_logical_size_bytes.fetch_add(small_logical_size_bytes, std::memory_order_relaxed);
+    recon_stats.large_logical_size_bytes.fetch_add(large_logical_size_bytes, std::memory_order_relaxed);
 
     enqueue_flat_folder_work(folder_queue, std::move(child_work));
     if (batch.complete) {
@@ -6537,6 +6567,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         std::chrono::steady_clock::time_point at;
         std::uint64_t small_read = 0;
         std::uint64_t large_read = 0;
+        std::uint64_t large_bytes_read = 0;
     };
     std::atomic<bool> bucket_priority_stop {false};
     std::thread bucket_priority_coordinator;
@@ -6552,6 +6583,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                     now,
                     static_cast<std::uint64_t>(snapshot.small_files_read),
                     static_cast<std::uint64_t>(snapshot.large_files_read),
+                    snapshot.large_bytes_read,
                 });
                 while (samples.size() > 2U && now - samples.front().at > sample_window) {
                     samples.pop_front();
@@ -6559,6 +6591,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
 
                 double small_rate = snapshot.small_files_per_second;
                 double large_rate = snapshot.large_files_per_second;
+                double large_byte_rate = snapshot.large_bytes_read > 0U && snapshot.elapsed_seconds > 0.0
+                                             ? static_cast<double>(snapshot.large_bytes_read) /
+                                                   snapshot.elapsed_seconds
+                                             : 0.0;
                 if (samples.size() >= 2U) {
                     const auto& oldest = samples.front();
                     const double elapsed = std::chrono::duration<double>(now - oldest.at).count();
@@ -6567,6 +6603,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                          snapshot.small_files_read - oldest.small_read) / elapsed;
                         large_rate = static_cast<double>(
                                          snapshot.large_files_read - oldest.large_read) / elapsed;
+                        large_byte_rate = static_cast<double>(
+                                              snapshot.large_bytes_read - oldest.large_bytes_read) / elapsed;
                     }
                 }
 
@@ -6580,14 +6618,21 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                     {static_cast<std::uint64_t>(snapshot.large_files_found),
                      static_cast<std::uint64_t>(snapshot.recon_large_files_found),
                      static_cast<std::uint64_t>(snapshot.large_files_read + queued_large)});
+                const std::uint64_t large_total_bytes = std::max<std::uint64_t>(
+                    {snapshot.large_logical_size_bytes,
+                     snapshot.recon_large_logical_size_bytes,
+                     snapshot.large_bytes_read});
 
                 SplitBucketPriorityInput input;
                 input.small_total = small_total;
                 input.large_total = large_total;
+                input.large_total_bytes = large_total_bytes;
                 input.small_done = snapshot.small_files_read;
                 input.large_done = snapshot.large_files_read;
+                input.large_done_bytes = snapshot.large_bytes_read;
                 input.small_files_per_second = small_rate;
                 input.large_files_per_second = large_rate;
+                input.large_bytes_per_second = large_byte_rate;
                 input.current_small_workers = small_reader_job.active_worker_limit();
                 input.current_large_workers = large_reader_job.active_worker_limit();
                 input.max_small_workers = small_reader_job.worker_count();
@@ -6609,6 +6654,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << " large_eta_seconds=" << decision.large_eta_seconds
                           << " small_rate_files_per_second=" << small_rate
                           << " large_rate_files_per_second=" << large_rate
+                          << " large_rate_bytes_per_second=" << large_byte_rate
                           << " small_remaining="
                           << (small_total > snapshot.small_files_read
                                   ? small_total - snapshot.small_files_read
@@ -6617,6 +6663,11 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << (large_total > snapshot.large_files_read
                                   ? large_total - snapshot.large_files_read
                                   : 0U)
+                          << " large_remaining_bytes="
+                          << (large_total_bytes > snapshot.large_bytes_read
+                                  ? large_total_bytes - snapshot.large_bytes_read
+                                  : 0U)
+                          << " large_total_bytes=" << large_total_bytes
                           << " queued_small_files=" << queued_small
                           << " queued_large_files=" << queued_large
                           << " recon_completed=" << (snapshot.recon_completed ? "true" : "false")
@@ -6726,6 +6777,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                       << " bytes_read=" << snapshot.bytes_read
                       << " small_bytes_read=" << snapshot.small_bytes_read
                       << " large_bytes_read=" << snapshot.large_bytes_read
+                      << " small_logical_size_bytes=" << snapshot.small_logical_size_bytes
+                      << " large_logical_size_bytes=" << snapshot.large_logical_size_bytes
                       << " files_read=" << snapshot.files_read
                       << " small_files_read=" << snapshot.small_files_read
                       << " large_files_read=" << snapshot.large_files_read
@@ -6734,6 +6787,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                       << " recon_files_found=" << snapshot.recon_files_found
                       << " recon_small_files_found=" << snapshot.recon_small_files_found
                       << " recon_large_files_found=" << snapshot.recon_large_files_found
+                      << " recon_small_logical_size_bytes=" << snapshot.recon_small_logical_size_bytes
+                      << " recon_large_logical_size_bytes=" << snapshot.recon_large_logical_size_bytes
                       << " recon_completed=" << (snapshot.recon_completed ? "true" : "false")
                       << " queued_small_files=" << queued_data_read_files(file_queues.small)
                       << " queued_large_files=" << queued_data_read_files(file_queues.large)
@@ -9846,11 +9901,15 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_read_pipeline(const std::
     report.large_files_read = snapshot.large_files_read;
     report.small_bytes_read = snapshot.small_bytes_read;
     report.large_bytes_read = snapshot.large_bytes_read;
+    report.small_logical_size_bytes = snapshot.small_logical_size_bytes;
+    report.large_logical_size_bytes = snapshot.large_logical_size_bytes;
     report.recon_files_found = snapshot.recon_files_found;
     report.recon_folders_found = snapshot.recon_folders_found;
     report.recon_small_files_found = snapshot.recon_small_files_found;
     report.recon_large_files_found = snapshot.recon_large_files_found;
     report.recon_logical_size_bytes = snapshot.recon_logical_size_bytes;
+    report.recon_small_logical_size_bytes = snapshot.recon_small_logical_size_bytes;
+    report.recon_large_logical_size_bytes = snapshot.recon_large_logical_size_bytes;
     report.recon_completed = snapshot.recon_completed;
     report.bytes_per_second = snapshot.bytes_per_second;
     report.gigabits_per_second = snapshot.gigabits_per_second;

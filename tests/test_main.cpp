@@ -794,10 +794,13 @@ void test_split_bucket_priority_balances_eta() {
     SplitBucketPriorityInput input;
     input.small_total = 10'000'000;
     input.large_total = 200'000;
+    input.large_total_bytes = 20'000'000'000;
     input.small_done = 1'000'000;
     input.large_done = 100'000;
+    input.large_done_bytes = 10'000'000'000;
     input.small_files_per_second = 30'000.0;
     input.large_files_per_second = 2'000.0;
+    input.large_bytes_per_second = 200'000'000.0;
     input.current_small_workers = 96;
     input.current_large_workers = 64;
     input.max_small_workers = 128;
@@ -811,10 +814,13 @@ void test_split_bucket_priority_balances_eta() {
 
     input.small_total = 1'100'000;
     input.large_total = 10'000'000;
+    input.large_total_bytes = 10'000'000'000'000;
     input.small_done = 1'000'000;
     input.large_done = 1'000'000;
+    input.large_done_bytes = 1'000'000'000'000;
     input.small_files_per_second = 50'000.0;
     input.large_files_per_second = 500.0;
+    input.large_bytes_per_second = 500'000'000.0;
     input.current_small_workers = 120;
     input.current_large_workers = 40;
     decision = choose_split_bucket_priority_workers(input);
@@ -825,10 +831,13 @@ void test_split_bucket_priority_balances_eta() {
 
     input.small_total = 5'000'000;
     input.large_total = 1'000'000;
+    input.large_total_bytes = 1'000'000'000'000;
     input.small_done = 1'000'000;
     input.large_done = 1'000'000;
+    input.large_done_bytes = 1'000'000'000'000;
     input.small_files_per_second = 20'000.0;
     input.large_files_per_second = 1'000.0;
+    input.large_bytes_per_second = 1'000'000'000.0;
     input.current_small_workers = 96;
     input.current_large_workers = 64;
     decision = choose_split_bucket_priority_workers(input);

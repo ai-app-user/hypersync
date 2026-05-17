@@ -1508,11 +1508,15 @@ int main(int argc, char** argv) {
                       << " large_files_read=" << report.large_files_read
                       << " small_bytes_read=" << report.small_bytes_read
                       << " large_bytes_read=" << report.large_bytes_read
+                      << " small_logical_size_bytes=" << report.small_logical_size_bytes
+                      << " large_logical_size_bytes=" << report.large_logical_size_bytes
                       << " recon_files_found=" << report.recon_files_found
                       << " recon_folders_found=" << report.recon_folders_found
                       << " recon_small_files_found=" << report.recon_small_files_found
                       << " recon_large_files_found=" << report.recon_large_files_found
                       << " recon_logical_size_bytes=" << report.recon_logical_size_bytes
+                      << " recon_small_logical_size_bytes=" << report.recon_small_logical_size_bytes
+                      << " recon_large_logical_size_bytes=" << report.recon_large_logical_size_bytes
                       << " recon_completed=" << (report.recon_completed ? "true" : "false")
                       << " bytes_per_second=" << report.bytes_per_second
                       << " gigabits_per_second=" << report.gigabits_per_second

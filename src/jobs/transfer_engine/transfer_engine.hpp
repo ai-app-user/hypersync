@@ -85,11 +85,15 @@ struct DataReadBenchmarkReport {
     std::size_t large_files_read = 0;
     std::uint64_t small_bytes_read = 0;
     std::uint64_t large_bytes_read = 0;
+    std::uint64_t small_logical_size_bytes = 0;
+    std::uint64_t large_logical_size_bytes = 0;
     std::size_t recon_files_found = 0;
     std::size_t recon_folders_found = 0;
     std::size_t recon_small_files_found = 0;
     std::size_t recon_large_files_found = 0;
     std::uint64_t recon_logical_size_bytes = 0;
+    std::uint64_t recon_small_logical_size_bytes = 0;
+    std::uint64_t recon_large_logical_size_bytes = 0;
     bool recon_completed = false;
     double bytes_per_second = 0.0;
     double gigabits_per_second = 0.0;
@@ -157,10 +161,13 @@ struct DataReadBenchmarkReport {
 struct SplitBucketPriorityInput {
     std::uint64_t small_total = 0;
     std::uint64_t large_total = 0;
+    std::uint64_t large_total_bytes = 0;
     std::uint64_t small_done = 0;
     std::uint64_t large_done = 0;
+    std::uint64_t large_done_bytes = 0;
     double small_files_per_second = 0.0;
     double large_files_per_second = 0.0;
+    double large_bytes_per_second = 0.0;
     std::size_t current_small_workers = 1;
     std::size_t current_large_workers = 1;
     std::size_t max_small_workers = 1;
