@@ -247,6 +247,17 @@ This morph is a queue-provider transition only: the worker still owns generic
 buffer handles, generic queues remain opaque, and callbacks must account bytes
 and files according to the route of the file actually supplied.
 
+Mixed small/large reads may enable the bucket-priority coordinator. The
+coordinator is not a bandwidth throttle. It samples bucket progress, computes
+rolling small-file and large-file rates over the last ten minutes, estimates
+remaining ETA for each bucket, and changes only queue selection priorities and
+active worker limits. If the small bucket has the longer ETA, large-reader
+workers may borrow a configured percentage of their provider pulls for the
+small reservoir while still falling back to large work whenever small work is
+not ready. If the large bucket has the longer ETA, the borrow percentage returns
+to zero and large readers stay on the large reservoir. The goal is equalized
+small/large ETA while keeping all useful data-reader capacity busy.
+
 The transport sender drains the small-file data queue first and drains the
 large-file queue only when the small queue is empty or below its configured low
 watermark. This gives small files maximum operation rate while allowing large

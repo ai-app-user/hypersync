@@ -1978,3 +1978,72 @@ Current 3-scanner test recommendation:
 --small-meta-reader-threads 96
 --large-meta-reader-threads 16
 ```
+
+ETA bucket-priority split read test, 2026-05-16/17
+-------------------------------------------------
+
+Purpose: verify live small/large bucket priority using rolling files/sec and
+ETA. The controller reports small and large rates, remaining work, ETA, active
+reader counts, and the percent of large-reader pulls temporarily borrowed for
+small-file work.
+
+Build/deploy:
+
+```text
+build host      transfer1
+deploy path     /mnt/local-nvme/wsync-codex/deployments/hypersync-linux-x86_64-transfer1-20260517T013315Z
+hypersync git   ad90875
+piper git       f1aecb4
+```
+
+Common settings:
+
+```text
+source                         nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5
+taskset                        0-79
+mode                           --background-recon-scan --bucket-priority
+small_file_threshold_bytes     131072
+small_meta_reader_threads      96
+large_meta_reader_threads      16
+recon_meta_reader_threads      1
+recon_metadata_async_depth     1
+recon_page_sleep_us            5000
+metadata_async_depth           256
+readdirplus_page_bytes         262144
+small_data_reader_threads      128
+large_data_reader_threads      64
+large_data_outstanding_requests 2
+small_file_async_window        1
+small_max_files_queued         5000000
+large_max_files_queued         50000
+data_buffer_slots              24576
+data_queue_depth               12288
+```
+
+Useful interval results:
+
+```text
+sample  total Gbit/s  small files/s  large files/s  large->small priority  queued small  queued large
+15s     149.0         50,361         1,487          57%                    4,203,282     50,000
+30s     164.0         55,198         1,220          48%                    4,246,464     50,000
+45s     175.1         50,469           845          36%                    4,705,216     50,000
+60s     180.9         47,995           634           0%                    4,095,936     50,000
+75s     184.2         46,428           519           0%                    4,578,880     50,000
+90s     186.5         45,421           433           0%                    0             0
+```
+
+Interpretation:
+
+- The controller reacted within the first 10 seconds. When small ETA was worse
+  than large ETA, `large_reader_small_priority_percent` rose to 57%, borrowing
+  large-reader capacity for the small reservoir.
+- As the rolling ETAs converged, the borrow percentage decayed back to zero,
+  restoring large-reader priority.
+- The run exposed both bucket rates in the normal stats line:
+  `small_files_per_second`, `large_files_per_second`,
+  `small_gigabits_per_second`, and `large_gigabits_per_second`.
+- The best interval sustained more than 55K small files/s while still pushing
+  large-file bandwidth. Total bandwidth reached 186.5 Gbit/s by the last useful
+  interval before the stop/tail phase.
+- Post-stop samples are not throughput evidence because the benchmark stop
+  timer clears queues. Use the last interval before stop.
