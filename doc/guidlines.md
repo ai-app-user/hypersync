@@ -214,6 +214,10 @@ Rules:
   user-facing progress totals must come from the overall scanner. Production
   scanner counters are reservoir-limited and may be useful diagnostics, but
   they must not be presented as whole-tree totals.
+- Overall/recon scan priority must be high enough at the beginning of a run to
+  establish whole-tree totals early. After the startup window, it should
+  automatically reduce active scanner workers so it does not permanently steal
+  bandwidth from data readers.
 - Large-file progress should include both logical capacity and file count, for
   example `L: 80.8T(5M files)/12% 168Gbit/s eta:56.2m`.
 - Generic job monitoring should report cumulative rate, recent/current rate,

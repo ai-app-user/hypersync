@@ -5960,12 +5960,19 @@ void scan_recon_metadata_worker(const std::string& source_root,
                                 FlatMetadataWorkQueue& folder_queue,
                                 ReconScanStats& recon_stats,
                                 std::uint64_t small_file_threshold,
-                                std::uint64_t page_sleep_us) {
+                                std::uint64_t page_sleep_us,
+                                ScannerCapacityControl* capacity_control = nullptr,
+                                std::size_t worker_index = 0) {
     auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
     try {
         backend->scan_flat_folders_streaming(
             std::max<std::size_t>(1, async_directory_depth),
-            [&folder_queue](bool wait_for_work) {
+            [&folder_queue, capacity_control, worker_index](bool wait_for_work) {
+                if (!wait_until_scanner_worker_active(worker_index, capacity_control, [&]() {
+                        return flat_metadata_scan_should_stop(folder_queue);
+                    })) {
+                    return std::optional<FileSpec> {};
+                }
                 return take_flat_folder_work(folder_queue, wait_for_work);
             },
             [&folder_queue] {
@@ -6426,8 +6433,13 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         std::max<std::size_t>(1, small_meta_reader_threads == 0U ? metadata_threads : small_meta_reader_threads);
     const std::size_t large_metadata_threads =
         std::max<std::size_t>(1, large_meta_reader_threads == 0U ? metadata_threads : large_meta_reader_threads);
+    const std::size_t hardware_threads =
+        std::max<std::size_t>(1, std::thread::hardware_concurrency());
     const std::size_t default_recon_metadata_threads =
-        bucket_priority_enabled ? small_metadata_threads : std::size_t {1};
+        bucket_priority_enabled
+            ? std::max<std::size_t>(small_metadata_threads,
+                                    std::min<std::size_t>(256U, hardware_threads * 2U))
+            : std::size_t {1};
     const std::size_t default_recon_async_depth =
         bucket_priority_enabled
             ? std::max<std::size_t>(1, meta_config.async_directory_depth)
@@ -6442,6 +6454,12 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
             1,
             recon_metadata_async_depth == 0U ? default_recon_async_depth
                                              : recon_metadata_async_depth);
+    const std::size_t recon_steady_metadata_threads =
+        bucket_priority_enabled
+            ? std::min<std::size_t>(
+                  recon_metadata_threads,
+                  std::max<std::size_t>(8U, hardware_threads / 5U))
+            : recon_metadata_threads;
     const std::size_t large_scanner_floor =
         bucket_priority_enabled && large_metadata_threads > 8U ? std::size_t {8} : std::size_t {1};
     const std::size_t scanner_shift_capacity =
@@ -6493,8 +6511,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
     std::atomic<std::uint32_t> large_reader_small_priority_percent {0};
     ScannerCapacityControl small_scanner_capacity;
     ScannerCapacityControl large_scanner_capacity;
+    ScannerCapacityControl recon_scanner_capacity;
     small_scanner_capacity.active_workers.store(small_metadata_threads, std::memory_order_relaxed);
     large_scanner_capacity.active_workers.store(large_metadata_threads, std::memory_order_relaxed);
+    recon_scanner_capacity.active_workers.store(recon_metadata_threads, std::memory_order_relaxed);
     auto make_morphing_large_file_provider =
         [](DataReadFileQueue& large_queue,
            DataReadFileQueue& small_queue,
@@ -6765,6 +6785,8 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
         bucket_priority_coordinator = std::thread([&]() {
             std::deque<PrioritySample> samples;
             const auto sample_window = std::chrono::minutes(1);
+            const auto recon_startup_window = std::chrono::minutes(2);
+            const auto coordinator_started_at = std::chrono::steady_clock::now();
             auto last_human_report = std::chrono::steady_clock::time_point {};
             while (!bucket_priority_stop.load(std::memory_order_relaxed)) {
                 const auto now = std::chrono::steady_clock::now();
@@ -6878,10 +6900,24 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                     set_scanner_active_workers(large_scanner_capacity,
                                                scanner_decision.large_scanners,
                                                large_metadata_worker_slots);
+                std::size_t recon_scanners = 0;
+                if (recon_scan_enabled) {
+                    const bool recon_startup =
+                        !snapshot.recon_completed &&
+                        (now - coordinator_started_at < recon_startup_window ||
+                         snapshot.recon_small_files_found < 100'000'000U);
+                    recon_scanners = set_scanner_active_workers(
+                        recon_scanner_capacity,
+                        recon_startup ? recon_metadata_threads : recon_steady_metadata_threads,
+                        recon_metadata_threads);
+                }
                 std::cerr << "bucket_priority small_workers=" << applied_small
                           << " large_workers=" << applied_large
                           << " small_scanners=" << small_scanners
                           << " large_scanners=" << large_scanners
+                          << " recon_scanners=" << recon_scanners
+                          << " recon_scanner_max=" << recon_metadata_threads
+                          << " recon_scanner_steady=" << recon_steady_metadata_threads
                           << " large_reader_small_priority_percent="
                           << decision.large_reader_small_priority_percent
                           << " small_eta_seconds=" << decision.small_eta_seconds
@@ -6944,6 +6980,7 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                               << " eta:" << compact_eta_duration(decision.large_eta_seconds)
                               << " , T: " << human_gbit_rate(total_byte_rate)
                               << " , ms:" << small_scanners << '/' << large_scanners
+                              << " , rs:" << recon_scanners << '/' << recon_metadata_threads
                               << " , src:" << displayed_totals.source
                               << " , ctrl:" << human_count(static_cast<double>(small_total))
                               << "/" << human_capacity(large_total_bytes)
@@ -7137,7 +7174,9 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                                            std::ref(recon_folder_queue),
                                            std::ref(recon_stats),
                                            file_queues.small_file_threshold,
-                                           recon_page_sleep_us);
+                                           recon_page_sleep_us,
+                                           &recon_scanner_capacity,
+                                           index);
             }
         }
     } else {
