@@ -140,6 +140,9 @@ SyntheticLatencyPercentiles approximate_latency_percentiles(
 }
 
 std::uint64_t scaled_count(std::uint64_t value, double scale) noexcept {
+    if (value == 0U) {
+        return 0;
+    }
     if (scale <= 0.0 || !std::isfinite(scale)) {
         return value;
     }

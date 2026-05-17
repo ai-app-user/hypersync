@@ -3904,6 +3904,27 @@ void test_main_cli_benchmark_synthetic_profile_smoke() {
                 profile_text.find("small_ratio=0.200") != std::string::npos);
 }
 
+void test_main_cli_benchmark_synthetic_replay_smoke() {
+    TempDir output("hypersync_cli_benchmark_synthetic_replay_output");
+
+    const std::string app = (fs::current_path() / "build" / "hypersync").string();
+    const fs::path profile_path = output.path / "synthetic_profile.txt";
+    const fs::path replay_stdout_path = output.path / "synthetic_replay_stdout.txt";
+
+    EXPECT_TRUE(command_succeeds(app + " benchmark-synthetic-profile --file-count 10000" +
+                                 " --block-file-count 1000 --output " +
+                                 profile_path.string() + " > /dev/null 2>&1"));
+    EXPECT_TRUE(command_succeeds(app + " benchmark-synthetic-replay --profile " +
+                                 profile_path.string() +
+                                 " --max-files 5000 --with-payload > " +
+                                 replay_stdout_path.string() + " 2>&1"));
+    const std::string replay_output = hypersync::read_file_contents(replay_stdout_path);
+    EXPECT_TRUE(replay_output.find("synthetic_replay_benchmark") != std::string::npos);
+    EXPECT_TRUE(replay_output.find("files=5000") != std::string::npos);
+    EXPECT_TRUE(replay_output.find("payload_views=5000") != std::string::npos);
+    EXPECT_TRUE(replay_output.find("files_per_second=") != std::string::npos);
+}
+
 void test_main_cli_benchmark_nfs_profile_smoke() {
     TempDir source("hypersync_cli_benchmark_nfs_profile_source");
     TempDir output("hypersync_cli_benchmark_nfs_profile_output");
@@ -4859,6 +4880,9 @@ int main(int argc, char** argv) {
         {"main_cli_benchmark_synthetic_profile_smoke",
          TestSuite::integration,
          test_main_cli_benchmark_synthetic_profile_smoke},
+        {"main_cli_benchmark_synthetic_replay_smoke",
+         TestSuite::integration,
+         test_main_cli_benchmark_synthetic_replay_smoke},
         {"main_cli_benchmark_nfs_profile_smoke",
          TestSuite::integration,
          test_main_cli_benchmark_nfs_profile_smoke},
