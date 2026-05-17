@@ -413,6 +413,59 @@ SplitBucketPriorityDecision choose_split_bucket_priority_workers_impl(
     return decision;
 }
 
+BucketPathOverloadScores evaluate_bucket_path_overload_impl(
+    const BucketPathOverloadInput& input) noexcept {
+    BucketPathOverloadScores scores;
+
+    if (std::isfinite(input.small_eta_seconds) &&
+        std::isfinite(input.large_eta_seconds) &&
+        input.small_eta_seconds > 0.0 &&
+        input.large_eta_seconds > 0.0) {
+        const double eta_ratio = input.small_eta_seconds / input.large_eta_seconds;
+        if (eta_ratio > 1.10) {
+            scores.small_score = std::max(scores.small_score, eta_ratio / 1.10);
+        }
+        if (eta_ratio < 0.90) {
+            scores.small_score = std::min(scores.small_score, std::max(0.25, eta_ratio / 0.90));
+        }
+    }
+
+    if (input.small_low_watermark_files > 0U &&
+        input.queued_small_files < input.small_low_watermark_files &&
+        input.small_low_watermark_intervals >= 3U) {
+        const double depletion =
+            1.0 +
+            static_cast<double>(input.small_low_watermark_files - input.queued_small_files) /
+                static_cast<double>(input.small_low_watermark_files);
+        scores.small_score = std::max(scores.small_score, depletion);
+    }
+
+    if (input.small_high_watermark_files > 0U &&
+        input.queued_small_files >= input.small_high_watermark_files &&
+        input.small_scanner_sleep_ratio > 0.50) {
+        scores.small_score = std::min(scores.small_score, 0.75);
+    }
+
+    if (input.large_queue_capacity_files > 0U &&
+        input.queued_large_files >= input.large_queue_capacity_files &&
+        input.total_gigabits_per_second > 0.0 &&
+        input.total_gigabits_per_second < input.large_overload_floor_gigabits_per_second) {
+        const double baseline = std::max(1.0, input.line_rate_gigabits_per_second);
+        scores.large_score = std::max(scores.large_score,
+                                      baseline / std::max(1.0, input.total_gigabits_per_second));
+    }
+
+    if (input.large_queue_capacity_files > 0U &&
+        input.queued_large_files < input.large_queue_capacity_files / 5U &&
+        input.large_gigabits_per_second >= input.line_rate_gigabits_per_second * 0.80) {
+        scores.large_score = std::min(scores.large_score, 0.80);
+    }
+
+    scores.small_score = std::clamp(scores.small_score, 0.25, 4.0);
+    scores.large_score = std::clamp(scores.large_score, 0.25, 4.0);
+    return scores;
+}
+
 std::string metadata_part_suffix(std::size_t index) {
     std::ostringstream out;
     out << std::setw(5) << std::setfill('0') << index;
@@ -6788,6 +6841,40 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
             const auto recon_startup_window = std::chrono::minutes(2);
             const auto coordinator_started_at = std::chrono::steady_clock::now();
             auto last_human_report = std::chrono::steady_clock::time_point {};
+            std::uint64_t small_low_watermark_intervals = 0;
+
+            AutoScalePolicy small_lane_policy;
+            small_lane_policy.enabled = true;
+            small_lane_policy.min_workers =
+                std::max<std::size_t>(1, std::min<std::size_t>(96, small_reader_job.worker_count()));
+            small_lane_policy.max_workers = std::max(small_lane_policy.min_workers,
+                                                     small_reader_job.worker_count());
+            small_lane_policy.initial_workers =
+                std::clamp<std::size_t>(small_reader_job.active_worker_limit(),
+                                        small_lane_policy.min_workers,
+                                        small_lane_policy.max_workers);
+            small_lane_policy.cooldown_samples = 1;
+            small_lane_policy.max_cooldown_samples = 5;
+            small_lane_policy.initial_probe_step_ratio = 0.125;
+            small_lane_policy.min_probe_step_ratio = 0.125;
+
+            AutoScalePolicy large_lane_policy;
+            large_lane_policy.enabled = true;
+            large_lane_policy.min_workers = 1;
+            large_lane_policy.max_workers = std::max<std::size_t>(1, large_reader_job.worker_count());
+            large_lane_policy.initial_workers =
+                std::clamp<std::size_t>(large_reader_job.active_worker_limit(),
+                                        large_lane_policy.min_workers,
+                                        large_lane_policy.max_workers);
+            large_lane_policy.cooldown_samples = 1;
+            large_lane_policy.max_cooldown_samples = 5;
+            large_lane_policy.initial_probe_step_ratio = 0.125;
+            large_lane_policy.min_probe_step_ratio = 0.125;
+
+            AutoScaler small_lane_scaler(small_lane_policy);
+            AutoScaler large_lane_scaler(large_lane_policy);
+            small_reader_job.set_active_worker_limit(small_lane_scaler.active_workers());
+            large_reader_job.set_active_worker_limit(large_lane_scaler.active_workers());
             while (!bucket_priority_stop.load(std::memory_order_relaxed)) {
                 const auto now = std::chrono::steady_clock::now();
                 const DataReadBenchmarkSnapshot snapshot =
@@ -6880,10 +6967,55 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                 input.max_large_workers = large_reader_job.worker_count();
                 const SplitBucketPriorityDecision decision =
                     choose_split_bucket_priority_workers_impl(input);
+
+                if (queued_small < file_queues.small.resume_entries) {
+                    ++small_low_watermark_intervals;
+                } else {
+                    small_low_watermark_intervals = 0;
+                }
+
+                BucketPathOverloadInput overload_input;
+                overload_input.small_eta_seconds = decision.small_eta_seconds;
+                overload_input.large_eta_seconds = decision.large_eta_seconds;
+                overload_input.queued_small_files = queued_small;
+                overload_input.small_low_watermark_files = file_queues.small.resume_entries;
+                overload_input.small_high_watermark_files = file_queues.small.max_entries;
+                overload_input.small_low_watermark_intervals = small_low_watermark_intervals;
+                overload_input.small_scanner_sleep_ratio =
+                    queued_small >= file_queues.small.max_entries ? 1.0 : 0.0;
+                overload_input.queued_large_files = queued_large;
+                overload_input.large_queue_capacity_files = file_queues.large.max_entries;
+                overload_input.total_gigabits_per_second = total_byte_rate * 8.0 / 1'000'000'000.0;
+                overload_input.large_gigabits_per_second = large_byte_rate * 8.0 / 1'000'000'000.0;
+                const BucketPathOverloadScores overload_scores =
+                    evaluate_bucket_path_overload_impl(overload_input);
+
+                AutoScaleMetrics small_lane_metrics;
+                small_lane_metrics.input_fullness =
+                    static_cast<double>(queued_small) /
+                    static_cast<double>(std::max<std::size_t>(1, file_queues.small.max_entries));
+                small_lane_metrics.input_available_ratio = small_lane_metrics.input_fullness;
+                small_lane_metrics.busy_ratio = queued_small == 0U ? 0.0 : 1.0;
+                small_lane_metrics.throughput_per_second = small_rate;
+                small_lane_metrics.overload_score = overload_scores.small_score;
+
+                AutoScaleMetrics large_lane_metrics;
+                large_lane_metrics.input_fullness =
+                    static_cast<double>(queued_large) /
+                    static_cast<double>(std::max<std::size_t>(1, file_queues.large.max_entries));
+                large_lane_metrics.input_available_ratio = large_lane_metrics.input_fullness;
+                large_lane_metrics.busy_ratio = queued_large == 0U ? 0.0 : 1.0;
+                large_lane_metrics.throughput_per_second = large_byte_rate;
+                large_lane_metrics.overload_score = overload_scores.large_score;
+
+                const AutoScaleDecision small_lane_decision =
+                    small_lane_scaler.update(small_lane_metrics);
+                const AutoScaleDecision large_lane_decision =
+                    large_lane_scaler.update(large_lane_metrics);
                 const std::size_t applied_small =
-                    small_reader_job.set_active_worker_limit(decision.small_workers);
+                    small_reader_job.set_active_worker_limit(small_lane_decision.active_workers);
                 const std::size_t applied_large =
-                    large_reader_job.set_active_worker_limit(decision.large_workers);
+                    large_reader_job.set_active_worker_limit(large_lane_decision.active_workers);
                 large_reader_small_priority_percent.store(
                     decision.large_reader_small_priority_percent,
                     std::memory_order_relaxed);
@@ -6920,6 +7052,10 @@ DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderC
                           << " recon_scanner_steady=" << recon_steady_metadata_threads
                           << " large_reader_small_priority_percent="
                           << decision.large_reader_small_priority_percent
+                          << " small_overload_score=" << overload_scores.small_score
+                          << " large_overload_score=" << overload_scores.large_score
+                          << " small_autoscale_reason=" << small_lane_decision.reason
+                          << " large_autoscale_reason=" << large_lane_decision.reason
                           << " small_eta_seconds=" << decision.small_eta_seconds
                           << " large_eta_seconds=" << decision.large_eta_seconds
                           << " small_rate_files_per_second=" << small_rate
@@ -9249,6 +9385,11 @@ SplitScannerCapacityDecision choose_split_scanner_capacity(
                                               base_large_scanners,
                                               large_scanner_floor,
                                               large_reader_small_priority_percent);
+}
+
+BucketPathOverloadScores evaluate_bucket_path_overload(
+    const BucketPathOverloadInput& input) noexcept {
+    return evaluate_bucket_path_overload_impl(input);
 }
 
 SenderRuntimeConfig::SenderRuntimeConfig()

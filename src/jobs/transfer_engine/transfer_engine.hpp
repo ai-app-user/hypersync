@@ -185,6 +185,30 @@ struct SplitBucketPriorityDecision {
 [[nodiscard]] SplitBucketPriorityDecision choose_split_bucket_priority_workers(
     const SplitBucketPriorityInput& input) noexcept;
 
+struct BucketPathOverloadInput {
+    double small_eta_seconds = 0.0;
+    double large_eta_seconds = 0.0;
+    std::size_t queued_small_files = 0;
+    std::size_t small_low_watermark_files = 0;
+    std::size_t small_high_watermark_files = 0;
+    std::uint64_t small_low_watermark_intervals = 0;
+    double small_scanner_sleep_ratio = 0.0;
+    std::size_t queued_large_files = 0;
+    std::size_t large_queue_capacity_files = 0;
+    double total_gigabits_per_second = 0.0;
+    double large_gigabits_per_second = 0.0;
+    double line_rate_gigabits_per_second = 196.0;
+    double large_overload_floor_gigabits_per_second = 130.0;
+};
+
+struct BucketPathOverloadScores {
+    double small_score = 1.0;
+    double large_score = 1.0;
+};
+
+[[nodiscard]] BucketPathOverloadScores evaluate_bucket_path_overload(
+    const BucketPathOverloadInput& input) noexcept;
+
 struct SplitScannerCapacityDecision {
     std::size_t small_scanners = 1;
     std::size_t large_scanners = 1;

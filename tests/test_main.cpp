@@ -83,6 +83,8 @@ using hypersync::RecBuf;
 using hypersync::ScanIndex;
 using hypersync::SplitBucketPriorityDecision;
 using hypersync::SplitBucketPriorityInput;
+using hypersync::BucketPathOverloadInput;
+using hypersync::BucketPathOverloadScores;
 using hypersync::SplitScannerCapacityDecision;
 using hypersync::ScanWriter;
 using hypersync::SpscRing;
@@ -92,6 +94,7 @@ using hypersync::kDataBufferPoolId;
 using hypersync::kMetadataBufferPoolId;
 using hypersync::choose_split_bucket_priority_workers;
 using hypersync::choose_split_scanner_capacity;
+using hypersync::evaluate_bucket_path_overload;
 
 namespace {
 
@@ -708,6 +711,30 @@ void test_autoscaler_recommends_cooperative_worker_limits() {
     runner.stop();
     EXPECT_TRUE(callback_seen.load(std::memory_order_acquire));
     EXPECT_TRUE(discarder.active_worker_limit() > 2U);
+
+    AutoScalePolicy overload_policy;
+    overload_policy.enabled = true;
+    overload_policy.min_workers = 4;
+    overload_policy.max_workers = 32;
+    overload_policy.initial_workers = 8;
+    overload_policy.cooldown_samples = 1;
+    overload_policy.max_cooldown_samples = 1;
+    overload_policy.initial_probe_step_ratio = 0.5;
+    overload_policy.min_probe_step_ratio = 0.5;
+    AutoScaler overload_scaler(overload_policy);
+    AutoScaleMetrics overload_metrics;
+    overload_metrics.overload_score = 1.50;
+    overload_metrics.output_fullness = 0.0;
+    decision = overload_scaler.update(overload_metrics);
+    EXPECT_TRUE(decision.changed);
+    EXPECT_EQ(decision.active_workers, 12U);
+    EXPECT_TRUE(std::string(decision.reason) == "overload_pressure");
+
+    overload_metrics.overload_score = 0.50;
+    decision = overload_scaler.update(overload_metrics);
+    EXPECT_TRUE(decision.changed);
+    EXPECT_EQ(decision.active_workers, 6U);
+    EXPECT_TRUE(std::string(decision.reason) == "overload_underload");
 }
 
 void test_pipeline_autoscaler_tunes_one_stage_then_advances() {
@@ -861,6 +888,35 @@ void test_split_scanner_capacity_follows_reader_borrowing() {
     decision = choose_split_scanner_capacity(96, 6, 8, 75);
     EXPECT_EQ(decision.small_scanners, 96U);
     EXPECT_EQ(decision.large_scanners, 6U);
+}
+
+void test_bucket_path_overload_scores_reflect_eta_reservoir_and_wire_pressure() {
+    BucketPathOverloadInput input;
+    input.small_eta_seconds = 1'200.0;
+    input.large_eta_seconds = 900.0;
+    input.queued_small_files = 3'500'000;
+    input.small_low_watermark_files = 4'000'000;
+    input.small_high_watermark_files = 5'000'000;
+    input.small_low_watermark_intervals = 3;
+    input.queued_large_files = 50'000;
+    input.large_queue_capacity_files = 50'000;
+    input.total_gigabits_per_second = 120.0;
+    input.large_gigabits_per_second = 110.0;
+    BucketPathOverloadScores scores = evaluate_bucket_path_overload(input);
+    EXPECT_TRUE(scores.small_score > 1.0);
+    EXPECT_TRUE(scores.large_score > 1.0);
+
+    input.small_eta_seconds = 800.0;
+    input.large_eta_seconds = 1'200.0;
+    input.queued_small_files = 5'000'000;
+    input.small_low_watermark_intervals = 0;
+    input.small_scanner_sleep_ratio = 0.75;
+    input.queued_large_files = 1'000;
+    input.total_gigabits_per_second = 196.0;
+    input.large_gigabits_per_second = 180.0;
+    scores = evaluate_bucket_path_overload(input);
+    EXPECT_TRUE(scores.small_score < 1.0);
+    EXPECT_TRUE(scores.large_score < 1.0);
 }
 
 void test_autoscale_profile_store_defaults_and_persists_learned_workers() {
@@ -4463,6 +4519,9 @@ int main(int argc, char** argv) {
         {"split_scanner_capacity_follows_reader_borrowing",
          TestSuite::unit,
          test_split_scanner_capacity_follows_reader_borrowing},
+        {"bucket_path_overload_scores_reflect_eta_reservoir_and_wire_pressure",
+         TestSuite::unit,
+         test_bucket_path_overload_scores_reflect_eta_reservoir_and_wire_pressure},
         {"autoscale_profile_store_defaults_and_persists_learned_workers",
          TestSuite::unit,
          test_autoscale_profile_store_defaults_and_persists_learned_workers},
