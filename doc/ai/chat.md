@@ -389,3 +389,15 @@ fields. The sparse run recorded `3` small-file read samples and `1` large-file
 read sample, all with `0` failures, while preserving fast metadata performance.
 Archived the resulting profile and timing file under `hypersync/doc/profiles/`
 so they can be tracked by git.
+
+## 2026-05-17 13:57 PDT
+
+**User:** great, now how can I try scan using generator with this profile to see
+if it works
+
+**Codex:** Added a real `benchmark-synthetic-replay --profile <profile.txt>`
+CLI because the replay cursor existed but was not exposed for saved profiles.
+Also fixed replay of empty profile phases so the zero-filled tail phases from
+the 100-phase profile do not emit bogus records. Added a focused integration
+test and deployed to transfer1. Transfer1 release replayed `10M` synthetic file
+records from the archived NFS profile in `1.03s` at `9.69M files/s`.

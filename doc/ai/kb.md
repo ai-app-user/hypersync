@@ -1078,3 +1078,19 @@ logical size: 335.99 TB
   - Archived in git under:
     `doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt`
     and matching `.time.txt`.
+
+## Synthetic Replay From Saved Profiles
+
+- 2026-05-17 13:57 PDT:
+  - Added `benchmark-synthetic-replay --profile <profile.txt>` on
+    `hypersync/dev` commit `22928cc`.
+  - The command loads the compact profiler text, feeds `SyntheticReplayCursor`,
+    and reports generated file/byte counts and files/sec. It skips empty phases
+    correctly.
+  - Useful smoke command:
+    `./build/release/hypersync benchmark-synthetic-replay --profile hypersync/doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt --max-files 10000000 --stats-interval-seconds 1`
+  - Transfer1 release smoke after deploy:
+    `10M` synthetic file records in `1.03175s`, `9.69M files/s`, with profile
+    mix `2.17M` small and `7.83M` large files.
+  - Optional `--with-payload` touches preallocated payload views; it does not
+    allocate or read storage.
