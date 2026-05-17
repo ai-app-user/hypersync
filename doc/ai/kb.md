@@ -897,19 +897,22 @@ logical size: 335.99 TB
   accumulates fixed chronological phase histograms. It does not store per-file
   records or raw NFS handles.
 - Transfer1 run:
-  - Run dir:
-    `/mnt/local-nvme/wsync-codex/nfs-profile-100m-10phase-20260517T180034Z`
+  - Optimized run dir:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-100m-10phase-optimized-20260517T181351Z`
   - Source:
     `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
   - Command settings:
     `--max-records 100000000 --phase-count 10 --meta-reader-threads 96 --metadata-async-depth 256 --readdirplus-page-bytes 262144`
-  - Result: `100,000,000` file records in `81.076s`,
-    `1.233M files/s`, max RSS `8,582,080 KB`.
-  - Observed: `5,585,721` folders, `7` failed folders,
-    `54,756,155` small files, `45,243,845` large files,
-    logical size `661,381,123,540,554` bytes.
+  - Initial implementation result: `100,000,000` file records in `81.076s`,
+    `1.233M files/s`; root cause was a global mutex taken for every file
+    classification.
+  - Optimized result: `100,000,000` file records in `18.545s`,
+    `5.392M files/s`, max RSS `6,832,316 KB`.
+  - Optimized observed: `786,201` folders, `8` failed folders,
+    `46,111,232` small files, `53,888,768` large files,
+    logical size `604,301,484,901,990` bytes.
   - Phase small ratios:
-    `0.014, 0.127, 0.448, 0.612, 0.754, 0.749, 0.689, 0.689, 0.724, 0.670`.
+    `0.036, 0.068, 0.201, 0.436, 0.540, 0.481, 0.522, 0.719, 0.805, 0.802`.
 - Verification:
   - `make integration-test`: `21/21` passed after adding
     `main_cli_benchmark_nfs_profile_smoke`.

@@ -285,3 +285,13 @@ Result: `100M` file records in `81.076s` (`1.23M files/s`), `5.59M` folders
 observed, `7` failed folders, `54.76M` small files, `45.24M` large files, and
 10 chronological phase slices. Added an integration smoke test and recorded the
 run in `hypersync/doc/performance.md`.
+
+**User:** did we regress on performance? it used to be 7M/s, given it was just a scanner, but it shouldn't be much different
+
+**Codex:** Confirmed the initial real-NFS profiler had a regression caused by
+a global mutex around per-file classification. Reworked the profiler so workers
+atomically reserve file-index ranges, accumulate local per-batch/per-phase
+counters, and only lock once per touched phase to merge compact totals. Reran
+the same 100M/10-phase profile on transfer1: throughput improved from
+`1.23M files/s` to `5.39M files/s` (`18.545s` elapsed). Updated performance
+and AI context docs.

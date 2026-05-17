@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -181,6 +182,24 @@ struct FixedPhaseAccumulator {
     std::uint64_t depth_sum = 0;
 };
 
+void merge_fixed_phase_accumulator(FixedPhaseAccumulator& target,
+                                   const FixedPhaseAccumulator& source) noexcept {
+    target.file_count += source.file_count;
+    target.folder_count += source.folder_count;
+    target.logical_size_bytes += source.logical_size_bytes;
+    target.small_file_count += source.small_file_count;
+    target.large_file_count += source.large_file_count;
+    target.filename_length_sum += source.filename_length_sum;
+    target.depth_sum += source.depth_sum;
+    for (std::size_t index = 0; index < target.size_file_counts.size(); ++index) {
+        target.size_file_counts[index] += source.size_file_counts[index];
+        target.size_logical_bytes[index] += source.size_logical_bytes[index];
+    }
+    for (std::size_t index = 0; index < target.folder_fanout_counts.size(); ++index) {
+        target.folder_fanout_counts[index] += source.folder_fanout_counts[index];
+    }
+}
+
 std::uint16_t profile_path_depth(std::string_view path) noexcept {
     if (path.empty()) {
         return 0;
@@ -333,18 +352,18 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                                             std::uint64_t small_threshold) {
     NfsProfileWorkQueue queue;
     queue.folders.push_back(hypersync::FileSpec {});
-    std::mutex profile_mutex;
     std::vector<FixedPhaseAccumulator> accumulators(std::max<std::size_t>(1U, phase_count));
-    std::uint64_t files_observed = 0;
-    std::uint64_t folders_observed = 1;
-    std::uint64_t failed_folders = 0;
+    std::vector<std::mutex> accumulator_mutexes(accumulators.size());
+    std::atomic<std::uint64_t> files_reserved {0};
+    std::atomic<std::uint64_t> files_recorded {0};
+    std::atomic<std::uint64_t> folders_observed {1};
+    std::atomic<std::uint64_t> failed_folders {0};
     const std::uint64_t records_per_phase =
         std::max<std::uint64_t>(1U, (max_records + accumulators.size() - 1U) / accumulators.size());
     const auto started = std::chrono::steady_clock::now();
 
     const auto should_stop = [&]() {
-        std::lock_guard<std::mutex> lock(profile_mutex);
-        return files_observed >= max_records;
+        return files_reserved.load(std::memory_order_acquire) >= max_records;
     };
 
     std::vector<std::thread> workers;
@@ -366,10 +385,7 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                     },
                     [&](hypersync::FlatFolderScanBatch batch) {
                         if (batch.failed) {
-                            {
-                                std::lock_guard<std::mutex> lock(profile_mutex);
-                                ++failed_folders;
-                            }
+                            failed_folders.fetch_add(1U, std::memory_order_relaxed);
                             finish_nfs_profile_folder_work(queue);
                             return;
                         }
@@ -382,28 +398,42 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
                             }
                         }
 
-                        {
-                            std::lock_guard<std::mutex> lock(profile_mutex);
-                            const std::uint64_t folder_file_count = batch.files.size();
-                            for (const auto& file : batch.files) {
-                                if (files_observed >= max_records) {
-                                    break;
-                                }
-                                const std::size_t phase_index = std::min<std::size_t>(
-                                    accumulators.size() - 1U,
-                                    static_cast<std::size_t>(files_observed / records_per_phase));
-                                add_file_to_fixed_phase(accumulators[phase_index],
-                                                        file,
-                                                        small_threshold,
-                                                        folder_file_count);
-                                ++files_observed;
-                            }
+                        const std::uint64_t batch_file_count = batch.files.size();
+                        const std::uint64_t start_index =
+                            files_reserved.fetch_add(batch_file_count, std::memory_order_acq_rel);
+                        const std::uint64_t accepted_file_count =
+                            start_index >= max_records
+                                ? 0U
+                                : std::min<std::uint64_t>(batch_file_count, max_records - start_index);
+
+                        std::vector<FixedPhaseAccumulator> local(accumulators.size());
+                        const std::uint64_t folder_file_count = batch.files.size();
+                        for (std::uint64_t offset = 0; offset < accepted_file_count; ++offset) {
+                            const std::uint64_t global_index = start_index + offset;
+                            const std::size_t phase_index = std::min<std::size_t>(
+                                accumulators.size() - 1U,
+                                static_cast<std::size_t>(global_index / records_per_phase));
+                            add_file_to_fixed_phase(local[phase_index],
+                                                    batch.files[static_cast<std::size_t>(offset)],
+                                                    small_threshold,
+                                                    folder_file_count);
+                        }
+                        if (accepted_file_count != 0U) {
                             const std::size_t folder_phase_index = std::min<std::size_t>(
                                 accumulators.size() - 1U,
-                                static_cast<std::size_t>(std::min(files_observed, max_records - 1U) /
-                                                         records_per_phase));
-                            accumulators[folder_phase_index].folder_count += 1U + batch.directories.size();
-                            folders_observed += 1U + batch.directories.size();
+                                static_cast<std::size_t>(start_index / records_per_phase));
+                            local[folder_phase_index].folder_count += 1U + batch.directories.size();
+                            folders_observed.fetch_add(1U + batch.directories.size(),
+                                                       std::memory_order_relaxed);
+                            files_recorded.fetch_add(accepted_file_count, std::memory_order_relaxed);
+                        }
+                        for (std::size_t phase_index = 0; phase_index < local.size(); ++phase_index) {
+                            if (local[phase_index].file_count == 0U &&
+                                local[phase_index].folder_count == 0U) {
+                                continue;
+                            }
+                            std::lock_guard<std::mutex> lock(accumulator_mutexes[phase_index]);
+                            merge_fixed_phase_accumulator(accumulators[phase_index], local[phase_index]);
                         }
 
                         if (should_stop()) {
@@ -430,9 +460,9 @@ NfsProfileCaptureResult capture_nfs_profile(const std::filesystem::path& source_
 
     NfsProfileCaptureResult result;
     result.profile = make_fixed_phase_profile(accumulators, small_threshold);
-    result.files_observed = files_observed;
-    result.folders_observed = folders_observed;
-    result.failed_folders = failed_folders;
+    result.files_observed = files_recorded.load(std::memory_order_relaxed);
+    result.folders_observed = folders_observed.load(std::memory_order_relaxed);
+    result.failed_folders = failed_folders.load(std::memory_order_relaxed);
     result.elapsed_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;

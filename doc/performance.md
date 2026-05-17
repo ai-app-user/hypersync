@@ -2113,7 +2113,7 @@ Command, run on transfer1:
   --meta-reader-threads 96 \
   --metadata-async-depth 256 \
   --readdirplus-page-bytes 262144 \
-  --output /mnt/local-nvme/wsync-codex/nfs-profile-100m-10phase-20260517T180034Z/profile.txt
+  --output /mnt/local-nvme/wsync-codex/nfs-profile-100m-10phase-optimized-20260517T181351Z/profile.txt
 ```
 
 Result:
@@ -2121,34 +2121,38 @@ Result:
 ```text
 files_observed      100,000,000
 folders_observed    5,585,721
-failed_folders      7
-elapsed_s           81.076
-files_per_second    1,233,417.406
-max_rss_kb          8,582,080
+failed_folders      8
+elapsed_s           18.545
+files_per_second    5,392,395.068
+max_rss_kb          6,832,316
 phases              10
-small_files         54,756,155
-large_files         45,243,845
-logical_size        661,381,123,540,554 bytes
+small_files         46,111,232
+large_files         53,888,768
+logical_size        604,301,484,901,990 bytes
 ```
 
 Phase small-file ratios:
 
 ```text
-phase 0  0.014
-phase 1  0.127
-phase 2  0.448
-phase 3  0.612
-phase 4  0.754
-phase 5  0.749
-phase 6  0.689
-phase 7  0.689
-phase 8  0.724
-phase 9  0.670
+phase 0  0.036
+phase 1  0.068
+phase 2  0.201
+phase 3  0.436
+phase 4  0.540
+phase 5  0.481
+phase 6  0.522
+phase 7  0.719
+phase 8  0.805
+phase 9  0.802
 ```
 
 Interpretation:
 
 - This run used direct libnfs through the existing `scan_flat_folders()` path.
+- Initial implementation measured only `1.23M files/s` because the profiler
+  took a global mutex while classifying every file. The optimized version
+  reserves file-index ranges atomically, accumulates per-batch/per-phase local
+  counters, and only locks to merge compact phase totals.
 - The profiler stored aggregate counters/histograms only, not the 100M file
   records or raw handles.
 - Memory is dominated by concurrent libnfs metadata scanning state and in-flight
