@@ -2078,6 +2078,18 @@ void generic_nfs_callback(int status, struct nfs_context* nfs, void* data, void*
     }
 }
 
+void generic_rpc_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
+    (void)rpc;
+    auto* state = static_cast<AsyncCommandState*>(private_data);
+    state->done = true;
+    state->status = status;
+    state->data = data;
+    record_async_command_completed(state->kind, state->queued_at, status);
+    if (status < 0 && data != nullptr) {
+        state->error = static_cast<const char*>(data);
+    }
+}
+
 void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
     (void)rpc;
     const auto callback_started_at = std::chrono::steady_clock::now();
@@ -5317,11 +5329,9 @@ private:
         }
 
         void fill_window() {
-            constexpr std::size_t kMaxQueueBatch = 32U;
             const std::size_t max_active =
                 std::max<std::size_t>(1U, fleet_.options_.max_concurrent_file_transactions);
-            std::size_t queued_this_pass = 0;
-            while (!backlog_.empty() && active_.size() < max_active && queued_this_pass < kMaxQueueBatch) {
+            while (!backlog_.empty() && active_.size() < max_active) {
                 std::shared_ptr<FileTransaction> transaction = std::move(backlog_.front());
                 backlog_.pop_front();
                 if (fleet_.options_.ensure_parent_directories) {
@@ -5329,7 +5339,6 @@ private:
                 }
                 queue_create(*transaction);
                 active_.push_back(std::move(transaction));
-                ++queued_this_pass;
             }
         }
 
@@ -5353,15 +5362,34 @@ private:
             transaction.phase = FileTransaction::Phase::writing;
             transaction.write_state = {};
             transaction.write_state.queued_at = std::chrono::steady_clock::now();
-            const int queue_result = nfs_pwrite_async(session_.context(),
-                                                      transaction.handle,
-                                                      transaction.offset,
-                                                      transaction.data.size(),
-                                                      transaction.data.data(),
-                                                      generic_nfs_callback,
-                                                      &transaction.write_state);
+            int queue_result = 0;
+            if (fleet_.options_.stable_small_file_writes) {
+                auto* rpc = nfs_get_rpc_context(session_.context());
+                auto* raw_handle = reinterpret_cast<struct nfs_fh3*>(nfs_get_fh(transaction.handle));
+                if (rpc == nullptr || raw_handle == nullptr) {
+                    throw std::runtime_error("nfs raw stable write handle is unavailable");
+                }
+                queue_result = rpc_nfs_write_async(rpc,
+                                                   generic_rpc_callback,
+                                                   raw_handle,
+                                                   const_cast<char*>(transaction.data.data()),
+                                                   transaction.offset,
+                                                   transaction.data.size(),
+                                                   FILE_SYNC,
+                                                   &transaction.write_state);
+            } else {
+                queue_result = nfs_pwrite_async(session_.context(),
+                                                transaction.handle,
+                                                transaction.offset,
+                                                transaction.data.size(),
+                                                transaction.data.data(),
+                                                generic_nfs_callback,
+                                                &transaction.write_state);
+            }
             if (queue_result != 0) {
-                throw std::runtime_error("nfs_pwrite_async queue failed: " +
+                throw std::runtime_error(std::string(fleet_.options_.stable_small_file_writes
+                                                         ? "rpc_nfs_write_async queue failed: "
+                                                         : "nfs_pwrite_async queue failed: ") +
                                          std::string(nfs_get_error(session_.context())));
             }
         }
@@ -5409,11 +5437,28 @@ private:
                         }
                     }
                     if (transaction.phase == FileTransaction::Phase::writing && transaction.write_state.done) {
-                        if (transaction.write_state.status < 0) {
-                            throw std::runtime_error("nfs_pwrite_async failed: " + transaction.write_state.error);
-                        }
-                        if (transaction.write_state.status != static_cast<int>(transaction.data.size())) {
-                            throw std::runtime_error("nfs_pwrite_async short write");
+                        if (fleet_.options_.stable_small_file_writes) {
+                            if (transaction.write_state.status != RPC_STATUS_SUCCESS) {
+                                throw std::runtime_error("rpc_nfs_write_async failed: " + transaction.write_state.error);
+                            }
+                            auto* result = static_cast<WRITE3res*>(transaction.write_state.data);
+                            if (result == nullptr) {
+                                throw std::runtime_error("rpc_nfs_write_async completed without a WRITE3 result");
+                            }
+                            if (result->status != NFS3_OK) {
+                                throw std::runtime_error("rpc_nfs_write_async returned NFS error " +
+                                                         std::to_string(static_cast<int>(result->status)));
+                            }
+                            if (result->WRITE3res_u.resok.count != transaction.data.size()) {
+                                throw std::runtime_error("rpc_nfs_write_async short write");
+                            }
+                        } else {
+                            if (transaction.write_state.status < 0) {
+                                throw std::runtime_error("nfs_pwrite_async failed: " + transaction.write_state.error);
+                            }
+                            if (transaction.write_state.status != static_cast<int>(transaction.data.size())) {
+                                throw std::runtime_error("nfs_pwrite_async short write");
+                            }
                         }
                         if (fleet_.options_.fsync_on_finish) {
                             queue_sync(transaction);
@@ -5630,12 +5675,14 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
         bool preserve_metadata = true;
         bool fsync_on_finish = true;
         bool ensure_parent_directories = true;
+        bool stable_small_file_writes = false;
         std::size_t max_concurrent_file_transactions = 64;
 
         [[nodiscard]] std::string string() const {
             std::ostringstream out;
             out << root_url << "|pm=" << preserve_metadata << "|fs=" << fsync_on_finish
-                << "|ep=" << ensure_parent_directories << "|fw=" << max_concurrent_file_transactions;
+                << "|ep=" << ensure_parent_directories << "|sw=" << stable_small_file_writes
+                << "|fw=" << max_concurrent_file_transactions;
             return out.str();
         }
     };
@@ -5648,6 +5695,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
     key.preserve_metadata = options.preserve_metadata;
     key.fsync_on_finish = options.fsync_on_finish;
     key.ensure_parent_directories = options.ensure_parent_directories;
+    key.stable_small_file_writes = options.stable_small_file_writes;
     key.max_concurrent_file_transactions = options.max_concurrent_file_transactions;
     const std::string key_text = key.string();
 
