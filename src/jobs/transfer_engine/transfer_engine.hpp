@@ -160,6 +160,14 @@ struct DataReadBenchmarkReport {
     std::uint64_t async_close_failed = 0;
     double async_close_avg_latency_ms = 0.0;
     double async_close_max_latency_ms = 0.0;
+    std::size_t files_written = 0;
+    std::size_t write_failed = 0;
+    std::uint64_t bytes_written = 0;
+    std::size_t data_writer_threads = 0;
+    std::size_t data_queue_shards = 0;
+    std::size_t data_queue_capacity = 0;
+    std::size_t data_queue_high_watermark = 0;
+    std::string target_root;
 };
 
 struct SplitBucketPriorityInput {
@@ -476,6 +484,25 @@ public:
                                                                        double max_duration_seconds = 0.0,
                                                                        std::uint32_t stats_interval_seconds = 5,
                                                                        const std::filesystem::path& status_socket_path = {}) const;
+    [[nodiscard]] DataReadBenchmarkReport benchmark_data_write_pipeline(const std::filesystem::path& source_root,
+                                                                        const std::string& target_root,
+                                                                        bool recursive = true,
+                                                                        std::size_t meta_reader_threads = 0,
+                                                                        std::size_t metadata_async_depth = 0,
+                                                                        std::size_t readdirplus_page_bytes = 0,
+                                                                        std::size_t data_reader_threads = 0,
+                                                                        std::size_t data_writer_threads = 0,
+                                                                        std::size_t data_outstanding_requests = 0,
+                                                                        std::size_t small_file_async_window = 0,
+                                                                        std::uint64_t max_file_size_bytes = 0,
+                                                                        std::size_t max_files_queued = 1024,
+                                                                        std::size_t data_buffer_slots = 0,
+                                                                        std::size_t data_queue_depth = 0,
+                                                                        const std::string& data_copy_mode = {},
+                                                                        bool pack_small_files = false,
+                                                                        double max_duration_seconds = 0.0,
+                                                                        std::uint32_t stats_interval_seconds = 5,
+                                                                        bool verify_hash = false) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
                                                                       bool recursive = true,
                                                                       std::size_t meta_reader_threads = 0,

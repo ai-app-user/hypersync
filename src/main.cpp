@@ -1075,6 +1075,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes|transport-discard|route-discard|sharded-discard] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-data-write --source <dir|nfs-url|synthetic-profile-url> --target <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-writer-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <per-shard>] [--data-copy-mode copy|no-copy] [--verify-hash] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-replay --profile <profile.txt> [--max-files <n>] [--file-count-scale <n>] [--data-size-scale <n>] [--latency-emulation] [--with-payload] [--stats-interval-seconds <n>]\n"
@@ -2894,6 +2895,162 @@ int main(int argc, char** argv) {
                       << " async_close_failed=" << report.async_close_failed
                       << " async_close_avg_latency_ms=" << report.async_close_avg_latency_ms
                       << " async_close_max_latency_ms=" << report.async_close_max_latency_ms
+                      << " elapsed_s=" << report.elapsed_seconds << '\n';
+            return 0;
+        }
+
+        if (command == "benchmark-data-write") {
+            std::filesystem::path source_root;
+            std::string target_root;
+            bool recursive = true;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
+            std::size_t readdirplus_page_bytes = 0;
+            std::size_t data_reader_threads = 0;
+            std::size_t data_writer_threads = 0;
+            std::size_t data_outstanding_requests = 0;
+            std::size_t small_file_async_window = 0;
+            std::uint64_t max_file_size_bytes = 0;
+            std::size_t max_files_queued = 1024;
+            std::size_t data_buffer_slots = 0;
+            std::size_t data_queue_depth = 0;
+            std::string data_copy_mode;
+            bool pack_small_files = false;
+            bool verify_hash = false;
+            double max_duration_seconds = 0.0;
+            std::uint32_t stats_interval_seconds = 5;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--source") {
+                    source_root = require_option(args, i, "--source");
+                } else if (args[i] == "--target") {
+                    target_root = require_option(args, i, "--target");
+                } else if (args[i] == "--non-recursive") {
+                    recursive = false;
+                } else if (args[i] == "--meta-reader-threads") {
+                    meta_reader_threads =
+                        parse_size_t_option(require_option(args, i, "--meta-reader-threads"),
+                                            "--meta-reader-threads");
+                } else if (args[i] == "--metadata-async-depth") {
+                    metadata_async_depth =
+                        parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
+                                            "--metadata-async-depth");
+                } else if (args[i] == "--readdirplus-page-bytes") {
+                    readdirplus_page_bytes =
+                        parse_size_t_option(require_option(args, i, "--readdirplus-page-bytes"),
+                                            "--readdirplus-page-bytes");
+                } else if (args[i] == "--data-reader-threads") {
+                    data_reader_threads =
+                        parse_size_t_option(require_option(args, i, "--data-reader-threads"),
+                                            "--data-reader-threads");
+                } else if (args[i] == "--data-writer-threads") {
+                    data_writer_threads =
+                        parse_size_t_option(require_option(args, i, "--data-writer-threads"),
+                                            "--data-writer-threads");
+                } else if (args[i] == "--data-outstanding-requests") {
+                    data_outstanding_requests =
+                        parse_size_t_option(require_option(args, i, "--data-outstanding-requests"),
+                                            "--data-outstanding-requests");
+                } else if (args[i] == "--small-file-async-window") {
+                    small_file_async_window =
+                        parse_size_t_option(require_option(args, i, "--small-file-async-window"),
+                                            "--small-file-async-window");
+                } else if (args[i] == "--max-file-size-bytes") {
+                    max_file_size_bytes =
+                        parse_size_t_option(require_option(args, i, "--max-file-size-bytes"),
+                                            "--max-file-size-bytes");
+                } else if (args[i] == "--max-files-queued") {
+                    max_files_queued =
+                        parse_size_t_option(require_option(args, i, "--max-files-queued"),
+                                            "--max-files-queued");
+                } else if (args[i] == "--data-buffer-slots") {
+                    data_buffer_slots =
+                        parse_size_t_option(require_option(args, i, "--data-buffer-slots"),
+                                            "--data-buffer-slots");
+                } else if (args[i] == "--data-queue-depth") {
+                    data_queue_depth =
+                        parse_size_t_option(require_option(args, i, "--data-queue-depth"),
+                                            "--data-queue-depth");
+                } else if (args[i] == "--data-copy-mode") {
+                    data_copy_mode = require_option(args, i, "--data-copy-mode");
+                } else if (args[i] == "--pack-small-files") {
+                    pack_small_files = true;
+                } else if (args[i] == "--verify-hash") {
+                    verify_hash = true;
+                } else if (args[i] == "--max-duration-seconds") {
+                    max_duration_seconds =
+                        parse_positive_double_option(require_option(args, i, "--max-duration-seconds"),
+                                                     "--max-duration-seconds");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+
+            if (source_root.empty()) {
+                throw std::runtime_error("--source is required");
+            }
+            if (target_root.empty()) {
+                throw std::runtime_error("--target is required");
+            }
+
+            const auto report = engine.benchmark_data_write_pipeline(source_root,
+                                                                     target_root,
+                                                                     recursive,
+                                                                     meta_reader_threads,
+                                                                     metadata_async_depth,
+                                                                     readdirplus_page_bytes,
+                                                                     data_reader_threads,
+                                                                     data_writer_threads,
+                                                                     data_outstanding_requests,
+                                                                     small_file_async_window,
+                                                                     max_file_size_bytes,
+                                                                     max_files_queued,
+                                                                     data_buffer_slots,
+                                                                     data_queue_depth,
+                                                                     data_copy_mode,
+                                                                     pack_small_files,
+                                                                     max_duration_seconds,
+                                                                     stats_interval_seconds,
+                                                                     verify_hash);
+            std::cout << "data_write_benchmark files_found=" << report.files_found
+                      << " folders_found=" << report.folders_found
+                      << " files_read=" << report.files_read
+                      << " files_written=" << report.files_written
+                      << " files_failed=" << report.files_failed
+                      << " write_failed=" << report.write_failed
+                      << " logical_size_bytes=" << report.logical_size_bytes
+                      << " bytes_read=" << report.bytes_read
+                      << " bytes_written=" << report.bytes_written
+                      << " read_gigabits_per_second=" << report.gigabits_per_second
+                      << " files_per_second=" << report.files_per_second
+                      << " meta_reader_threads=" << report.meta_reader_threads
+                      << " metadata_async_depth=" << report.metadata_async_depth
+                      << " readdirplus_page_bytes=" << report.readdirplus_page_bytes
+                      << " data_reader_threads=" << report.data_reader_threads
+                      << " data_writer_threads=" << report.data_writer_threads
+                      << " data_outstanding_requests=" << report.data_outstanding_requests
+                      << " small_file_async_window=" << report.small_file_async_window
+                      << " max_file_size_bytes=" << report.max_file_size_bytes
+                      << " max_files_queued=" << report.max_files_queued
+                      << " data_buffer_slots=" << report.data_buffer_slots
+                      << " data_queue_depth=" << report.data_queue_depth
+                      << " data_queue_shards=" << report.data_queue_shards
+                      << " data_queue_capacity=" << report.data_queue_capacity
+                      << " data_queue_high_watermark=" << report.data_queue_high_watermark
+                      << " data_copy_mode=" << report.data_copy_mode
+                      << " pack_small_files=" << (report.pack_small_files ? "true" : "false")
+                      << " target=" << report.target_root
+                      << " meta_async=" << (report.meta_reader_async ? "true" : "false")
+                      << " data_async=" << (report.data_reader_async ? "true" : "false")
+                      << " async_read_queued=" << report.async_read_queued
+                      << " async_read_completed=" << report.async_read_completed
+                      << " async_read_failed=" << report.async_read_failed
+                      << " async_read_avg_latency_ms=" << report.async_read_avg_latency_ms
+                      << " async_read_max_latency_ms=" << report.async_read_max_latency_ms
                       << " elapsed_s=" << report.elapsed_seconds << '\n';
             return 0;
         }

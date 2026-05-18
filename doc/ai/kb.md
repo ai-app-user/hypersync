@@ -1279,3 +1279,9 @@ logical size: 335.99 TB
     `target_data_writer_writes_regular_and_packed_buffers`,
     `target_meta_writer_creates_flat_folder_directories`, and existing
     `nfs_data_buffer_reader_*` buffer tests.
+  - 2026-05-18 PDT: added `benchmark-data-write` for writer benchmarking without
+    transport:
+    `[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-M]->(FileQueue)->[DataReader-<backend>-R]->(DataBufQueue-WxD)->[DataWriter-<backend>-W]`.
+    `DataBufQueue` is sharded by file id, with `W` shards and one writer lane
+    per shard. The command reports files/bytes read and files/bytes written,
+    queue capacity, queue high watermark, and async read latency.

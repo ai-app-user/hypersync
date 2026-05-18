@@ -610,3 +610,14 @@ This keeps all chunks for a large file on one writer lane/context and avoids
 cross-lane create/truncate races. Verified locally with five focused unit tests:
 target data writer regular+packed buffers, target metadata directory creation,
 and the existing data-buffer reader paths.
+
+**User:** Asked to test the new `DataWriter-NFS` by generating synthetic data
+locally on agnopo and writing directly to the freshly mounted NFS target.
+
+**Codex:** Added a `benchmark-data-write` command that preserves the normal job
+pipeline and replaces the terminal discard stage with `DataWriter-<backend>`.
+The test shape is:
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-32]->(DataBufQueue-32xN)->[DataWriter-NFS-32]`.
+The data queue is sharded by file id so writer lanes do not race on create or
+truncate. Local build and the full unit suite passed (`73/73`) before deploying
+the command for the agnopo NFS write test.
