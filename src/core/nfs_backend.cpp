@@ -1019,6 +1019,7 @@ struct SyntheticProfileBackendOptions {
     double metadata_latency_scale = 1.0;
     double data_latency_scale = 1.0;
     SyntheticProfilePayloadMode payload_mode = SyntheticProfilePayloadMode::zero;
+    std::uint64_t files_per_batch = 4096;
 };
 
 bool synthetic_latency_includes_metadata(SyntheticProfileLatencyMode mode) noexcept {
@@ -1035,6 +1036,14 @@ double synthetic_positive_double_or(std::string_view value, double fallback) {
     }
     const double parsed = std::stod(std::string(value));
     return parsed >= 0.0 && std::isfinite(parsed) ? parsed : fallback;
+}
+
+std::uint64_t synthetic_positive_u64_or(std::string_view value, std::uint64_t fallback) {
+    if (value.empty()) {
+        return fallback;
+    }
+    const std::uint64_t parsed = std::stoull(std::string(value));
+    return parsed == 0U ? fallback : parsed;
 }
 
 SyntheticProfileLatencyMode parse_synthetic_latency_mode(std::string_view value) {
@@ -1080,6 +1089,8 @@ void parse_synthetic_query_param(SyntheticProfileBackendOptions& options,
     } else if (key == "payload" || key == "data-payload" || key == "payload-pattern" ||
                key == "data-pattern") {
         options.payload_mode = parse_synthetic_payload_mode(value);
+    } else if (key == "files-per-batch" || key == "batch-files" || key == "files-per-folder") {
+        options.files_per_batch = synthetic_positive_u64_or(value, options.files_per_batch);
     } else if (!key.empty()) {
         throw std::runtime_error("unknown synthetic-profile query parameter: " + std::string(key));
     }
@@ -1366,13 +1377,13 @@ public:
         const std::function<bool()>& should_stop,
         const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
         (void)outstanding_folders;
-        constexpr std::uint64_t kFilesPerSyntheticBatch = 4096;
+        const std::uint64_t files_per_batch = std::max<std::uint64_t>(1U, options_.files_per_batch);
         const std::uint64_t total_files = synthetic_profile_file_count(profile_);
         if (total_files == 0U) {
             return;
         }
         const std::uint64_t total_batches =
-            (total_files + kFilesPerSyntheticBatch - 1U) / kFilesPerSyntheticBatch;
+            (total_files + files_per_batch - 1U) / files_per_batch;
         const std::uint64_t lane_count = std::max<std::uint64_t>(1U, outstanding_folders);
 
         std::uint64_t internal_batch_index = 0;
@@ -1409,7 +1420,7 @@ public:
                 continue;
             }
             const std::uint64_t batch_index = requested_batch.value_or(0U);
-            const std::uint64_t batch_first_file = batch_index * kFilesPerSyntheticBatch;
+            const std::uint64_t batch_first_file = batch_index * files_per_batch;
             if (batch_first_file >= total_files) {
                 return;
             }
@@ -1425,11 +1436,11 @@ public:
             batch.folder = synthetic_batch_folder_spec(batch_index, recursive);
             batch.scan_started_unix_ns = current_unix_time_nanoseconds();
             batch.files.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(
-                kFilesPerSyntheticBatch,
+                files_per_batch,
                 total_files - batch_first_file)));
             std::uint64_t emitted_files = batch_first_file;
             for (std::uint64_t index = 0;
-                 index < kFilesPerSyntheticBatch && emitted_files < total_files && !(should_stop && should_stop());
+                 index < files_per_batch && emitted_files < total_files && !(should_stop && should_stop());
                  ++index) {
                 if (!cursor.next_file(view)) {
                     break;
