@@ -588,16 +588,41 @@ void run_metadata_writer_partition_process(const MetadataRecordWriterConfig& wri
                                     stats.folders_written);
 }
 
+void run_metadata_discard_partition_process(const std::filesystem::path& output_path,
+                                            std::size_t partition_index) {
+    RawBufferPool receive_pool(kMetadataBatchBufferPoolId,
+                               kMetadataPartitionTransportPoolSlots,
+                               sizeof(MetadataBatchBuffer),
+                               alignof(MetadataBatchBuffer));
+    BufferPoolRegistry receive_registry;
+    receive_registry.register_pool(receive_pool);
+    BufQueue discard_queue(receive_pool.capacity());
+    BufferReceiverJob receiver(1U,
+                               receive_pool,
+                               discard_queue,
+                               BufferTransportEndpoint::unix_socket(metadata_partition_socket_path(output_path, partition_index)));
+    BufferDiscarderJob discarder(BufferDiscarderConfig(1U), discard_queue, receive_registry);
+
+    receiver.start();
+    discarder.start();
+    receiver.wait();
+    discarder.wait();
+
+    write_metadata_partition_report(metadata_partition_report_path(output_path, partition_index), 0U, 0U);
+}
+
 class PartitionedMetadataWriter {
 public:
     PartitionedMetadataWriter(MetadataRecordWriterConfig writer_config,
                               std::filesystem::path output_path,
                               std::size_t partitions,
-                              RawBufferPool* routed_source_pool = nullptr)
+                              RawBufferPool* routed_source_pool = nullptr,
+                              bool discard_partitions = false)
         : writer_config_(std::move(writer_config)),
           output_path_(std::move(output_path)),
           partitions_(std::max<std::size_t>(1U, partitions)),
-          routed_source_pool_(routed_source_pool) {
+          routed_source_pool_(routed_source_pool),
+          discard_partitions_(discard_partitions) {
         if (partitions_ <= 1U) {
             throw std::invalid_argument("partitioned metadata writer requires more than one partition");
         }
@@ -615,7 +640,11 @@ public:
             }
             if (child == 0) {
                 try {
-                    run_metadata_writer_partition_process(writer_config_, output_path_, partitions_, index);
+                    if (discard_partitions_) {
+                        run_metadata_discard_partition_process(output_path_, index);
+                    } else {
+                        run_metadata_writer_partition_process(writer_config_, output_path_, partitions_, index);
+                    }
                     _Exit(0);
                 } catch (const std::exception& error) {
                     std::cerr << "metadata writer partition " << index << " failed: "
@@ -908,6 +937,7 @@ private:
     std::filesystem::path output_path_;
     std::size_t partitions_;
     RawBufferPool* routed_source_pool_ = nullptr;
+    bool discard_partitions_ = false;
     std::vector<std::unique_ptr<PartitionSendState>> states_;
     std::vector<std::unique_ptr<RouteSendState>> route_states_;
     std::vector<pid_t> children_;
@@ -10220,8 +10250,10 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
     report.autoscale_interval_ms = pipeline_autoscale ? autoscale_interval_ms : 0U;
     report.autoscale_profile = pipeline_autoscale ? autoscale_profile : std::string {};
     report.autoscale_settings_path = pipeline_autoscale ? autoscale_settings_path : std::filesystem::path {};
-    if (metadata_output_partition_mode != "single" && metadata_output_partition_mode != "processes") {
-        throw std::invalid_argument("metadata output partition mode must be single or processes");
+    if (metadata_output_partition_mode != "single" &&
+        metadata_output_partition_mode != "processes" &&
+        metadata_output_partition_mode != "transport-discard") {
+        throw std::invalid_argument("metadata output partition mode must be single, processes, or transport-discard");
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -10274,9 +10306,15 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         }
         std::optional<MetadataRecordWriter> record_writer;
         std::unique_ptr<PartitionedMetadataWriter> partitioned_writer;
-        if (writer_config.enabled && report.metadata_output_partitions > 1U) {
+        const bool transport_discard = metadata_output_partition_mode == "transport-discard";
+        if ((writer_config.enabled || transport_discard) && report.metadata_output_partitions > 1U) {
             if (metadata_output_partition_mode != "processes") {
-                throw std::invalid_argument("partitioned metadata output requires --metadata-output-partition-mode processes");
+                if (!transport_discard) {
+                    throw std::invalid_argument("partitioned metadata output requires --metadata-output-partition-mode processes");
+                }
+            }
+            if (writer_config.output_path.empty()) {
+                throw std::invalid_argument("transport-discard metadata partition mode requires --metadata-output for socket/report directory");
             }
         } else if (writer_config.enabled) {
             record_writer.emplace(writer_config);
@@ -10288,12 +10326,13 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         report.record_buffer_slots = flat_slots;
 
         RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
-        if (writer_config.enabled && report.metadata_output_partitions > 1U) {
+        if ((writer_config.enabled || transport_discard) && report.metadata_output_partitions > 1U) {
             partitioned_writer = std::make_unique<PartitionedMetadataWriter>(
                 writer_config,
                 writer_config.output_path,
                 report.metadata_output_partitions,
-                &metadata_pool);
+                &metadata_pool,
+                transport_discard);
         }
         RawBufferPool folder_pool = make_folder_work_buffer_pool(
             kFolderWorkBufferPoolId,
