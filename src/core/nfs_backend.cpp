@@ -1713,7 +1713,9 @@ public:
         ScopedFd& handle = open_handles_[rel_path];
         if (!handle.valid()) {
             const std::filesystem::path absolute_path = std::filesystem::path(root_) / rel_path;
-            ensure_parent_directories(absolute_path);
+            if (options_.ensure_parent_directories) {
+                ensure_parent_directories(absolute_path);
+            }
             const int raw_fd =
                 ::open(absolute_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, static_cast<mode_t>(spec.mode));
             if (raw_fd < 0) {
@@ -5105,7 +5107,9 @@ public:
 
     void write_chunk(const FileSpec& spec, std::string_view data, std::uint64_t offset) override {
         const std::string rel_path = normalize_path(spec.rel_path);
-        ensure_directory_chain(parent_path(rel_path));
+        if (options_.ensure_parent_directories) {
+            ensure_directory_chain(parent_path(rel_path));
+        }
         struct nfsfh* handle = open_handle(rel_path, spec.mode);
 
         std::size_t written_total = 0;
@@ -5149,7 +5153,9 @@ public:
                 continue;
             }
             const std::string rel_path = normalize_path(chunk.spec.rel_path);
-            ensure_directory_chain(parent_path(rel_path));
+            if (options_.ensure_parent_directories) {
+                ensure_directory_chain(parent_path(rel_path));
+            }
             struct nfsfh* handle = open_handle(rel_path, chunk.spec.mode);
             pending.push_back(PendingWrite {});
             PendingWrite& write = pending.back();
@@ -5210,7 +5216,9 @@ public:
         pending.reserve(files.size());
         for (const WriteChunk& file : files) {
             const std::string rel_path = normalize_path(file.spec.rel_path);
-            ensure_directory_chain(parent_path(rel_path));
+            if (options_.ensure_parent_directories) {
+                ensure_directory_chain(parent_path(rel_path));
+            }
             pending.push_back(PendingFile {});
             PendingFile& state = pending.back();
             state.file = &file;

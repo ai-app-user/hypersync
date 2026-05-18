@@ -508,7 +508,8 @@ public:
                                                                         std::uint32_t stats_interval_seconds = 5,
                                                                         bool verify_hash = false,
                                                                         bool preserve_target_metadata = true,
-                                                                        bool target_fsync = true) const;
+                                                                        bool target_fsync = true,
+                                                                        bool ensure_target_directories = true) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
                                                                       bool recursive = true,
                                                                       std::size_t meta_reader_threads = 0,

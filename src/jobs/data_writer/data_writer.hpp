@@ -66,6 +66,7 @@ struct TargetDataWriterConfig {
     std::size_t async_window = 1;
     bool preserve_metadata = true;
     bool fsync_on_finish = true;
+    bool ensure_parent_directories = true;
 
     TargetDataWriterConfig();
     TargetDataWriterConfig(std::size_t worker_count,
@@ -73,7 +74,8 @@ struct TargetDataWriterConfig {
                            bool verify_hash = false,
                            std::size_t async_window = 1,
                            bool preserve_metadata = true,
-                           bool fsync_on_finish = true);
+                           bool fsync_on_finish = true,
+                           bool ensure_parent_directories = true);
 };
 
 [[nodiscard]] TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config);

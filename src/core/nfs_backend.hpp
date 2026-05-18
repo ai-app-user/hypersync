@@ -216,6 +216,7 @@ public:
     struct Options {
         bool preserve_metadata = true;
         bool fsync_on_finish = true;
+        bool ensure_parent_directories = true;
     };
 
     virtual ~TargetWriterBackend() = default;
