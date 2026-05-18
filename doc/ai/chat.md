@@ -719,3 +719,14 @@ Tested on agnopo against the tuned 16-IP NFS target. Important results so far:
 - Deep packed-buffer batching currently exposes a libnfs writer stability issue under heavy small CREATE/WRITE/CLOSE pressure; bounded per-context file windows are needed before pushing deeper.
 
 Current conclusion: large-file write path is near line rate, but small-file *write* throughput is not yet near `50K/s`; the observed ceiling is currently the NFS CREATE/CLOSE metadata path or our high-level libnfs small-file state machine, not source generation or queue supply.
+
+**User:** Asked whether the small-file plateau was caused by shared libnfs contexts / RPC slot starvation and proposed connection sharding plus bounded lifecycle state machines.
+
+**Codex:** Clarified that `DataWriter-NFS` already uses independent libnfs contexts per writer worker and pins worker indices across the 16-IP target range, so the missing piece was not connection sharding but bounded per-context lifecycle depth. Implemented `--data-writer-file-window` / `target_data_writer.max_concurrent_file_transactions` and rewrote `LibNfsTargetWriterBackend::write_files()` so each context only keeps a bounded number of CREATE -> WRITE -> CLOSE transactions active at once. Local build and unit tests passed (`73/73`), deployed to agnopo, and retested.
+
+Bounded-window agnopo probes with `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue)->[DataReader-SYN-96]->(DataQueue)->[DataWriter-NFS-96]`, all 16 target IPs, `--assume-target-directories`, `files-per-batch=16`:
+- `file_window=8`: stable, `17,415` files in `15.2s`, `~1.15K files/s`.
+- `file_window=16`: stable, `17,160` files in `15.5s`, `~1.11K files/s`.
+- `file_window=32`: reached interval `~1.35K files/s`, then the benchmark harness aborted because `--assume-target-directories` advanced to `synthetic/batch_8198` while only `batch_0..8191` had been pre-created.
+
+Current conclusion: bounded lifecycle state fixes the unsafe crash pattern, but high-level NFS CREATE/WRITE/CLOSE small-file writes remain far below `50K/s` on this target. The next architectural options are a raw NFSv3 create/write state machine, a real metadata-writer stage that precreates all target directories before data writer assumes them, or a small-file packaging/container strategy for the destination.
