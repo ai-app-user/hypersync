@@ -454,3 +454,14 @@ the old unused direct flat-metadata scan helper. Local build passed and
 **User:** Asked to try the scanner saving results to DB and run for at least a few minutes to verify it remained fast.
 
 **Codex:** Rebuilt transfer1 release with DuckDB enabled from `/mnt/local-nvme/deps/duckdb`, ran a real NFS `benchmark-meta` to 32 partitioned Parquet outputs for 180s scan time, and verified the output with the DuckDB CLI. The run wrote `641,113,308` file rows and `7,096,081` folder rows, `7.5G` total output, final `3.61M records/s` after writer drain, with early/mid samples around `5.1M-5.3M files/s`.
+
+## 2026-05-18
+
+**User:** Asked to run the metadata generator to discard and report performance.
+
+**Codex:** Ran transfer1 synthetic metadata discard benchmarks on `dev` commit
+`7e862c5`. Raw generator discard processed `200M` files plus `2M` folders in
+`5.50s` at `36.4M files/s`. Folder-shaped metadata buffer packing discard
+processed the same input in `15.45s` at `12.9M files/s`. Transport discard
+through 32 sender/receiver/discarder lanes processed the same input in `18.94s`
+at `10.6M files/s`.

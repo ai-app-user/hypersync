@@ -2378,3 +2378,33 @@ Conclusions:
 - The route-discard run confirms the router and partition queues can still approach the 7M files/s scanner band before topology/tail effects.
 - Socket transport and writer work add measurable overhead; Parquet writer/drain remains the slowest downstream stage.
 ```
+
+## Synthetic Metadata Generator Discard, 2026-05-18
+
+Host: transfer1  
+Commit: `7e862c5`  
+Input: `200,000,000` synthetic files, `2,000,000` synthetic folders,
+`batch_size=1,000,000`, `partitions=32`, average file size `32768`.
+
+```text
+[FileMetadataGenerator]->(none)->[Discard]
+  mode=generate-discard
+  files=200,000,000 folders=2,000,000 records=202,000,000
+  elapsed=5.497s files/s=36.38M records/s=36.75M
+
+[FileMetadataGenerator]->(MetadataBatchBufferPool)->[Discard]
+  mode=folder-pack-discard
+  files=200,000,000 folders=2,000,000 records=202,000,000
+  elapsed=15.449s files/s=12.95M records/s=13.08M
+
+[FileMetadataGenerator]->(PartitionSendQueue x32)->[BufferSender-1 x32]->(UnixSocket x32)->[BufferReceiver-1 x32]->(WriterBufQueue x32)->[BufferDiscarder-1 x32]
+  mode=transport-discard
+  files=200,000,000 folders=2,000,000 records=202,000,000
+  elapsed=18.935s files/s=10.56M records/s=10.67M
+```
+
+Interpretation: synthetic generation is above the current real NFS scanner
+target. The existing generator benchmark still contains helper modes rather than
+a clean named `NfsMetaGenerator` job, so the next architectural cleanup should
+promote synthetic metadata generation into a normal Piper job that emits
+metadata buffers into queues and can be composed with scan/read/diff pipelines.
