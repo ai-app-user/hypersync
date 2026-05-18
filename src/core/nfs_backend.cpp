@@ -2081,18 +2081,6 @@ void generic_nfs_callback(int status, struct nfs_context* nfs, void* data, void*
     }
 }
 
-void generic_rpc_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
-    (void)rpc;
-    auto* state = static_cast<AsyncCommandState*>(private_data);
-    state->done = true;
-    state->status = status;
-    state->data = data;
-    record_async_command_completed(state->kind, state->queued_at, status);
-    if (status < 0 && data != nullptr) {
-        state->error = static_cast<const char*>(data);
-    }
-}
-
 void raw_write_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
     (void)rpc;
     auto* state = static_cast<AsyncCommandState*>(private_data);
