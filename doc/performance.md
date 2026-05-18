@@ -2456,3 +2456,21 @@ first synthetic `4096` file batch when used through `FolderSeeder`. It now
 exposes replay batches as recursive synthetic folders, with root fanout based on
 `metadata_async_depth`, so normal scanner workers can consume the generated
 profile in parallel.
+
+SyntheticMetaReader scaling sweep on the same profile:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-N]->(MetadataBufQueue)->[MetadataStatsDiscarder]
+
+threads  files_seen   elapsed_s  final files/s  notes
+1        18,694,144   12.511     1.87M          queue high watermark 1
+8        162,795,520  12.503     16.28M         queue high watermark 5
+32       646,602,752  12.605     64.66M         queue high watermark 64
+128      613,564,416  13.321     60.12M         queue high watermark 4095
+```
+
+Interpretation: profile-backed metadata generation scales nearly linearly from
+1 to 32 workers. At 128 workers the single metadata stats discard queue becomes
+hot and the run regresses below the 32-thread result. For SyntheticMetaReader
+metadata-only tuning, `32` readers is the best current point for this sink; use
+wider downstream sharding before testing reader counts above that.

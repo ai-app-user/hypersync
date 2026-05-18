@@ -478,3 +478,10 @@ batch. Added functional coverage for recursive batch folder replay. On
 transfer1, the profile-backed stats discard run used the archived full-source
 sampled profile and sustained roughly `67.3M files/s` over 10 seconds with
 `96` metadata readers and async depth `256`.
+
+**Codex:** Ran a profile-backed SyntheticMetaReader scaling sweep against
+`MetadataStatsDiscarder`: `1` thread reached `1.87M files/s`, `8` reached
+`16.28M files/s`, `32` reached `64.66M files/s`, and `128` regressed to
+`60.12M files/s` with the single output queue high-watermarking at `4095`.
+Current conclusion: scaling is nearly linear to `32` workers, then the discard
+sink/queue becomes the bottleneck.
