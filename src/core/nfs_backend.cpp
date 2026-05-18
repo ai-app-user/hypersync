@@ -5253,7 +5253,13 @@ private:
 
         void enqueue(std::shared_ptr<FileTransaction> transaction) {
             auto* node = new QueueNode(std::move(transaction));
-            node->next = inbound_.exchange(node, std::memory_order_acq_rel);
+            QueueNode* head = inbound_.load(std::memory_order_acquire);
+            do {
+                node->next = head;
+            } while (!inbound_.compare_exchange_weak(head,
+                                                     node,
+                                                     std::memory_order_release,
+                                                     std::memory_order_acquire));
         }
 
     private:
