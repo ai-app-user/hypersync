@@ -1324,3 +1324,24 @@ logical size: 335.99 TB
     Result: `627` large files / `717.1 GB` written, zero failures, final
     `162.6 Gbit/s` over `35.3s`; interval throughput held near `164-166 Gbit/s`.
     The high-level libnfs writer lifecycle remains the main gap to 200G.
+
+- 2026-05-18 PDT: Hypersync owns network preflight now through
+  `hypersync network-preflight [--iface ens3] [--cpu-mask <mask>] [--apply]`.
+  Report-only mode prints `network_preflight ok|mismatch` records and returns
+  non-zero if optimized settings are missing. `--apply` attempts to set the
+  tuned profile: MTU 9000, RX/TX rings 8192, adaptive-rx off with rx-usecs 12,
+  RPS/RFS/XPS masks, `net.core.rps_sock_flow_entries=262144`, 2GB TCP buffer
+  caps, `tcp_rmem/tcp_wmem=4096 1048576 2147483647`, BBR/fq,
+  `tcp_mtu_probing=1`, sunrpc slot table entries 65536, and removal of TCPMSS
+  clamp rules. Keep this command as the canonical drift check before NFS
+  performance tests.
+
+- agnopo network drift observed before preflight apply: MTU `1500`,
+  `rps_sock_flow_entries=0`, RPS/RFS queues disabled, reduced TCP buffers,
+  `tcp_mtu_probing=0`, small sunrpc slot entries, and RX/TX rings not at 8192.
+  The mounted NFS volume still had the desired mount flags (`nconnect=32`,
+  `rsize/wsize=1048576`, `remoteports=172.27.255.2-172.27.255.17`,
+  `spread_reads`, `spread_writes`). Running
+  `sudo hypersync network-preflight --iface ens3 --apply` restored the tuned
+  host profile. Validator CPU masks must compare normalized masks because Linux
+  drops leading zero groups (for example `0000ffff,...` vs `ffff,...`).

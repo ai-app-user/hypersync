@@ -5,7 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <cctype>
 #include <deque>
 #include <exception>
 #include <fstream>
@@ -20,6 +23,10 @@
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -64,6 +71,325 @@ double parse_positive_double_option(const std::string& value, std::string_view f
         throw std::runtime_error("invalid positive number for " + std::string(flag_name));
     }
     return parsed;
+}
+
+std::string trim_copy(std::string value) {
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    return value;
+}
+
+std::string shell_quote(std::string_view value) {
+    std::string quoted = "'";
+    for (const char ch : value) {
+        if (ch == '\'') {
+            quoted += "'\\''";
+        } else {
+            quoted.push_back(ch);
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
+std::string command_output(const std::string& command) {
+    std::string output;
+#if defined(_WIN32)
+    (void)command;
+#else
+    FILE* pipe = popen((command + " 2>/dev/null").c_str(), "r");
+    if (pipe == nullptr) {
+        return output;
+    }
+    std::array<char, 4096> buffer {};
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        output += buffer.data();
+    }
+    pclose(pipe);
+#endif
+    return output;
+}
+
+std::string read_text_file(const std::string& path) {
+    std::ifstream input(path);
+    if (!input) {
+        return {};
+    }
+    std::stringstream buffer;
+    buffer << input.rdbuf();
+    return trim_copy(buffer.str());
+}
+
+std::string linux_online_cpu_mask() {
+    std::string online = read_text_file("/sys/devices/system/cpu/online");
+    std::size_t max_cpu = 0;
+    bool found = false;
+    std::stringstream stream(online.empty() ? "0" : online);
+    std::string range;
+    while (std::getline(stream, range, ',')) {
+        const std::size_t dash = range.find('-');
+        const std::string last = dash == std::string::npos ? range : range.substr(dash + 1U);
+        if (!last.empty()) {
+            max_cpu = std::max<std::size_t>(max_cpu,
+                                            static_cast<std::size_t>(parse_u64_option(last, "cpu-online")));
+            found = true;
+        }
+    }
+    if (!found) {
+        max_cpu = std::max<unsigned int>(1U, std::thread::hardware_concurrency()) - 1U;
+    }
+
+    const std::size_t group_count = (max_cpu / 32U) + 1U;
+    std::vector<std::uint32_t> groups(group_count, 0);
+    for (std::size_t cpu = 0; cpu <= max_cpu; ++cpu) {
+        groups[cpu / 32U] |= (1U << (cpu % 32U));
+    }
+
+    std::ostringstream out;
+    for (std::size_t index = group_count; index > 0; --index) {
+        if (index != group_count) {
+            out << ',';
+        }
+        out << std::hex << std::setw(8) << std::setfill('0') << groups[index - 1U];
+    }
+    return out.str();
+}
+
+struct NetworkPreflightOptions {
+    std::string iface = "ens3";
+    bool apply = false;
+    std::string cpu_mask;
+    std::uint64_t rps_flow_cnt = 32768;
+    std::uint64_t rps_sock_flow_entries = 262144;
+    std::uint64_t mtu = 9000;
+    std::uint64_t ring = 8192;
+};
+
+std::string sysctl_value(std::string_view key) {
+    return trim_copy(command_output("sysctl -n " + std::string(key)));
+}
+
+bool output_contains_current_ring(const std::string& ethtool_ring, std::string_view key, std::string_view value) {
+    const std::size_t current = ethtool_ring.find("Current hardware settings:");
+    if (current == std::string::npos) {
+        return false;
+    }
+    const std::string tail = ethtool_ring.substr(current);
+    return tail.find(std::string(key) + ":\t\t\t" + std::string(value)) != std::string::npos ||
+           tail.find(std::string(key) + ":\t" + std::string(value)) != std::string::npos;
+}
+
+std::optional<std::uint64_t> ethtool_named_value(const std::string& output, std::string_view key) {
+    std::stringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        if (trim_copy(line.substr(0, colon)) != key) {
+            continue;
+        }
+        const std::string value = trim_copy(line.substr(colon + 1U));
+        if (value.empty()) {
+            return std::nullopt;
+        }
+        return parse_u64_option(value, key);
+    }
+    return std::nullopt;
+}
+
+bool ethtool_flag_value(const std::string& output, std::string_view key, std::string_view expected) {
+    std::stringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        if (trim_copy(line.substr(0, colon)) == key) {
+            const std::string value = trim_copy(line.substr(colon + 1U));
+            return value == expected ||
+                   value.rfind(std::string(expected) + " ", 0) == 0;
+        }
+    }
+    return false;
+}
+
+std::string normalize_cpu_mask(std::string mask) {
+    mask = trim_copy(mask);
+    std::vector<std::string> groups;
+    std::stringstream stream(mask);
+    std::string group;
+    while (std::getline(stream, group, ',')) {
+        group = trim_copy(group);
+        const std::size_t non_zero = group.find_first_not_of('0');
+        groups.push_back(non_zero == std::string::npos ? "0" : group.substr(non_zero));
+    }
+    while (groups.size() > 1U && groups.front() == "0") {
+        groups.erase(groups.begin());
+    }
+    std::ostringstream out;
+    for (std::size_t index = 0; index < groups.size(); ++index) {
+        if (index != 0U) {
+            out << ',';
+        }
+        out << groups[index];
+    }
+    return out.str();
+}
+
+std::uint64_t count_lines(const std::string& text) {
+    if (text.empty()) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(std::count(text.begin(), text.end(), '\n') +
+                                      (text.back() == '\n' ? 0 : 1));
+}
+
+int run_network_preflight(const NetworkPreflightOptions& options) {
+    const std::string iface = options.iface;
+    const std::string mask = options.cpu_mask.empty() ? linux_online_cpu_mask() : options.cpu_mask;
+    const std::string qiface = shell_quote(iface);
+    const std::string qmask = shell_quote(mask);
+    const std::string sudo = [] {
+#if defined(_WIN32)
+        return std::string {};
+#else
+        return geteuid() == 0 ? std::string {} : std::string("sudo ");
+#endif
+    }();
+
+    if (options.apply) {
+        const std::vector<std::string> commands = {
+            sudo + "ip link set dev " + qiface + " mtu " + std::to_string(options.mtu),
+            sudo + "ethtool -G " + qiface + " rx " + std::to_string(options.ring) +
+                " tx " + std::to_string(options.ring),
+            sudo + "ethtool -C " + qiface + " adaptive-rx off rx-usecs 12",
+            sudo + "sysctl -w net.core.rps_sock_flow_entries=" +
+                std::to_string(options.rps_sock_flow_entries),
+            sudo + "sysctl -w net.core.rmem_max=2147483647 net.core.wmem_max=2147483647",
+            sudo + "sysctl -w 'net.ipv4.tcp_rmem=4096 1048576 2147483647' "
+                "'net.ipv4.tcp_wmem=4096 1048576 2147483647'",
+            sudo + "sysctl -w net.ipv4.tcp_congestion_control=bbr net.core.default_qdisc=fq "
+                "net.ipv4.tcp_mtu_probing=1",
+            sudo + "iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS "
+                "--clamp-mss-to-pmtu 2>/dev/null || true",
+            "for q in /sys/class/net/" + iface + "/queues/rx-*; do echo " + qmask + " | " + sudo +
+                "tee \"$q/rps_cpus\" >/dev/null; echo " + std::to_string(options.rps_flow_cnt) +
+                " | " + sudo + "tee \"$q/rps_flow_cnt\" >/dev/null; done",
+            "for q in /sys/class/net/" + iface + "/queues/tx-*; do echo " + qmask + " | " + sudo +
+                "tee \"$q/xps_cpus\" >/dev/null; done",
+            "for f in /proc/sys/sunrpc/tcp_max_slot_table_entries /proc/sys/sunrpc/tcp_slot_table_entries; "
+                "do [ -e \"$f\" ] && echo 65536 | " + sudo + "tee \"$f\" >/dev/null || true; done",
+        };
+        for (const std::string& command : commands) {
+            const int rc = std::system(command.c_str());
+            if (rc != 0) {
+                std::cerr << "network_preflight apply_failed command=" << command << " rc=" << rc << '\n';
+            }
+        }
+    }
+
+    std::size_t mismatches = 0;
+    const auto check = [&](std::string name, std::string current, std::string expected) {
+        const bool ok = trim_copy(current) == trim_copy(expected);
+        if (!ok) {
+            ++mismatches;
+        }
+        std::cout << "network_preflight " << (ok ? "ok" : "mismatch")
+                  << " setting=" << name
+                  << " current=" << shell_quote(trim_copy(current))
+                  << " expected=" << shell_quote(trim_copy(expected)) << '\n';
+    };
+
+    check("mtu", read_text_file("/sys/class/net/" + iface + "/mtu"), std::to_string(options.mtu));
+    check("net.core.rps_sock_flow_entries",
+          read_text_file("/proc/sys/net/core/rps_sock_flow_entries"),
+          std::to_string(options.rps_sock_flow_entries));
+    check("net.core.rmem_max", sysctl_value("net.core.rmem_max"), "2147483647");
+    check("net.core.wmem_max", sysctl_value("net.core.wmem_max"), "2147483647");
+    check("net.ipv4.tcp_rmem", sysctl_value("net.ipv4.tcp_rmem"), "4096\t1048576\t2147483647");
+    check("net.ipv4.tcp_wmem", sysctl_value("net.ipv4.tcp_wmem"), "4096\t1048576\t2147483647");
+    check("net.ipv4.tcp_congestion_control", sysctl_value("net.ipv4.tcp_congestion_control"), "bbr");
+    check("net.core.default_qdisc", sysctl_value("net.core.default_qdisc"), "fq");
+    check("net.ipv4.tcp_mtu_probing", sysctl_value("net.ipv4.tcp_mtu_probing"), "1");
+
+    const std::string rings = command_output("ethtool -g " + qiface);
+    const bool ring_ok = output_contains_current_ring(rings, "RX", std::to_string(options.ring)) &&
+                         output_contains_current_ring(rings, "TX", std::to_string(options.ring));
+    if (!ring_ok) {
+        ++mismatches;
+    }
+    std::cout << "network_preflight " << (ring_ok ? "ok" : "mismatch")
+              << " setting=rx_tx_ring expected='" << options.ring << "/" << options.ring << "'\n";
+
+    const std::string coalesce = command_output("ethtool -c " + qiface);
+    const bool coalesce_ok = ethtool_flag_value(coalesce, "Adaptive RX", "off") &&
+                             ethtool_named_value(coalesce, "rx-usecs").value_or(0) == 12U;
+    if (!coalesce_ok) {
+        ++mismatches;
+    }
+    std::cout << "network_preflight " << (coalesce_ok ? "ok" : "mismatch")
+              << " setting=rx_coalesce expected='adaptive-rx off rx-usecs 12'\n";
+
+    const std::string rx0 = read_text_file("/sys/class/net/" + iface + "/queues/rx-0/rps_cpus");
+    const std::string rx0_flow = read_text_file("/sys/class/net/" + iface + "/queues/rx-0/rps_flow_cnt");
+    const std::string tx0 = read_text_file("/sys/class/net/" + iface + "/queues/tx-0/xps_cpus");
+    check("rx-0/rps_cpus", normalize_cpu_mask(rx0), normalize_cpu_mask(mask));
+    check("rx-0/rps_flow_cnt", rx0_flow, std::to_string(options.rps_flow_cnt));
+    check("tx-0/xps_cpus", normalize_cpu_mask(tx0), normalize_cpu_mask(mask));
+
+    const std::string tcp_max_slots = read_text_file("/proc/sys/sunrpc/tcp_max_slot_table_entries");
+    if (!tcp_max_slots.empty()) {
+        check("sunrpc.tcp_max_slot_table_entries", tcp_max_slots, "65536");
+    }
+    const std::string tcp_slots = read_text_file("/proc/sys/sunrpc/tcp_slot_table_entries");
+    if (!tcp_slots.empty()) {
+        check("sunrpc.tcp_slot_table_entries", tcp_slots, "65536");
+    }
+
+    const std::string speed = command_output("ethtool " + qiface + " | awk -F': ' '/Speed:/ {print $2}'");
+    if (!speed.empty()) {
+        std::cout << "network_preflight info setting=speed current="
+                  << shell_quote(trim_copy(speed)) << '\n';
+    }
+    const std::string channels = command_output("ethtool -l " + qiface);
+    const std::optional<std::uint64_t> combined = ethtool_named_value(channels, "Combined");
+    if (combined.has_value()) {
+        std::cout << "network_preflight info setting=combined_channels current="
+                  << combined.value() << '\n';
+    }
+    const std::string tcp_mss_rules =
+        command_output("iptables -t mangle -S | grep -c TCPMSS || true");
+    if (!tcp_mss_rules.empty() && trim_copy(tcp_mss_rules) != "0") {
+        ++mismatches;
+        std::cout << "network_preflight mismatch setting=tcpmss_rules current="
+                  << shell_quote(trim_copy(tcp_mss_rules)) << " expected='0'\n";
+    } else {
+        std::cout << "network_preflight ok setting=tcpmss_rules current='0' expected='0'\n";
+    }
+
+    const std::string nfs_mounts =
+        command_output("findmnt -rn -t nfs,nfs4 -o TARGET,SOURCE,OPTIONS | grep -E 'nconnect=|rsize=1048576|wsize=1048576|remoteports=' || true");
+    std::cout << "network_preflight info setting=optimized_nfs_mounts count="
+              << count_lines(nfs_mounts) << '\n';
+    if (!nfs_mounts.empty()) {
+        std::cout << nfs_mounts;
+        if (nfs_mounts.back() != '\n') {
+            std::cout << '\n';
+        }
+    }
+
+    std::cout << "network_preflight summary iface=" << iface
+              << " apply=" << (options.apply ? "true" : "false")
+              << " mismatches=" << mismatches
+              << " cpu_mask=" << shell_quote(mask) << '\n';
+    return mismatches == 0U ? 0 : 2;
 }
 
 std::optional<std::string_view> profile_token(std::string_view line,
@@ -1066,6 +1392,7 @@ void print_usage() {
         << "Usage:\n"
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
         << "  hypersync status --socket <path>\n"
+        << "  hypersync network-preflight [--iface <name>] [--cpu-mask <mask>] [--apply]\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--checker-threads <n>] [--checker-request-queue-depth <n>] [--checker-batch-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
@@ -1134,6 +1461,22 @@ int main(int argc, char** argv) {
             }
             std::cout << hypersync::request_status(socket_path);
             return 0;
+        }
+
+        if (command == "network-preflight") {
+            NetworkPreflightOptions preflight;
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--iface") {
+                    preflight.iface = require_option(args, i, "--iface");
+                } else if (args[i] == "--cpu-mask") {
+                    preflight.cpu_mask = require_option(args, i, "--cpu-mask");
+                } else if (args[i] == "--apply") {
+                    preflight.apply = true;
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            return run_network_preflight(preflight);
         }
 
         hypersync::ConfigStore config_store(

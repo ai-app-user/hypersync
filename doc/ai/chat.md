@@ -682,3 +682,9 @@ This confirms automatic endpoint fallback works. Remaining gap to 200G is now
 dominated by high-level libnfs target writer lifecycle work
 (`create/open/pwrite/close/fsync/metadata`); the reader-style raw-handle fast
 path is still the next architecture step for writes.
+
+**User:** Asked to verify current network settings first, and to move the important network-setting verification into the app so Hypersync can either suggest fixes or apply them.
+
+**Codex:** Added a first `hypersync network-preflight` command. It verifies the high-throughput Linux/NFS network profile we use on transfer/agnopo-class hosts: MTU, rings, RX coalescing, RPS/RFS/XPS, TCP buffers, BBR/fq, tcp_mtu_probing, sunrpc slot table entries, TCPMSS rules, and visible optimized NFS mounts. The command defaults to report-only mode and supports `--apply` to set the expected profile on the selected interface. Local debug build and unit suite passed (`73/73`).
+
+**Codex:** Ran the new preflight on agnopo. Report-only mode found drift from the tuned profile: MTU `1500`, RPS/RFS disabled, TCP buffers reduced, `tcp_mtu_probing=0`, RX/TX rings not at `8192`, RX coalescing not fixed, and sunrpc slots at `128/2`. The NFS mount itself still had the desired performance options (`nconnect=32`, `rsize/wsize=1048576`, remoteports range, spread reads/writes). Applied the profile with `sudo hypersync network-preflight --iface ens3 --apply`; after apply the real settings were correct, with a small validator false positive for CPU mask formatting and `ethtool` coalescing line shape. Fixed those validator false positives and reran local build/tests (`73/73`).
