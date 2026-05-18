@@ -5257,6 +5257,9 @@ public:
                         throw std::runtime_error("nfs_create_async failed: " + state.create_state.error);
                     }
                     state.handle = static_cast<struct nfsfh*>(state.create_state.data);
+                    if (state.handle == nullptr) {
+                        throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
+                    }
                     if (state.file->data.empty()) {
                         state.phase = PendingFile::Phase::closing;
                         state.close_state.queued_at = std::chrono::steady_clock::now();

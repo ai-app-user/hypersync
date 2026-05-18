@@ -706,3 +706,16 @@ path is still the next architecture step for writes.
 **User:** Asked to verify the target is tuned again and retest the NFS writer with different thread counts, expecting max performance with fewer threads after tuning.
 
 **Codex:** Redeployed `dev` to agnopo and ran `sudo hypersync tuning --iface ens3 --peer 172.27.255.2`; the target reported `mismatches=0`. A non-root write sweep was invalid because the high-level writer attempted metadata restore and hit `NFS3ERR_PERM` from `nfs_chown_async`; reran as root for meaningful write-path numbers. Large-only synthetic PRNG writes through all 16 IPs with `data_writer_async_window=2`, `min_file_size_bytes=1048576`, and matched reader/writer lanes produced: 32 lanes `92.7 Gbit/s`, 48 lanes `135.2 Gbit/s`, 64 lanes `154.5 Gbit/s`, 96 lanes `189.4 Gbit/s`, 112 lanes `195.3 Gbit/s`, 128 lanes `194.6 Gbit/s` repeat (`194.1 Gbit/s` previous 128-lane run). Current recommendation for tuned agnopo large writes is 112 data readers / 112 NFS data writers, async write window 2, root or metadata-restore disabled when synthetic ownership cannot be applied.
+
+**User:** After validating ~195 Gbit/s large-file NFS writes, asked to design, implement, and test a small-files-only write workload with a target of `50K files/s`.
+
+**Codex:** Implemented three small-file write-path improvements on `dev`: packed-small-file buffers can be written through a direct `TargetWriterBackend::write_files()` fast path; `DataWriter-NFS` can batch multiple packed buffers across `data_writer_async_window`; and tuned data runs can use `--assume-target-directories` so directory creation stays in the metadata writer instead of the payload writer hot path. Also added `synthetic-profile://...?files-per-batch=<n>` to control synthetic small-file directory shape. Local build and unit suite passed (`73/73`).
+
+Tested on agnopo against the tuned 16-IP NFS target. Important results so far:
+- Missing target-root directories caused writer mounts to stall/fail; pre-creating the libnfs target root is mandatory because libnfs mounts the URL path itself.
+- Baseline single-lane small writes with pre-created root: about `1.64K files/s`.
+- Multi-lane runs with default synthetic shape (`4096` files per batch dir) did not scale: 16-96 lanes stayed around `1.8K-2.8K files/s` with the data queue full, showing writer/backend metadata create pressure.
+- Removing directory assurance from the data writer hot path and reducing synthetic files-per-batch still stayed around `2.7K-2.8K files/s` on this target.
+- Deep packed-buffer batching currently exposes a libnfs writer stability issue under heavy small CREATE/WRITE/CLOSE pressure; bounded per-context file windows are needed before pushing deeper.
+
+Current conclusion: large-file write path is near line rate, but small-file *write* throughput is not yet near `50K/s`; the observed ceiling is currently the NFS CREATE/CLOSE metadata path or our high-level libnfs small-file state machine, not source generation or queue supply.

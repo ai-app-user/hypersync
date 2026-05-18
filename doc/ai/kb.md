@@ -1384,3 +1384,10 @@ logical size: 335.99 TB
   can abort on `nfs_chown_async` / `NFS3ERR_PERM` when synthetic profile metadata
   contains ownership the export will not allow; use root or add a metadata-restore
   skip mode before treating non-root write throughput as valid.
+
+- 2026-05-18 PDT small-file NFS write investigation after large-write tuning:
+  - New implementation pieces: `TargetWriterBackend::write_files()` for packed small files, packed-buffer batching across `DataWriter-NFS --data-writer-async-window`, `benchmark-data-write --assume-target-directories`, and synthetic profile URL `files-per-batch=<n>` / `batch-files=<n>` / `files-per-folder=<n>`.
+  - Libnfs target URLs mount the URL path itself. Benchmark target roots must already exist before starting `DataWriter-NFS`; otherwise writer backends fail during `nfs_mount_async` and the pipeline can appear to stall with `files_written=0` until the worker exception surfaces.
+  - Safe architecture: `MetaWriter-NFS` owns directory creation. `DataWriter-NFS` may use `--assume-target-directories` only when target directories are known to have been created by an earlier metadata stage.
+  - agnopo small-write tests on the tuned 16-IP target are currently far below the `50K files/s` goal. Observed rates: one writer lane about `1.64K files/s`; 16-96 writer lanes with packed synthetic small files stayed around `1.8K-2.8K files/s` with the data queue full. Changing synthetic active-directory shape with `files-per-batch=16` did not materially improve the rate.
+  - Heavy packed-buffer batching can currently crash under small-file NFS write pressure. Before further deep sweeps, add a bounded per-context file-operation window inside `LibNfsTargetWriterBackend::write_files()` so each context keeps a controlled number of CREATE/WRITE/CLOSE state machines in flight instead of queueing an entire multi-buffer batch at once.
