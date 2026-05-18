@@ -5238,6 +5238,7 @@ private:
         std::string remote_path;
         std::string_view data;
         std::uint64_t offset = 0;
+        std::size_t bytes_written = 0;
         struct nfsfh* handle = nullptr;
         AsyncCommandState create_state;
         AsyncCommandState write_state;
@@ -5369,12 +5370,13 @@ private:
                 if (rpc == nullptr || raw_handle == nullptr) {
                     throw std::runtime_error("nfs raw stable write handle is unavailable");
                 }
+                const std::size_t remaining = transaction.data.size() - transaction.bytes_written;
                 queue_result = rpc_nfs_write_async(rpc,
                                                    generic_rpc_callback,
                                                    raw_handle,
-                                                   const_cast<char*>(transaction.data.data()),
-                                                   transaction.offset,
-                                                   transaction.data.size(),
+                                                   const_cast<char*>(transaction.data.data() + transaction.bytes_written),
+                                                   transaction.offset + transaction.bytes_written,
+                                                   remaining,
                                                    FILE_SYNC,
                                                    &transaction.write_state);
             } else {
@@ -5449,8 +5451,16 @@ private:
                                 throw std::runtime_error("rpc_nfs_write_async returned NFS error " +
                                                          std::to_string(static_cast<int>(result->status)));
                             }
-                            if (result->WRITE3res_u.resok.count != transaction.data.size()) {
+                            const std::size_t remaining = transaction.data.size() - transaction.bytes_written;
+                            const std::size_t written = result->WRITE3res_u.resok.count;
+                            if (written == 0U || written > remaining) {
                                 throw std::runtime_error("rpc_nfs_write_async short write");
+                            }
+                            transaction.bytes_written += written;
+                            if (transaction.bytes_written < transaction.data.size()) {
+                                queue_write(transaction);
+                                ++it;
+                                continue;
                             }
                         } else {
                             if (transaction.write_state.status < 0) {
