@@ -109,10 +109,12 @@ TargetDataWriterConfig::TargetDataWriterConfig()
 
 TargetDataWriterConfig::TargetDataWriterConfig(std::size_t worker_count,
                                                std::string target_root,
-                                               bool verify_hash)
+                                               bool verify_hash,
+                                               std::size_t async_window)
     : worker_count(std::max<std::size_t>(1U, worker_count)),
       target_root(std::move(target_root)),
-      verify_hash(verify_hash) {}
+      verify_hash(verify_hash),
+      async_window(std::max<std::size_t>(1U, async_window)) {}
 
 TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("target_meta_writer"));
@@ -124,7 +126,8 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
     const ConfigSection values = config.merged_sections(default_job_config_sections("target_data_writer"));
     return TargetDataWriterConfig(config_size_t_or(values, "worker_count", 1U),
                                   config_string_or(values, "target_root", "."),
-                                  config_bool_or(values, "verify_hash", false));
+                                  config_bool_or(values, "verify_hash", false),
+                                  config_size_t_or(values, "async_window", 1U));
 }
 
 TargetMetaWriterJob::TargetMetaWriterJob(TargetMetaWriterConfig config,
@@ -304,13 +307,46 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     auto backend = make_target_writer_backend(config_.target_root);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
+        std::vector<BufferHandle> batch;
         try {
-            process_buffer(*backend, handle);
+            if (config_.async_window > 1U &&
+                sharded_input_ != nullptr &&
+                !is_packed_small_file_buffer(data_buffer(data_pool_, handle))) {
+                batch.push_back(handle);
+                const std::size_t shard =
+                    sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
+                while (batch.size() < config_.async_window) {
+                    BufferHandle next;
+                    if (!sharded_input_->try_pop(shard, next)) {
+                        break;
+                    }
+                    if (is_packed_small_file_buffer(data_buffer(data_pool_, next))) {
+                        sharded_input_->push_wait(shard, next);
+                        break;
+                    }
+                    batch.push_back(next);
+                }
+                process_regular_batch(*backend, batch);
+            } else {
+                process_buffer(*backend, handle);
+            }
         } catch (...) {
-            data_pool_.release(handle);
+            if (batch.empty()) {
+                data_pool_.release(handle);
+            } else {
+                for (const BufferHandle& batched : batch) {
+                    data_pool_.release(batched);
+                }
+            }
             throw;
         }
-        data_pool_.release(handle);
+        if (batch.empty()) {
+            data_pool_.release(handle);
+        } else {
+            for (const BufferHandle& batched : batch) {
+                data_pool_.release(batched);
+            }
+        }
     }
 }
 
@@ -346,6 +382,39 @@ void TargetDataWriterJob::process_buffer(TargetWriterBackend& backend, const Buf
     } else {
         write_regular_buffer(backend, buffer);
         record_buffer(buffer.trailer.data_len);
+    }
+}
+
+void TargetDataWriterJob::process_regular_batch(TargetWriterBackend& backend,
+                                                const std::vector<BufferHandle>& handles) {
+    std::vector<TargetWriterBackend::WriteChunk> chunks;
+    chunks.reserve(handles.size());
+    for (const BufferHandle& handle : handles) {
+        const DataBuffer& buffer = data_buffer(data_pool_, handle);
+        if (is_packed_small_file_buffer(buffer)) {
+            throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
+                                     " cannot batch packed-small-file buffers");
+        }
+        const std::size_t data_len = static_cast<std::size_t>(buffer.trailer.data_len);
+        if (data_len > buffer.bytes.size()) {
+            record_file_failed();
+            throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
+                                     " received oversized data buffer");
+        }
+        TargetWriterBackend::WriteChunk chunk;
+        chunk.spec = file_spec_from_trailer(buffer.trailer);
+        chunk.data = std::string_view(reinterpret_cast<const char*>(buffer.bytes.data()), data_len);
+        chunk.offset = buffer.trailer.data_offset;
+        chunk.last_chunk = (buffer.trailer.flags & kFlagLastChunk) != 0U;
+        chunks.push_back(std::move(chunk));
+    }
+
+    backend.write_chunks(chunks);
+    for (const TargetWriterBackend::WriteChunk& chunk : chunks) {
+        record_buffer(chunk.data.size());
+        if (chunk.last_chunk) {
+            record_file_written();
+        }
     }
 }
 

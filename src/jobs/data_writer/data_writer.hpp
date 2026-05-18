@@ -63,9 +63,13 @@ struct TargetDataWriterConfig {
     std::size_t worker_count = 1;
     std::string target_root;
     bool verify_hash = false;
+    std::size_t async_window = 1;
 
     TargetDataWriterConfig();
-    TargetDataWriterConfig(std::size_t worker_count, std::string target_root, bool verify_hash = false);
+    TargetDataWriterConfig(std::size_t worker_count,
+                           std::string target_root,
+                           bool verify_hash = false,
+                           std::size_t async_window = 1);
 };
 
 [[nodiscard]] TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config);
@@ -134,6 +138,7 @@ protected:
 private:
     [[nodiscard]] bool pop_input(std::size_t worker_index, BufferHandle& handle);
     void process_buffer(TargetWriterBackend& backend, const BufferHandle& handle);
+    void process_regular_batch(TargetWriterBackend& backend, const std::vector<BufferHandle>& handles);
     void write_regular_buffer(TargetWriterBackend& backend, const DataBuffer& buffer);
     void write_packed_small_files(TargetWriterBackend& backend, const DataBuffer& buffer);
     static FileSpec file_spec_from_trailer(const DataBufTrailer& trailer);

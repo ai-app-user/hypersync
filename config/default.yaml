@@ -109,6 +109,7 @@ jobs:
     worker_count: 32
     target_root: .
     verify_hash: false
+    async_window: 1
   scan_writer:
     scan_side: S
     flush_per_file: true

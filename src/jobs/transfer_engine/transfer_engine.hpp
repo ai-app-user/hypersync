@@ -133,6 +133,7 @@ struct DataReadBenchmarkReport {
     std::uint64_t autoscale_interval_ms = 0;
     std::string autoscale_profile;
     std::filesystem::path autoscale_settings_path;
+    std::uint64_t min_file_size_bytes = 0;
     std::uint64_t max_file_size_bytes = 0;
     std::size_t max_files_queued = 0;
     std::size_t small_max_files_queued = 0;
@@ -164,6 +165,7 @@ struct DataReadBenchmarkReport {
     std::size_t write_failed = 0;
     std::uint64_t bytes_written = 0;
     std::size_t data_writer_threads = 0;
+    std::size_t data_writer_async_window = 1;
     std::size_t data_queue_shards = 0;
     std::size_t data_queue_capacity = 0;
     std::size_t data_queue_high_watermark = 0;
@@ -492,8 +494,10 @@ public:
                                                                         std::size_t readdirplus_page_bytes = 0,
                                                                         std::size_t data_reader_threads = 0,
                                                                         std::size_t data_writer_threads = 0,
+                                                                        std::size_t data_writer_async_window = 0,
                                                                         std::size_t data_outstanding_requests = 0,
                                                                         std::size_t small_file_async_window = 0,
+                                                                        std::uint64_t min_file_size_bytes = 0,
                                                                         std::uint64_t max_file_size_bytes = 0,
                                                                         std::size_t max_files_queued = 1024,
                                                                         std::size_t data_buffer_slots = 0,

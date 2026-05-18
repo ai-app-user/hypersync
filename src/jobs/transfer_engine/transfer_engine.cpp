@@ -6084,6 +6084,7 @@ void record_data_read_metadata_batch(bool recursive,
                                      DataReadFileQueue& file_queue,
                                      DataReadBenchmarkStats& stats,
                                      FlatFolderScanBatch batch,
+                                     std::uint64_t min_file_size_bytes,
                                      std::uint64_t max_file_size_bytes) {
     if (batch.failed) {
         std::cerr << "metadata scan skipped folder '"
@@ -6108,6 +6109,9 @@ void record_data_read_metadata_batch(bool recursive,
     std::uint64_t logical_size_bytes = 0;
     for (auto& file : batch.files) {
         const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
+        if (min_file_size_bytes != 0U && logical_size < min_file_size_bytes) {
+            continue;
+        }
         if (max_file_size_bytes != 0U && logical_size > max_file_size_bytes) {
             continue;
         }
@@ -6349,6 +6353,7 @@ void scan_data_read_metadata_worker(const std::string& source_root,
                                     bool recursive,
                                     std::size_t async_directory_depth,
                                     std::size_t readdirplus_page_bytes,
+                                    std::uint64_t min_file_size_bytes,
                                     std::uint64_t max_file_size_bytes,
                                     FlatMetadataWorkQueue& folder_queue,
                                     DataReadFileQueue& file_queue,
@@ -6363,12 +6368,18 @@ void scan_data_read_metadata_worker(const std::string& source_root,
             [&folder_queue, &file_queue] {
                 return flat_metadata_scan_should_stop(folder_queue) || data_read_timer_expired(file_queue);
             },
-            [recursive, max_file_size_bytes, &folder_queue, &file_queue, &stats](FlatFolderScanBatch batch) {
+            [recursive,
+             min_file_size_bytes,
+             max_file_size_bytes,
+             &folder_queue,
+             &file_queue,
+             &stats](FlatFolderScanBatch batch) {
                 record_data_read_metadata_batch(recursive,
                                                 folder_queue,
                                                 file_queue,
                                                 stats,
                                                 std::move(batch),
+                                                min_file_size_bytes,
                                                 max_file_size_bytes);
             });
     } catch (...) {
@@ -6579,6 +6590,7 @@ DataReadBenchmarkSnapshot run_parallel_nfs_open_scan(const NfsMetaReaderConfig& 
                                       meta_config.recursive,
                                       std::max<std::size_t>(1, meta_config.async_directory_depth),
                                       meta_config.readdirplus_page_bytes,
+                                      0,
                                       0,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
@@ -6791,6 +6803,7 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
                                       meta_config.recursive,
                                       std::max<std::size_t>(1, meta_config.async_directory_depth),
                                       meta_config.readdirplus_page_bytes,
+                                      0,
                                       max_file_size_bytes,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
@@ -6840,6 +6853,7 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
 DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig& meta_config,
                                                        const NfsDataReaderConfig& data_config,
                                                        const TargetDataWriterConfig& writer_config,
+                                                       std::uint64_t min_file_size_bytes,
                                                        std::uint64_t max_file_size_bytes,
                                                        std::size_t max_files_queued,
                                                        std::size_t data_buffer_slots,
@@ -6955,6 +6969,7 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
                                       meta_config.recursive,
                                       std::max<std::size_t>(1, meta_config.async_directory_depth),
                                       meta_config.readdirplus_page_bytes,
+                                      min_file_size_bytes,
                                       max_file_size_bytes,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
@@ -8200,6 +8215,7 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
                                       meta_config.recursive,
                                       std::max<std::size_t>(1, meta_config.async_directory_depth),
                                       meta_config.readdirplus_page_bytes,
+                                      0,
                                       0,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
@@ -11263,8 +11279,10 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       std::size_t readdirplus_page_bytes,
                                                                       std::size_t data_reader_threads,
                                                                       std::size_t data_writer_threads,
+                                                                      std::size_t data_writer_async_window,
                                                                       std::size_t data_outstanding_requests,
                                                                       std::size_t small_file_async_window,
+                                                                      std::uint64_t min_file_size_bytes,
                                                                       std::uint64_t max_file_size_bytes,
                                                                       std::size_t max_files_queued,
                                                                       std::size_t data_buffer_slots,
@@ -11310,6 +11328,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     if (data_writer_threads != 0U) {
         writer_config.worker_count = data_writer_threads;
     }
+    if (data_writer_async_window != 0U) {
+        writer_config.async_window = data_writer_async_window;
+    }
 
     NfsMetaReader meta_reader(meta_config);
     NfsDataReader data_reader(data_config);
@@ -11326,7 +11347,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.small_file_async_window = data_config.small_file_async_window != 0U
                                          ? data_config.small_file_async_window
                                          : report.data_outstanding_requests;
+    report.min_file_size_bytes = min_file_size_bytes;
     report.max_file_size_bytes = max_file_size_bytes;
+    report.data_writer_async_window = std::max<std::size_t>(1, writer_config.async_window);
     report.max_files_queued = std::max<std::size_t>(1, max_files_queued);
     report.data_copy_mode = data_copy_mode_name(data_config.copy_data_from_nfs);
     report.pack_small_files = data_config.pack_small_files;
@@ -11338,6 +11361,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     const DataReadBenchmarkSnapshot snapshot = run_parallel_data_write_scan(meta_config,
                                                                             data_config,
                                                                             writer_config,
+                                                                            min_file_size_bytes,
                                                                             max_file_size_bytes,
                                                                             report.max_files_queued,
                                                                             data_buffer_slots,

@@ -218,6 +218,13 @@ public:
     virtual void ensure_directory(const FileSpec& spec) = 0;
     virtual void apply_directory_metadata(const FileSpec& spec) = 0;
     virtual void write_chunk(const FileSpec& spec, std::string_view data, std::uint64_t offset) = 0;
+    struct WriteChunk {
+        FileSpec spec;
+        std::string_view data;
+        std::uint64_t offset = 0;
+        bool last_chunk = false;
+    };
+    virtual void write_chunks(const std::vector<WriteChunk>& chunks);
     virtual void finish_file(const FileSpec& spec) = 0;
     virtual void abort_file(std::string_view rel_path) noexcept = 0;
     [[nodiscard]] virtual std::uint64_t file_hash(std::string_view rel_path) const = 0;

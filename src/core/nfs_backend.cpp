@@ -5024,6 +5024,72 @@ public:
         }
     }
 
+    void write_chunks(const std::vector<WriteChunk>& chunks) override {
+        struct PendingWrite {
+            AsyncCommandState state;
+            const WriteChunk* chunk = nullptr;
+        };
+
+        std::vector<PendingWrite> pending;
+        pending.reserve(chunks.size());
+        std::vector<const WriteChunk*> finish_after_write;
+        finish_after_write.reserve(chunks.size());
+
+        for (const WriteChunk& chunk : chunks) {
+            if (chunk.data.empty()) {
+                if (chunk.last_chunk) {
+                    finish_after_write.push_back(&chunk);
+                }
+                continue;
+            }
+            const std::string rel_path = normalize_path(chunk.spec.rel_path);
+            ensure_directory_chain(parent_path(rel_path));
+            struct nfsfh* handle = open_handle(rel_path, chunk.spec.mode);
+            pending.push_back(PendingWrite {});
+            PendingWrite& write = pending.back();
+            write.chunk = &chunk;
+            write.state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result = nfs_pwrite_async(session_.context(),
+                                                      handle,
+                                                      chunk.offset,
+                                                      chunk.data.size(),
+                                                      chunk.data.data(),
+                                                      generic_nfs_callback,
+                                                      &write.state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_pwrite_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+            if (chunk.last_chunk) {
+                finish_after_write.push_back(&chunk);
+            }
+        }
+
+        std::size_t completed = 0;
+        while (completed < pending.size()) {
+            service_nfs_context(session_.context(), 100);
+            completed = 0;
+            for (const PendingWrite& write : pending) {
+                if (write.state.done) {
+                    ++completed;
+                }
+            }
+        }
+
+        for (const PendingWrite& write : pending) {
+            if (write.state.status < 0) {
+                throw std::runtime_error("nfs_pwrite_async failed: " + write.state.error);
+            }
+            if (write.state.status != static_cast<int>(write.chunk->data.size())) {
+                throw std::runtime_error("nfs_pwrite_async short write");
+            }
+        }
+
+        for (const WriteChunk* chunk : finish_after_write) {
+            finish_file(chunk->spec);
+        }
+    }
+
     void finish_file(const FileSpec& spec) override {
         const std::string rel_path = normalize_path(spec.rel_path);
         const std::string remote_path = "/" + rel_path;
@@ -5262,6 +5328,15 @@ bool libnfs_support_enabled() {
 #else
     return false;
 #endif
+}
+
+void TargetWriterBackend::write_chunks(const std::vector<WriteChunk>& chunks) {
+    for (const WriteChunk& chunk : chunks) {
+        write_chunk(chunk.spec, chunk.data, chunk.offset);
+        if (chunk.last_chunk) {
+            finish_file(chunk.spec);
+        }
+    }
 }
 
 void NfsBackend::visit_files(bool recursive, const std::function<void(FileSpec)>& visitor) const {

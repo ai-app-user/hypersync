@@ -1075,7 +1075,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes|transport-discard|route-discard|sharded-discard] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-data-write --source <dir|nfs-url|synthetic-profile-url> --target <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-writer-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <per-shard>] [--data-copy-mode copy|no-copy] [--verify-hash] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-data-write --source <dir|nfs-url|synthetic-profile-url> --target <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-writer-threads <n>] [--data-writer-async-window <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--min-file-size-bytes <n>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <per-shard>] [--data-copy-mode copy|no-copy] [--verify-hash] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-replay --profile <profile.txt> [--max-files <n>] [--file-count-scale <n>] [--data-size-scale <n>] [--latency-emulation] [--with-payload] [--stats-interval-seconds <n>]\n"
@@ -2908,8 +2908,10 @@ int main(int argc, char** argv) {
             std::size_t readdirplus_page_bytes = 0;
             std::size_t data_reader_threads = 0;
             std::size_t data_writer_threads = 0;
+            std::size_t data_writer_async_window = 0;
             std::size_t data_outstanding_requests = 0;
             std::size_t small_file_async_window = 0;
+            std::uint64_t min_file_size_bytes = 0;
             std::uint64_t max_file_size_bytes = 0;
             std::size_t max_files_queued = 1024;
             std::size_t data_buffer_slots = 0;
@@ -2947,6 +2949,10 @@ int main(int argc, char** argv) {
                     data_writer_threads =
                         parse_size_t_option(require_option(args, i, "--data-writer-threads"),
                                             "--data-writer-threads");
+                } else if (args[i] == "--data-writer-async-window") {
+                    data_writer_async_window =
+                        parse_size_t_option(require_option(args, i, "--data-writer-async-window"),
+                                            "--data-writer-async-window");
                 } else if (args[i] == "--data-outstanding-requests") {
                     data_outstanding_requests =
                         parse_size_t_option(require_option(args, i, "--data-outstanding-requests"),
@@ -2955,6 +2961,10 @@ int main(int argc, char** argv) {
                     small_file_async_window =
                         parse_size_t_option(require_option(args, i, "--small-file-async-window"),
                                             "--small-file-async-window");
+                } else if (args[i] == "--min-file-size-bytes") {
+                    min_file_size_bytes =
+                        parse_size_t_option(require_option(args, i, "--min-file-size-bytes"),
+                                            "--min-file-size-bytes");
                 } else if (args[i] == "--max-file-size-bytes") {
                     max_file_size_bytes =
                         parse_size_t_option(require_option(args, i, "--max-file-size-bytes"),
@@ -3005,8 +3015,10 @@ int main(int argc, char** argv) {
                                                                      readdirplus_page_bytes,
                                                                      data_reader_threads,
                                                                      data_writer_threads,
+                                                                     data_writer_async_window,
                                                                      data_outstanding_requests,
                                                                      small_file_async_window,
+                                                                     min_file_size_bytes,
                                                                      max_file_size_bytes,
                                                                      max_files_queued,
                                                                      data_buffer_slots,
@@ -3032,8 +3044,10 @@ int main(int argc, char** argv) {
                       << " readdirplus_page_bytes=" << report.readdirplus_page_bytes
                       << " data_reader_threads=" << report.data_reader_threads
                       << " data_writer_threads=" << report.data_writer_threads
+                      << " data_writer_async_window=" << report.data_writer_async_window
                       << " data_outstanding_requests=" << report.data_outstanding_requests
                       << " small_file_async_window=" << report.small_file_async_window
+                      << " min_file_size_bytes=" << report.min_file_size_bytes
                       << " max_file_size_bytes=" << report.max_file_size_bytes
                       << " max_files_queued=" << report.max_files_queued
                       << " data_buffer_slots=" << report.data_buffer_slots
