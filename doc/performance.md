@@ -2515,3 +2515,39 @@ Interpretation: `DataReader-SYN-64` sustains about `1.0-1.1 Tbit/s` logical
 synthetic throughput on the profiled file-size distribution. Copy and no-copy
 are similar here, so the measured limit is dominated by DataReader scheduling,
 buffer churn, and discard pressure rather than payload memory initialization.
+
+### Fast PRNG Payload Mode
+
+Host: transfer1  
+Commit: `823e0cf`  
+Profile:
+`/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-data-sampled-fastpath-20260517T200342Z/profile.txt`
+
+Pipeline:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-64]->(DataBufQueue)->[BufferDiscarder-1]
+```
+
+Command delta from the zero-fill baseline:
+
+```text
+--source synthetic-profile://<profile>?payload=prng
+--data-copy-mode copy
+```
+
+Result:
+
+```text
+files_found   507,904
+files_read    491,961
+bytes_read    1,186,317,284,398
+elapsed_s     10.010
+Gbit/s        948.09
+files/s       49.15K
+```
+
+Interpretation: pseudo-random payload generation is now real CPU work in the
+synthetic data path. The fast xorshift64-style fill keeps the benchmark near
+`950 Gbit/s`, about `11%` below the zero-fill copy baseline, while preserving
+the same profile-backed file-size distribution and normal buffer pipeline.

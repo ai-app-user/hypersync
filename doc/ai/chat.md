@@ -508,3 +508,19 @@ requests `2`, and the archived full-source profile. The no-copy run sustained
 `55.0K files/s`. Copy and no-copy were similar, so the current synthetic data
 limit is mostly reader scheduling/buffer/discard pressure rather than payload
 initialization.
+
+## 2026-05-18
+
+**User:** Asked to try `DataReader-SYN` with pseudo-random data using a fast
+algorithm.
+
+**Codex:** Added `synthetic-profile://...?payload=prng` support to the
+profile-backed synthetic backend. The mode fills copied data buffers with a
+deterministic fast xorshift64-style stream seeded by profile seed, path hash,
+and chunk offset. Added unit coverage proving the payload is deterministic,
+non-zero, and distinct for different synthetic files. Deployed transfer1 from
+`dev` commit `823e0cf` and reran the same profile-backed pipeline:
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-64]->(DataBufQueue)->[BufferDiscarder-1]`.
+The `copy` run with `payload=prng` reached `948.09 Gbit/s` and `49.15K files/s`
+over `10.01s`, which is about `11%` below the zero-fill copy baseline because
+payload generation is now real CPU work.
