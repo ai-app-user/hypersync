@@ -2408,3 +2408,51 @@ target. The existing generator benchmark still contains helper modes rather than
 a clean named `NfsMetaGenerator` job, so the next architectural cleanup should
 promote synthetic metadata generation into a normal Piper job that emits
 metadata buffers into queues and can be composed with scan/read/diff pipelines.
+
+## Profile-Backed SyntheticMetaReader, 2026-05-18
+
+Host: transfer1  
+Commit: `6c7a3c8`  
+Profile:
+`/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-data-sampled-fastpath-20260517T200342Z/profile.txt`
+
+Pipeline:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(MetadataBufQueue)->[MetadataStatsDiscarder]
+```
+
+Command shape:
+
+```text
+benchmark-meta --source synthetic-profile://<profile>
+  --metadata-stats-discarder
+  --meta-reader-threads 96
+  --metadata-async-depth 256
+  --max-duration-seconds 10
+  --stats-interval-seconds 2
+  --no-pipeline-autoscale
+  --record-buffer-slots 4096
+```
+
+Result:
+
+```text
+2s   76.7M files/s
+4s   75.6M files/s
+6s   72.0M files/s
+8s   72.0M files/s
+10s  67.3M files/s
+
+files_seen              690,380,800
+folders_found           168,807
+logical_size_bytes      657,311,099,714,718
+elapsed_s               13.208
+records_per_second      67.86M
+```
+
+Implementation note: the profile-backed source originally stopped after the
+first synthetic `4096` file batch when used through `FolderSeeder`. It now
+exposes replay batches as recursive synthetic folders, with root fanout based on
+`metadata_async_depth`, so normal scanner workers can consume the generated
+profile in parallel.

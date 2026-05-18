@@ -465,3 +465,16 @@ the old unused direct flat-metadata scan helper. Local build passed and
 processed the same input in `15.45s` at `12.9M files/s`. Transport discard
 through 32 sender/receiver/discarder lanes processed the same input in `18.94s`
 at `10.6M files/s`.
+
+## 2026-05-18
+
+**User:** Asked to test the profile-backed SyntheticMetaReader now.
+
+**Codex:** Fixed the `synthetic-profile://` backend so it composes correctly
+with the normal recursive scanner pipeline. Synthetic replay now exposes
+seekable batch folders and root fanout, so `FolderSeeder -> NfsMetaReaderBuffer`
+can keep many readers active instead of stopping after the first 4096-file
+batch. Added functional coverage for recursive batch folder replay. On
+transfer1, the profile-backed stats discard run used the archived full-source
+sampled profile and sustained roughly `67.3M files/s` over 10 seconds with
+`96` metadata readers and async depth `256`.
