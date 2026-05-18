@@ -2334,3 +2334,47 @@ Cumulative scanner/writer samples:
 ```
 
 Interpretation: DB-backed scan remains fast and the parquet output is finalized/readable. It is slower than discard-only, as expected, because parquet writer processes drain after the 180s scan timer and the run entered slower/tail regions.
+
+## Metadata Pipeline Sizing Isolation, 2026-05-18
+
+Source: `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5`
+
+Current sizing guidance from transfer1 tests:
+
+```text
+NfsMetaReaderBuffer: 96 readers
+metadata_async_depth: 256
+metadata buffer slots: 4096
+Parquet writer partitions: 32 processes
+Parquet writer per-process DuckDB settings: 1GB memory, 1 DuckDB thread, 2GB checkpoint, uncompressed parquet
+```
+
+Pipeline isolation results:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(MetadataBufQueue-64shards/4096total)->[BufferDiscarder-64]
+  7.10M files/s over 120s, queue high watermark 133/4096, queue_full=false
+
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(MetadataBufQueue-4096)->[BufferDiscarder-1]
+  6.11M files/s over 120s, queue high watermark 256/4096, queue_full=false
+
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(MetadataBufQueue-4096)->[PartitionedMetadataRouter-32]->(PartitionSendQueue-1024 x32)->[BufferDiscarder-1 x32]
+  peaked near 6.90M files/s, ended 4.25M files/s over 180s after folder-heavy topology phase, metadata queue high watermark 377/4096, queue_full=false
+
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(MetadataBufQueue-4096)->[PartitionedMetadataRouter-32]->(PartitionSendQueue-1024 x32)->[BufferSender-1 x32]->(UnixSocket x32)->[BufferReceiver-1 x32]->(WriterBufQueue-1024 x32)->[BufferDiscarder-1 x32]
+  peaked near 6.49M files/s, ended 3.24M files/s over 180s after folder-heavy topology phase, metadata queue high watermark 2982/4096, queue_full=false
+
+[FolderSeeder-1]->(FolderQueue)->[NfsMetaReaderBuffer-96]->(MetadataBufQueue-4096)->[PartitionedMetadataRouter-32]->(PartitionSendQueue-1024 x32)->[BufferSender-1 x32]->(UnixSocket x32)->[BufferReceiver-1 x32]->(WriterBufQueue-1024 x32)->[MetadataRecordWriter-1 x32]
+  peaked near 5.55M files/s, ended 3.80M files/s over 180s plus writer drain, metadata queue high watermark 3040/4096, queue_full=false
+```
+
+Conclusions:
+
+```text
+- 96 metadata readers is the current best known scanner sizing for this source shape.
+- 128 metadata readers was unstable/bad in sharded-discard testing and was stopped after it exceeded the 120s timer by several minutes.
+- Metadata output queues did not reach full in any isolation run; queue fullness is not the current bottleneck.
+- Parquet writer fanout should stay at 32 processes, matching the earlier best result.
+- The route-discard run confirms the router and partition queues can still approach the 7M files/s scanner band before topology/tail effects.
+- Socket transport and writer work add measurable overhead; Parquet writer/drain remains the slowest downstream stage.
+```
