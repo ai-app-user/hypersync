@@ -166,6 +166,7 @@ struct DataReadBenchmarkReport {
     std::uint64_t bytes_written = 0;
     std::size_t data_writer_threads = 0;
     std::size_t data_writer_async_window = 1;
+    std::size_t data_writer_file_window = 64;
     std::size_t data_queue_shards = 0;
     std::size_t data_queue_capacity = 0;
     std::size_t data_queue_high_watermark = 0;
@@ -509,7 +510,8 @@ public:
                                                                         bool verify_hash = false,
                                                                         bool preserve_target_metadata = true,
                                                                         bool target_fsync = true,
-                                                                        bool ensure_target_directories = true) const;
+                                                                        bool ensure_target_directories = true,
+                                                                        std::size_t data_writer_file_window = 0) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
                                                                       bool recursive = true,
                                                                       std::size_t meta_reader_threads = 0,

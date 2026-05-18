@@ -5219,8 +5219,9 @@ public:
             AsyncCommandState write_state;
             AsyncCommandState close_state;
             const WriteChunk* file = nullptr;
+            std::string remote_path;
             struct nfsfh* handle = nullptr;
-            enum class Phase { creating, writing, closing, done } phase = Phase::creating;
+            enum class Phase { waiting, creating, writing, closing, done } phase = Phase::waiting;
         };
 
         std::vector<PendingFile> pending;
@@ -5233,24 +5234,37 @@ public:
             pending.push_back(PendingFile {});
             PendingFile& state = pending.back();
             state.file = &file;
+            state.remote_path = "/" + rel_path;
+        }
+
+        const std::size_t max_active =
+            std::max<std::size_t>(1U, options_.max_concurrent_file_transactions);
+        std::size_t next_to_queue = 0;
+        std::size_t active = 0;
+
+        auto queue_create = [&](PendingFile& state) {
+            state.phase = PendingFile::Phase::creating;
             state.create_state.queued_at = std::chrono::steady_clock::now();
-            const std::string remote_path = "/" + rel_path;
             const int queue_result = nfs_create_async(session_.context(),
-                                                      remote_path.c_str(),
+                                                      state.remote_path.c_str(),
                                                       O_TRUNC,
-                                                      static_cast<int>(file.spec.mode),
+                                                      static_cast<int>(state.file->spec.mode),
                                                       generic_nfs_callback,
                                                       &state.create_state);
             if (queue_result != 0) {
                 throw std::runtime_error("nfs_create_async queue failed: " +
                                          std::string(nfs_get_error(session_.context())));
             }
+        };
+
+        while (next_to_queue < pending.size() && active < max_active) {
+            queue_create(pending[next_to_queue++]);
+            ++active;
         }
 
         std::size_t completed = 0;
         while (completed < pending.size()) {
-            service_nfs_context(session_.context(), 100);
-            completed = 0;
+            service_nfs_context(session_.context(), active == 0U ? 0 : 100);
             for (PendingFile& state : pending) {
                 if (state.phase == PendingFile::Phase::creating && state.create_state.done) {
                     if (state.create_state.status < 0) {
@@ -5325,9 +5339,12 @@ public:
                         apply_remote_metadata("/" + normalize_path(state.file->spec.rel_path), state.file->spec);
                     }
                     state.phase = PendingFile::Phase::done;
-                }
-                if (state.phase == PendingFile::Phase::done) {
                     ++completed;
+                    --active;
+                    while (next_to_queue < pending.size() && active < max_active) {
+                        queue_create(pending[next_to_queue++]);
+                        ++active;
+                    }
                 }
             }
         }

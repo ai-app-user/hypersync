@@ -217,6 +217,7 @@ public:
         bool preserve_metadata = true;
         bool fsync_on_finish = true;
         bool ensure_parent_directories = true;
+        std::size_t max_concurrent_file_transactions = 64;
     };
 
     virtual ~TargetWriterBackend() = default;

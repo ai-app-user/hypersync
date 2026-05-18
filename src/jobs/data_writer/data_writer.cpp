@@ -113,14 +113,16 @@ TargetDataWriterConfig::TargetDataWriterConfig(std::size_t worker_count,
                                                std::size_t async_window,
                                                bool preserve_metadata,
                                                bool fsync_on_finish,
-                                               bool ensure_parent_directories)
+                                               bool ensure_parent_directories,
+                                               std::size_t max_concurrent_file_transactions)
     : worker_count(std::max<std::size_t>(1U, worker_count)),
       target_root(std::move(target_root)),
       verify_hash(verify_hash),
       async_window(std::max<std::size_t>(1U, async_window)),
       preserve_metadata(preserve_metadata),
       fsync_on_finish(fsync_on_finish),
-      ensure_parent_directories(ensure_parent_directories) {}
+      ensure_parent_directories(ensure_parent_directories),
+      max_concurrent_file_transactions(std::max<std::size_t>(1U, max_concurrent_file_transactions)) {}
 
 TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("target_meta_writer"));
@@ -136,7 +138,8 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
                                   config_size_t_or(values, "async_window", 1U),
                                   config_bool_or(values, "preserve_metadata", true),
                                   config_bool_or(values, "fsync_on_finish", true),
-                                  config_bool_or(values, "ensure_parent_directories", true));
+                                  config_bool_or(values, "ensure_parent_directories", true),
+                                  config_size_t_or(values, "max_concurrent_file_transactions", 64U));
 }
 
 TargetMetaWriterJob::TargetMetaWriterJob(TargetMetaWriterConfig config,
@@ -317,6 +320,7 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     options.preserve_metadata = config_.preserve_metadata;
     options.fsync_on_finish = config_.fsync_on_finish;
     options.ensure_parent_directories = config_.ensure_parent_directories;
+    options.max_concurrent_file_transactions = config_.max_concurrent_file_transactions;
     auto backend = make_target_writer_backend(config_.target_root, worker_index, options);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
