@@ -111,6 +111,27 @@ If a Job needs special behavior, that behavior belongs in a domain-specific Job
 or payload view, not in the generic queue, pool, sender, receiver, or monitoring
 layer.
 
+Job names describe the work performed, not the storage backend. Metadata and
+data readers are generic Jobs:
+
+`MetaReader`, `DataReader`
+
+Backend-specific behavior belongs behind the backend interface selected by the
+source URL:
+
+`nfs://... -> NFS`, `synthetic-profile://... -> SYN`, local filesystem paths
+`-> FS`.
+
+Pipeline and status displays must include the backend suffix when ambiguity
+matters:
+
+`[MetaReader-NFS-8]`, `[DataReader-SYN-64]`, `[DataReader-FS-4]`.
+
+Do not introduce parallel job names such as `NfsDataReader`,
+`SyntheticDataReader`, or `FsDataReader` for the same logical pipeline role.
+The real NFS, synthetic profile, and filesystem-specific code lives in backend
+adapters, not in separate pipeline job types.
+
 ### 0.6 Waiting and Backpressure Rules
 
 Jobs are expected to run at maximum useful speed. A Job must never wait for a

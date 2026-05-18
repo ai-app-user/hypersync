@@ -2226,6 +2226,20 @@ std::string data_copy_mode_name(bool copy_payload_to_buffer) {
     return copy_payload_to_buffer ? "copy" : "no-copy";
 }
 
+std::string backend_code_for_source(std::string_view source) {
+    if (source.rfind("synthetic-profile://", 0) == 0) {
+        return "SYN";
+    }
+    if (is_nfs_url(source)) {
+        return "NFS";
+    }
+    return "FS";
+}
+
+std::string backend_job_name(std::string_view base_name, std::string_view source) {
+    return std::string(base_name) + "-" + backend_code_for_source(source);
+}
+
 MonitorQueueSnapshot monitor_buf_queue(std::string name, const BufQueue& queue) {
     MonitorQueueSnapshot snapshot;
     snapshot.name = std::move(name);
@@ -6610,10 +6624,12 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
     StatusRegistry status_registry;
     std::unique_ptr<StatusServer> status_server;
     if (!status_socket_path.empty()) {
-        status_registry.register_job("nfs_meta_reader", [&stats, metadata_threads]() {
+        const std::string meta_reader_job_name = backend_job_name("MetaReader", data_config.source_root);
+        const std::string data_reader_job_name = backend_job_name("DataReader", data_config.source_root);
+        status_registry.register_job(meta_reader_job_name, [&stats, metadata_threads, meta_reader_job_name]() {
             const DataReadBenchmarkSnapshot stats_snapshot = snapshot_data_read_stats(stats);
             MonitorJobSnapshot snapshot;
-            snapshot.name = "nfs_meta_reader";
+            snapshot.name = meta_reader_job_name;
             snapshot.running = true;
             snapshot.worker_count = metadata_threads;
             snapshot.processed_count = stats_snapshot.files_found + stats_snapshot.folders_found;
@@ -6623,10 +6639,10 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
                               " folders_found=" + std::to_string(stats_snapshot.folders_found);
             return snapshot;
         });
-        status_registry.register_job("nfs_data_reader", [&data_reader_job]() {
+        status_registry.register_job(data_reader_job_name, [&data_reader_job, data_reader_job_name]() {
             const NfsDataBufferReaderStats stats_snapshot = data_reader_job.stats();
             MonitorJobSnapshot snapshot;
-            snapshot.name = "nfs_data_reader";
+            snapshot.name = data_reader_job_name;
             snapshot.running = stats_snapshot.running;
             snapshot.worker_count = stats_snapshot.worker_count;
             snapshot.processed_count = stats_snapshot.buffers_read;
@@ -7817,10 +7833,12 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
     StatusRegistry status_registry;
     std::unique_ptr<StatusServer> status_server;
     if (!status_socket_path.empty()) {
-        status_registry.register_job("nfs_meta_reader", [&stats, metadata_threads]() {
+        const std::string meta_reader_job_name = backend_job_name("MetaReader", data_config.source_root);
+        const std::string data_reader_job_name = backend_job_name("DataReader", data_config.source_root);
+        status_registry.register_job(meta_reader_job_name, [&stats, metadata_threads, meta_reader_job_name]() {
             const DataReadBenchmarkSnapshot stats_snapshot = snapshot_data_read_stats(stats);
             MonitorJobSnapshot snapshot;
-            snapshot.name = "nfs_meta_reader";
+            snapshot.name = meta_reader_job_name;
             snapshot.running = true;
             snapshot.worker_count = metadata_threads;
             snapshot.processed_count = stats_snapshot.files_found + stats_snapshot.folders_found;
@@ -7830,10 +7848,10 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
                               " folders_found=" + std::to_string(stats_snapshot.folders_found);
             return snapshot;
         });
-        status_registry.register_job("nfs_data_reader", [&data_reader_job]() {
+        status_registry.register_job(data_reader_job_name, [&data_reader_job, data_reader_job_name]() {
             const NfsDataBufferReaderStats stats_snapshot = data_reader_job.stats();
             MonitorJobSnapshot snapshot;
-            snapshot.name = "nfs_data_reader";
+            snapshot.name = data_reader_job_name;
             snapshot.running = stats_snapshot.running;
             snapshot.worker_count = stats_snapshot.worker_count;
             snapshot.processed_count = stats_snapshot.buffers_read;

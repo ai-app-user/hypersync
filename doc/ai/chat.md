@@ -485,3 +485,18 @@ sampled profile and sustained roughly `67.3M files/s` over 10 seconds with
 `60.12M files/s` with the single output queue high-watermarking at `4095`.
 Current conclusion: scaling is nearly linear to `32` workers, then the discard
 sink/queue becomes the bottleneck.
+
+## 2026-05-18
+
+**User:** Clarified that metadata/data reader Jobs should be backend-generic:
+`MetaReader` and `DataReader`, with backend suffixes visible in pipelines and
+status output (`-NFS`, `-SYN`, `-FS`). The old non-buffer data reader path is
+not part of the desired architecture.
+
+**Codex:** Updated the mandatory architecture docs and guidelines with the
+generic job naming rule. Added backend-suffixed status job names for the
+buffer-native data read and data hash pipelines, e.g. `MetaReader-SYN` and
+`DataReader-NFS`. Kept the internal `NfsDataReader` helper in place for now
+because the buffer-native `DataReader` still delegates backend read operations
+through it; it should be renamed/flattened in a later cleanup without changing
+the pipeline contract.

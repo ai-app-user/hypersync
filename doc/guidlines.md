@@ -26,6 +26,11 @@ This document defines general development principles for the application. It sho
 - Use sharded queues for hot producer-to-consumer data paths. Consumers should prefer their assigned shard but be able to steal from other shards so imbalanced workloads do not strand buffers.
 - Development and performance tests should exercise sharded queues for hot job-to-job paths. Keep single `BufQueue` tests only for the primitive itself or explicit contention experiments.
 - Keep domain work in the responsible job. For example, NFS readers read data buffers; hashers hash data buffers and finalize file hashes.
+- Name pipeline jobs by their role, not by the backend. Use generic names such
+  as `MetaReader` and `DataReader`; show backend identity as a suffix in
+  pipelines/status output (`-NFS`, `-SYN`, `-FS`). Backend-specific behavior
+  belongs in backend adapters selected by the source URL, not in separate
+  pipeline job classes for each backend.
 - Keep command behavior stable enough for automation.
 - Add configuration only when it has a clear operational purpose.
 - Keep defaults safe for small local tests, with explicit options for high-performance runs.
