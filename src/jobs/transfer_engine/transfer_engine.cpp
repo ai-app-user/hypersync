@@ -4576,7 +4576,20 @@ public:
                                            PartitionedMetadataWriter& partitioned_writer)
         : BufferConsumerJob(std::max<std::size_t>(1U, worker_count), input, registry),
           stats_discarder_(stats_discarder),
-          partitioned_writer_(partitioned_writer) {}
+          partitioned_writer_(&partitioned_writer) {}
+
+    PartitionedFlatFolderMetadataRouterJob(std::size_t worker_count,
+                                           BufQueue& input,
+                                           const BufferPoolRegistry& registry,
+                                           MetadataStatsDiscarder* stats_discarder,
+                                           std::vector<std::unique_ptr<BufQueue>>& partition_queues)
+        : BufferConsumerJob(std::max<std::size_t>(1U, worker_count), input, registry),
+          stats_discarder_(stats_discarder),
+          partition_queues_(&partition_queues) {
+        if (partition_queues.empty()) {
+            throw std::invalid_argument("metadata route discard requires at least one partition queue");
+        }
+    }
 
 protected:
     void process_buffer(const BufferHandle& handle, RawBufferPool& pool) override {
@@ -4606,17 +4619,32 @@ protected:
             stats_discarder_->record_batch(files_found, logical_size_bytes, folders_found);
         }
 
-        try {
-            partitioned_writer_.route_flat_folder_buffer(handle, pool);
-        } catch (...) {
+        if (partitioned_writer_ != nullptr) {
+            try {
+                partitioned_writer_->route_flat_folder_buffer(handle, pool);
+            } catch (...) {
+                pool.release(handle);
+                throw;
+            }
+            return;
+        }
+
+        if (partition_queues_ == nullptr || partition_queues_->empty()) {
             pool.release(handle);
-            throw;
+            throw std::runtime_error("metadata router has no output route");
+        }
+        const FlatFolderBufferInfo info = flat_folder_buffer_info(buffer);
+        const std::size_t partition = metadata_partition_for_path(info.folder_path, partition_queues_->size());
+        if (!(*partition_queues_)[partition]->push_wait(handle)) {
+            pool.release(handle);
+            throw std::runtime_error("metadata route discard queue closed while pushing scan buffer");
         }
     }
 
 private:
     MetadataStatsDiscarder* stats_discarder_ = nullptr;
-    PartitionedMetadataWriter& partitioned_writer_;
+    PartitionedMetadataWriter* partitioned_writer_ = nullptr;
+    std::vector<std::unique_ptr<BufQueue>>* partition_queues_ = nullptr;
 };
 
 std::size_t shard_for_folder_hash(std::uint64_t folder_hash, std::size_t shard_count) {
@@ -10252,8 +10280,9 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
     report.autoscale_settings_path = pipeline_autoscale ? autoscale_settings_path : std::filesystem::path {};
     if (metadata_output_partition_mode != "single" &&
         metadata_output_partition_mode != "processes" &&
-        metadata_output_partition_mode != "transport-discard") {
-        throw std::invalid_argument("metadata output partition mode must be single, processes, or transport-discard");
+        metadata_output_partition_mode != "transport-discard" &&
+        metadata_output_partition_mode != "route-discard") {
+        throw std::invalid_argument("metadata output partition mode must be single, processes, transport-discard, or route-discard");
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -10307,13 +10336,14 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         std::optional<MetadataRecordWriter> record_writer;
         std::unique_ptr<PartitionedMetadataWriter> partitioned_writer;
         const bool transport_discard = metadata_output_partition_mode == "transport-discard";
-        if ((writer_config.enabled || transport_discard) && report.metadata_output_partitions > 1U) {
+        const bool route_discard = metadata_output_partition_mode == "route-discard";
+        if ((writer_config.enabled || transport_discard || route_discard) && report.metadata_output_partitions > 1U) {
             if (metadata_output_partition_mode != "processes") {
-                if (!transport_discard) {
+                if (!transport_discard && !route_discard) {
                     throw std::invalid_argument("partitioned metadata output requires --metadata-output-partition-mode processes");
                 }
             }
-            if (writer_config.output_path.empty()) {
+            if (transport_discard && writer_config.output_path.empty()) {
                 throw std::invalid_argument("transport-discard metadata partition mode requires --metadata-output for socket/report directory");
             }
         } else if (writer_config.enabled) {
@@ -10363,10 +10393,29 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                        metadata_queue,
                                        max_duration_seconds);
         const std::size_t metadata_consumer_threads =
-            partitioned_writer != nullptr ? std::min(report.meta_reader_threads, report.metadata_output_partitions)
-                                          : 1U;
+            (partitioned_writer != nullptr || route_discard)
+                ? std::min(report.meta_reader_threads, report.metadata_output_partitions)
+                : 1U;
+        std::vector<std::unique_ptr<BufQueue>> route_discard_queues;
+        std::vector<std::unique_ptr<BufferDiscarderJob>> route_discarders;
         std::unique_ptr<ThreadedJob> metadata_consumer;
-        if (partitioned_writer != nullptr) {
+        if (route_discard) {
+            route_discard_queues.reserve(report.metadata_output_partitions);
+            route_discarders.reserve(report.metadata_output_partitions);
+            for (std::size_t index = 0; index < report.metadata_output_partitions; ++index) {
+                route_discard_queues.push_back(std::make_unique<BufQueue>(kMetadataPartitionTransportPoolSlots));
+                route_discarders.push_back(std::make_unique<BufferDiscarderJob>(
+                    BufferDiscarderConfig(1U),
+                    *route_discard_queues.back(),
+                    registry));
+            }
+            metadata_consumer = std::make_unique<PartitionedFlatFolderMetadataRouterJob>(
+                metadata_consumer_threads,
+                metadata_queue,
+                registry,
+                &stats_discarder,
+                *route_discard_queues);
+        } else if (partitioned_writer != nullptr) {
             metadata_consumer = std::make_unique<PartitionedFlatFolderMetadataRouterJob>(
                 metadata_consumer_threads,
                 metadata_queue,
@@ -10386,6 +10435,9 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         stats_discarder.start();
         stats_discarder.record_folder("");
         folder_seeder.start();
+        for (auto& discarder : route_discarders) {
+            discarder->start();
+        }
         metadata_consumer->start();
         scanner.start();
         scanner.wait();
@@ -10394,6 +10446,12 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
             std::rethrow_exception(error);
         }
         metadata_consumer->wait();
+        for (auto& queue : route_discard_queues) {
+            queue->close();
+        }
+        for (auto& discarder : route_discarders) {
+            discarder->wait();
+        }
         report.learned_meta_reader_threads = report.meta_reader_threads;
         stats_discarder.stop();
         const MetadataStatsSnapshot stats = stats_discarder.snapshot();
