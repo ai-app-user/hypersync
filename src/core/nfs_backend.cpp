@@ -5305,6 +5305,9 @@ private:
             while (!backlog_.empty() && active_.size() < max_active) {
                 std::shared_ptr<FileTransaction> transaction = std::move(backlog_.front());
                 backlog_.pop_front();
+                if (fleet_.options_.ensure_parent_directories) {
+                    ensure_directory_chain(parent_path(transaction->spec.rel_path));
+                }
                 queue_create(*transaction);
                 active_.push_back(std::move(transaction));
             }
@@ -5409,6 +5412,9 @@ private:
                             throw std::runtime_error("nfs_close_async failed: " + transaction.close_state.error);
                         }
                         transaction.handle = nullptr;
+                        if (fleet_.options_.preserve_metadata) {
+                            apply_remote_metadata(transaction.remote_path, transaction.spec);
+                        }
                         transaction.phase = FileTransaction::Phase::done;
                         complete_transaction(*it, {});
                         it = active_.erase(it);
@@ -5459,12 +5465,123 @@ private:
             active_.clear();
         }
 
+        void apply_remote_metadata(const std::string& remote_path, const FileSpec& spec) {
+            const auto stat = try_stat64(session_.context(), remote_path);
+            if (!stat.has_value()) {
+                throw std::runtime_error("remote path missing while applying metadata: " + remote_path);
+            }
+
+            if (static_cast<std::uint32_t>(stat->nfs_uid) != spec.uid ||
+                static_cast<std::uint32_t>(stat->nfs_gid) != spec.gid) {
+                run_async_command(
+                    session_.context(),
+                    [&](AsyncCommandState* state) {
+                        return nfs_chown_async(session_.context(),
+                                               remote_path.c_str(),
+                                               static_cast<int>(spec.uid),
+                                               static_cast<int>(spec.gid),
+                                               generic_nfs_callback,
+                                               state);
+                    },
+                    "nfs_chown_async");
+            }
+
+            if ((stat->nfs_mode & 0777U) != spec.mode) {
+                run_async_command(
+                    session_.context(),
+                    [&](AsyncCommandState* state) {
+                        return nfs_chmod_async(session_.context(),
+                                               remote_path.c_str(),
+                                               static_cast<int>(spec.mode),
+                                               generic_nfs_callback,
+                                               state);
+                    },
+                    "nfs_chmod_async");
+            }
+
+            const std::uint64_t remote_mtime = truncate_to_microseconds(mtime_from_nfs_stat(*stat));
+            if (remote_mtime != truncate_to_microseconds(spec.mtime)) {
+                struct timeval times[2];
+                times[0].tv_sec = static_cast<time_t>(spec.mtime / 1'000'000'000ULL);
+                times[0].tv_usec = static_cast<suseconds_t>((spec.mtime % 1'000'000'000ULL) / 1000ULL);
+                times[1] = times[0];
+                run_async_command(
+                    session_.context(),
+                    [&](AsyncCommandState* state) {
+                        return nfs_utimes_async(
+                            session_.context(), remote_path.c_str(), times, generic_nfs_callback, state);
+                    },
+                    "nfs_utimes_async");
+            }
+        }
+
+        void ensure_directory_chain(std::string_view rel_path) {
+            const std::string normalized = normalize_path(rel_path);
+            if (normalized.empty()) {
+                return;
+            }
+
+            std::string current_path;
+            std::string component;
+            for (char ch : normalized) {
+                if (ch == '/') {
+                    if (!component.empty()) {
+                        if (!current_path.empty()) {
+                            current_path.push_back('/');
+                        }
+                        current_path += component;
+                        ensure_single_directory(current_path);
+                        component.clear();
+                    }
+                } else {
+                    component.push_back(ch);
+                }
+            }
+            if (!component.empty()) {
+                if (!current_path.empty()) {
+                    current_path.push_back('/');
+                }
+                current_path += component;
+                ensure_single_directory(current_path);
+            }
+        }
+
+        void ensure_single_directory(const std::string& rel_path) {
+            if (known_directories_.find(rel_path) != known_directories_.end()) {
+                return;
+            }
+
+            const std::string remote_path = "/" + rel_path;
+            const auto stat = try_stat64(session_.context(), remote_path);
+            if (!stat.has_value()) {
+                AsyncCommandState mkdir_state;
+                mkdir_state.queued_at = std::chrono::steady_clock::now();
+                const int queue_result = nfs_mkdir2_async(session_.context(),
+                                                          remote_path.c_str(),
+                                                          0755,
+                                                          generic_nfs_callback,
+                                                          &mkdir_state);
+                if (queue_result != 0) {
+                    throw std::runtime_error("nfs_mkdir2_async queue failed: " +
+                                             std::string(nfs_get_error(session_.context())));
+                }
+                pump_nfs_until_done(session_.context(), mkdir_state);
+                if (mkdir_state.status < 0 && mkdir_state.status != -EEXIST) {
+                    throw std::runtime_error("nfs_mkdir2_async failed: " + mkdir_state.error);
+                }
+            } else if (!S_ISDIR(stat->nfs_mode)) {
+                throw std::runtime_error("remote path exists but is not a directory: " + remote_path);
+            }
+            known_directories_.insert(rel_path);
+        }
+
         NfsTargetWriteReactorFleet& fleet_;
         std::size_t index_;
         LibNfsSession session_;
         std::atomic<QueueNode*> inbound_ {nullptr};
         std::deque<std::shared_ptr<FileTransaction>> backlog_;
         std::vector<std::shared_ptr<FileTransaction>> active_;
+        std::unordered_set<std::string> known_directories_ {""};
         std::atomic<bool> stop_requested_ {false};
         std::thread thread_;
     };
