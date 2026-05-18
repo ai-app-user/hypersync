@@ -4328,7 +4328,30 @@ public:
           folder_input_(folder_input),
           folder_feedback_(folder_feedback),
           output_pool_(output_pool),
-          output_(output),
+          output_(&output),
+          max_duration_seconds_(max_duration_seconds) {}
+
+    NfsMetaReaderBufferJob(std::string root,
+                           std::string compare_mode,
+                           std::size_t worker_count,
+                           std::size_t async_depth,
+                           RawBufferPool& folder_pool,
+                           RawBufferPool& feedback_pool,
+                           BufQueue& folder_input,
+                           BufQueue& folder_feedback,
+                           RawBufferPool& output_pool,
+                           ShardedBufQueue& output,
+                           double max_duration_seconds)
+        : ThreadedJob(worker_count),
+          root_(std::move(root)),
+          compare_mode_(std::move(compare_mode)),
+          async_depth_(std::max<std::size_t>(1U, async_depth)),
+          folder_pool_(folder_pool),
+          feedback_pool_(feedback_pool),
+          folder_input_(folder_input),
+          folder_feedback_(folder_feedback),
+          output_pool_(output_pool),
+          sharded_output_(&output),
           max_duration_seconds_(max_duration_seconds) {}
 
     [[nodiscard]] DistributedDiffRunReport stats() const {
@@ -4405,7 +4428,10 @@ protected:
                         throw std::runtime_error("flat folder scanner stopped while waiting for output buffer");
                     },
                     [this, worker_index](const BufferHandle& handle) {
-                        if (!wait_for_output(worker_index, output_, handle)) {
+                        const bool pushed = sharded_output_ != nullptr
+                                                ? wait_for_output(worker_index, *sharded_output_, handle)
+                                                : wait_for_output(worker_index, *output_, handle);
+                        if (!pushed) {
                             output_pool_.release(handle);
                             throw std::runtime_error("flat folder scanner output queue closed");
                         }
@@ -4418,11 +4444,11 @@ protected:
     void on_stop_requested() override {
         folder_input_.close();
         folder_feedback_.close();
-        output_.close();
+        close_output();
     }
 
     void on_all_workers_finished() override {
-        output_.close();
+        close_output();
     }
 
 private:
@@ -4445,6 +4471,16 @@ private:
         }
     }
 
+    void close_output() {
+        if (sharded_output_ != nullptr) {
+            sharded_output_->close();
+            return;
+        }
+        if (output_ != nullptr) {
+            output_->close();
+        }
+    }
+
     std::string root_;
     std::string compare_mode_;
     std::size_t async_depth_ = 1;
@@ -4453,7 +4489,8 @@ private:
     BufQueue& folder_input_;
     BufQueue& folder_feedback_;
     RawBufferPool& output_pool_;
-    BufQueue& output_;
+    BufQueue* output_ = nullptr;
+    ShardedBufQueue* sharded_output_ = nullptr;
     double max_duration_seconds_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> stop_at_;
     std::atomic<std::uint64_t> folders_sent_ {0};
@@ -10281,9 +10318,11 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
     if (metadata_output_partition_mode != "single" &&
         metadata_output_partition_mode != "processes" &&
         metadata_output_partition_mode != "transport-discard" &&
-        metadata_output_partition_mode != "route-discard") {
-        throw std::invalid_argument("metadata output partition mode must be single, processes, transport-discard, or route-discard");
+        metadata_output_partition_mode != "route-discard" &&
+        metadata_output_partition_mode != "sharded-discard") {
+        throw std::invalid_argument("metadata output partition mode must be single, processes, transport-discard, route-discard, or sharded-discard");
     }
+    const bool sharded_discard = metadata_output_partition_mode == "sharded-discard";
 
     const auto started = std::chrono::steady_clock::now();
 
@@ -10446,6 +10485,10 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
             std::rethrow_exception(error);
         }
         metadata_consumer->wait();
+        report.metadata_queue_shards = 1U;
+        report.metadata_queue_capacity = metadata_queue.capacity();
+        report.metadata_queue_high_watermark = metadata_queue.high_watermark();
+        report.metadata_queue_full = metadata_queue.high_watermark() >= metadata_queue.capacity();
         for (auto& queue : route_discard_queues) {
             queue->close();
         }
@@ -10487,6 +10530,11 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         BufferPoolRegistry registry;
         registry.register_pool(metadata_pool);
         BufQueue metadata_to_discard(flat_slots);
+        const std::size_t sharded_queue_shards =
+            sharded_discard ? std::max<std::size_t>(1U, report.metadata_output_partitions) : 1U;
+        const std::size_t sharded_queue_depth_per_shard =
+            std::max<std::size_t>(1U, (flat_slots + sharded_queue_shards - 1U) / sharded_queue_shards);
+        ShardedBufQueue sharded_metadata_to_discard(sharded_queue_shards, sharded_queue_depth_per_shard);
         BufQueue folder_queue(folder_pool.capacity());
         BufQueue folder_feedback_queue(folder_feedback_pool.capacity());
 
@@ -10496,30 +10544,58 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                       folder_feedback_pool,
                                       folder_queue,
                                       folder_feedback_queue);
-        NfsMetaReaderBufferJob scanner(source_root.string(),
-                                       "size",
-                                       report.meta_reader_threads,
-                                       report.metadata_async_depth,
-                                       folder_pool,
-                                       folder_feedback_pool,
-                                       folder_queue,
-                                       folder_feedback_queue,
-                                       metadata_pool,
-                                       metadata_to_discard,
-                                       max_duration_seconds);
-        BufferDiscarderJob discarder(BufferDiscarderConfig(1U), metadata_to_discard, registry);
+        report.metadata_queue_shards = sharded_discard ? sharded_queue_shards : 1U;
+        report.metadata_queue_capacity =
+            sharded_discard ? sharded_metadata_to_discard.capacity() : metadata_to_discard.capacity();
+        std::unique_ptr<NfsMetaReaderBufferJob> scanner;
+        std::unique_ptr<BufferDiscarderJob> discarder;
+        if (sharded_discard) {
+            scanner = std::make_unique<NfsMetaReaderBufferJob>(source_root.string(),
+                                                               "size",
+                                                               report.meta_reader_threads,
+                                                               report.metadata_async_depth,
+                                                               folder_pool,
+                                                               folder_feedback_pool,
+                                                               folder_queue,
+                                                               folder_feedback_queue,
+                                                               metadata_pool,
+                                                               sharded_metadata_to_discard,
+                                                               max_duration_seconds);
+            discarder = std::make_unique<BufferDiscarderJob>(
+                BufferDiscarderConfig(sharded_queue_shards),
+                sharded_metadata_to_discard,
+                registry);
+        } else {
+            scanner = std::make_unique<NfsMetaReaderBufferJob>(source_root.string(),
+                                                               "size",
+                                                               report.meta_reader_threads,
+                                                               report.metadata_async_depth,
+                                                               folder_pool,
+                                                               folder_feedback_pool,
+                                                               folder_queue,
+                                                               folder_feedback_queue,
+                                                               metadata_pool,
+                                                               metadata_to_discard,
+                                                               max_duration_seconds);
+            discarder = std::make_unique<BufferDiscarderJob>(BufferDiscarderConfig(1U),
+                                                             metadata_to_discard,
+                                                             registry);
+        }
 
         folder_seeder.start();
-        discarder.start();
-        scanner.start();
-        scanner.wait();
+        discarder->start();
+        scanner->start();
+        scanner->wait();
         folder_seeder.wait();
         if (auto error = folder_seeder.error()) {
             std::rethrow_exception(error);
         }
-        discarder.wait();
+        discarder->wait();
 
-        const DistributedDiffRunReport scanner_stats = scanner.stats();
+        report.metadata_queue_high_watermark = sharded_discard ? sharded_metadata_to_discard.high_watermark()
+                                                               : metadata_to_discard.high_watermark();
+        report.metadata_queue_full = report.metadata_queue_high_watermark >= report.metadata_queue_capacity;
+        const DistributedDiffRunReport scanner_stats = scanner->stats();
         report.files_seen = static_cast<std::size_t>(scanner_stats.files_compared);
         report.checker_emitted = 0;
         report.checker_discarded = report.files_seen;

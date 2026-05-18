@@ -61,6 +61,10 @@ struct MetadataBenchmarkReport {
     std::size_t metadata_folders_written = 0;
     std::size_t metadata_output_partitions = 1;
     std::size_t record_buffer_slots = 0;
+    std::size_t metadata_queue_shards = 1;
+    std::size_t metadata_queue_capacity = 0;
+    std::size_t metadata_queue_high_watermark = 0;
+    bool metadata_queue_full = false;
     std::uint32_t stats_interval_seconds = 0;
     std::string scan_run_id;
     bool pipeline_autoscale = false;
