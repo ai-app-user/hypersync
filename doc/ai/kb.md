@@ -1405,3 +1405,17 @@ logical size: 335.99 TB
   30-second result: `7,252,133` files read/written, `454.18 GB`, `241,665 files/s`, `121.08 Gbit/s`, zero failures, data queue high watermark `21 / 24,576`.
   20-second CPU repeat: `240,062 files/s`, `120.27 Gbit/s`; `mpstat` all-CPU average user `3.14%`, system `40.90%`, idle `55.94%`.
   Interpretation: the piper queue/data reader/packed-buffer pipeline is healthy and has >4x headroom over the `50K files/s` goal. The real `DataWriter-NFS` small-file plateau is isolated to the high-level libnfs/kernel socket/syscall target writer path.
+
+- 2026-05-18 PDT: `DataWriter-NFS` packed-small-file writes now use a shared reactor-squad topology instead of one `nfs_context` per writer worker. `NfsTargetWriteReactorFleet` creates up to 16 reactor threads per root/options tuple. Each reactor owns one `LibNfsSession`/`nfs_context`; producer writer workers submit file transactions through a CAS-published MPSC stack and do not call `nfs_service()` on this path. The legacy per-worker session is lazy and is only created for regular write chunks, explicit directory metadata operations, file hash, or abort paths.
+- Reactor transactions copy payload bytes from packed buffers so the existing `TargetDataWriterJob` buffer-release contract remains correct. This is correctness-first; a later optimization can move buffer ownership into the reactor to remove the copy.
+- Reactor lifecycle: `CREATE -> WRITE -> optional FSYNC -> CLOSE`; `--data-writer-file-window` is enforced per reactor as the max active file transactions. Parent-directory creation and metadata preservation are performed by the reactor thread when enabled; `--assume-target-directories`, `--skip-target-metadata`, and `--no-target-fsync` keep those steps out of the hot path.
+- Queue bug fixed: do not publish MPSC queue nodes with atomic `exchange()` before `node->next` is visible. Use a CAS push that writes `next` first, then publishes the node. The bad exchange version crashed under 96 producers with allocator/list corruption.
+- agnopo reactor benchmark, all 16 IPs, packed small files, assumed dirs, no fsync/metadata restore, `files-per-batch=1024`, `DataWriter-NFS-96`, `data_writer_file_window=32`:
+  `330,817` files in `30.44s`, `10,868 files/s`, `5.44 Gbit/s`, zero failures, data queue high watermark `256 / 24,576`.
+  CPU average: user `15.54%`, system `63.78%`, idle `19.72%`; `53/80` cores >=80% busy, `1/80` core >=95% busy.
+  This is much better than the prior 96-context result (`~1.32K files/s`, system CPU `84.88%`, idle `0.00%`), but still short of the `50K files/s` target.
+- Reactor tuning observed so far:
+  - `data_writer_file_window=32` is best tested.
+  - `file_window=64`: about `9,252 files/s`.
+  - `file_window=128`: about `9,751 files/s`.
+  - with file window `32`, `DataWriter-NFS-32`: about `9,512 files/s`; `DataWriter-NFS-64`: about `9,263 files/s`; `DataWriter-NFS-96`: about `10,868 files/s`.
