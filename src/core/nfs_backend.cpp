@@ -960,11 +960,17 @@ enum class SyntheticProfileLatencyMode {
     all,
 };
 
+enum class SyntheticProfilePayloadMode {
+    zero,
+    prng,
+};
+
 struct SyntheticProfileBackendOptions {
     std::filesystem::path profile_path;
     SyntheticProfileLatencyMode latency_mode = SyntheticProfileLatencyMode::off;
     double metadata_latency_scale = 1.0;
     double data_latency_scale = 1.0;
+    SyntheticProfilePayloadMode payload_mode = SyntheticProfilePayloadMode::zero;
 };
 
 bool synthetic_latency_includes_metadata(SyntheticProfileLatencyMode mode) noexcept {
@@ -999,6 +1005,17 @@ SyntheticProfileLatencyMode parse_synthetic_latency_mode(std::string_view value)
     throw std::runtime_error("unknown synthetic-profile latency mode: " + std::string(value));
 }
 
+SyntheticProfilePayloadMode parse_synthetic_payload_mode(std::string_view value) {
+    if (value == "zero" || value == "zeros" || value == "none" || value == "0") {
+        return SyntheticProfilePayloadMode::zero;
+    }
+    if (value == "prng" || value == "pseudo-random" || value == "pseudo_random" ||
+        value == "random" || value == "xorshift64" || value == "fast-random") {
+        return SyntheticProfilePayloadMode::prng;
+    }
+    throw std::runtime_error("unknown synthetic-profile payload mode: " + std::string(value));
+}
+
 void parse_synthetic_query_param(SyntheticProfileBackendOptions& options,
                                  std::string_view key,
                                  std::string_view value) {
@@ -1012,6 +1029,9 @@ void parse_synthetic_query_param(SyntheticProfileBackendOptions& options,
         options.metadata_latency_scale = synthetic_positive_double_or(value, 1.0);
     } else if (key == "data-latency-scale" || key == "read-latency-scale") {
         options.data_latency_scale = synthetic_positive_double_or(value, 1.0);
+    } else if (key == "payload" || key == "data-payload" || key == "payload-pattern" ||
+               key == "data-pattern") {
+        options.payload_mode = parse_synthetic_payload_mode(value);
     } else if (!key.empty()) {
         throw std::runtime_error("unknown synthetic-profile query parameter: " + std::string(key));
     }
@@ -1439,7 +1459,7 @@ public:
         const std::size_t bytes = static_cast<std::size_t>(
             std::min<std::uint64_t>(declared_size, destination_bytes));
         if (bytes != 0U) {
-            std::memset(destination, 0, bytes);
+            fill_payload(destination, bytes, rel_path, 0);
         }
         return bytes;
     }
@@ -1479,7 +1499,7 @@ public:
             }
             DataBuffer& buffer = data_buffer(pool, handle);
             if (copy_payload_to_buffer && chunk_size != 0U) {
-                std::memset(buffer.bytes.data(), 0, chunk_size);
+                fill_payload(buffer.bytes.data(), chunk_size, rel_path, total);
             }
             buffer.trailer = {};
             buffer.trailer.data_offset = total;
@@ -1525,6 +1545,41 @@ public:
     }
 
 private:
+    [[nodiscard]] static std::uint64_t next_fast_prng(std::uint64_t& state) noexcept {
+        state ^= state >> 12U;
+        state ^= state << 25U;
+        state ^= state >> 27U;
+        return state * 2685821657736338717ULL;
+    }
+
+    void fill_payload(std::byte* destination,
+                      std::size_t bytes,
+                      std::string_view rel_path,
+                      std::uint64_t offset) const {
+        if (options_.payload_mode == SyntheticProfilePayloadMode::zero) {
+            std::memset(destination, 0, bytes);
+            return;
+        }
+
+        std::uint64_t state = profile_.seed ^
+                              synthetic_splitmix64(hash64(rel_path)) ^
+                              synthetic_splitmix64(offset + 0xd1b54a32d192ed03ULL);
+        if (state == 0U) {
+            state = 0x9e3779b97f4a7c15ULL;
+        }
+
+        std::size_t written = 0;
+        while (bytes - written >= sizeof(std::uint64_t)) {
+            const std::uint64_t word = next_fast_prng(state);
+            std::memcpy(destination + written, &word, sizeof(word));
+            written += sizeof(word);
+        }
+        if (written < bytes) {
+            const std::uint64_t word = next_fast_prng(state);
+            std::memcpy(destination + written, &word, bytes - written);
+        }
+    }
+
     void apply_data_latency(std::string_view rel_path, std::uint64_t declared_size) const {
         if (!synthetic_latency_includes_data(options_.latency_mode)) {
             return;

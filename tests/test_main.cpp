@@ -1222,6 +1222,41 @@ void test_synthetic_profile_backend_can_emulate_profile_latency() {
     EXPECT_TRUE(read_seconds >= 0.003);
 }
 
+void test_synthetic_profile_backend_can_fill_fast_prng_payload() {
+    TempDir root("synthetic_profile_backend_prng_payload");
+    const fs::path profile_path = root.path / "profile.txt";
+    write_file(profile_path,
+               "synthetic_profile_benchmark files_observed=1 phases=1 elapsed_s=0 files_per_second=0 "
+               "logical_size_bytes=4096 small_files=1 large_files=0 seed=12345\n"
+               "phase index=0 name=phase_0 files=1 folders=1 small=1 large=0 "
+               "logical_size_bytes=4096 "
+               "size_buckets=<=0:0/0,<=4096:1/4096,<=16384:0/0,<=65536:0/0,"
+               "<=131072:0/0,<=1048576:0/0,<=16777216:0/0,"
+               "<=134217728:0/0,<=1073741824:0/0,<=inf:0/0\n");
+
+    auto backend = hypersync::make_nfs_backend("synthetic-profile://" + profile_path.string() +
+                                               "?payload=prng");
+    std::vector<std::byte> first(4096);
+    std::vector<std::byte> second(4096);
+    const std::uint64_t first_bytes =
+        backend->read_file_into("phase_0/folder_0/file_0.bin", 4096, first.data(), first.size());
+    const std::uint64_t second_bytes =
+        backend->read_file_into("phase_0/folder_0/file_0.bin", 4096, second.data(), second.size());
+
+    EXPECT_EQ(first_bytes, 4096U);
+    EXPECT_EQ(second_bytes, 4096U);
+    EXPECT_EQ(first, second);
+    EXPECT_TRUE(std::any_of(first.begin(), first.end(), [](std::byte value) {
+        return value != std::byte {0};
+    }));
+
+    std::vector<std::byte> other(4096);
+    const std::uint64_t other_bytes =
+        backend->read_file_into("phase_0/folder_0/file_1.bin", 4096, other.data(), other.size());
+    EXPECT_EQ(other_bytes, 4096U);
+    EXPECT_TRUE(first != other);
+}
+
 void test_synthetic_payload_pool_returns_preallocated_blocks() {
     SyntheticPayloadPool pool(4096, 1024 * 1024, SyntheticPayloadPattern::repeated, 7);
     EXPECT_EQ(pool.small_block_bytes(), 4096U);
@@ -4957,6 +4992,9 @@ int main(int argc, char** argv) {
         {"synthetic_profile_backend_can_emulate_profile_latency",
          TestSuite::unit,
          test_synthetic_profile_backend_can_emulate_profile_latency},
+        {"synthetic_profile_backend_can_fill_fast_prng_payload",
+         TestSuite::unit,
+         test_synthetic_profile_backend_can_fill_fast_prng_payload},
         {"synthetic_payload_pool_returns_preallocated_blocks",
          TestSuite::unit,
          test_synthetic_payload_pool_returns_preallocated_blocks},
