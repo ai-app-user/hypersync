@@ -1295,3 +1295,15 @@ logical size: 335.99 TB
   - For multi-lane NFS target writes, concurrent directory creation must treat
     `EEXIST`/`NFS3ERR_EXIST` as success. Multiple writer lanes can race creating
     shared parent directories such as `/synthetic`.
+  - Large-file write scaling on agnopo with direct libnfs target:
+    - `DataWriter-NFS-32`, single endpoint: about `40 Gbit/s`.
+    - `DataWriter-NFS-32`, 16-IP URL range: about `39-40 Gbit/s`.
+    - `DataWriter-NFS-128`, 16-IP range: about `93-94 Gbit/s`, `355.5 GB`
+      written in `30.5s`.
+    - `DataWriter-NFS-256`, 16-IP range: about `125 Gbit/s`, `475.5 GB`
+      written in `30.4s`.
+    - `DataWriter-NFS-512` regressed and hit an `nfs_mount_async` timeout.
+  - Current write-path limiter: each writer context does synchronous
+    `pwrite`/`fsync`/`close`/metadata operations. To approach `200 Gbit/s`
+    large writes and `50K files/s` small writes, implement async write windows
+    per context and configurable/deferred fsync + metadata application.

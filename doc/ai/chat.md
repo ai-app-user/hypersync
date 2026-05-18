@@ -637,3 +637,22 @@ with zero failures. Final average: `5.75K files/s`, `1.86 Gbit/s`; interval
 writer throughput was about `1.94 Gbit/s`. The queue high watermark was
 `7653 / 8192`, so the writer side was the limiter for this small-file NFS write
 shape.
+
+**User:** Set the performance target for the new write path: `200 Gbit/s` for
+large-file writes and `50K files/s` for small-file writes.
+
+**Codex:** Ran large-file write probes on agnopo with synthetic PRNG payloads
+and direct `DataWriter-NFS`:
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-32]->(DataBufQueue-32x256)->[DataWriter-NFS-32]`
+against one endpoint wrote `154.9 GB` in `30.9s`, about `40 Gbit/s`.
+Using the 16-IP URL range with 32 writers was still about `39-40 Gbit/s`, so a
+single endpoint was not the only limit. Increasing to
+`[DataReader-SYN-64]->(DataBufQueue-128x128)->[DataWriter-NFS-128]` reached
+`355.5 GB` in `30.5s`, about `93-94 Gbit/s`. A 256-writer probe
+`[DataReader-SYN-128]->(DataBufQueue-256x64)->[DataWriter-NFS-256]` reached
+`475.5 GB` in `30.4s`, about `125 Gbit/s`, zero failures. A 512-writer probe
+regressed badly and hit `nfs_mount_async timed out` on one endpoint. Current
+conclusion: breadth helps up to about 256 contexts, but to approach 200G the
+writer needs real async write windows per context and probably configurable
+fsync/metadata application instead of synchronous pwrite/fsync/close/chmod per
+file.
