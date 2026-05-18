@@ -235,7 +235,9 @@ public:
     std::string root,
     std::size_t endpoint_index = kNfsEndpointAny,
     std::size_t readdirplus_page_bytes = 0);
-[[nodiscard]] std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root);
+[[nodiscard]] std::unique_ptr<TargetWriterBackend> make_target_writer_backend(
+    std::string root,
+    std::size_t endpoint_index = kNfsEndpointAny);
 
 }  // namespace hypersync
 

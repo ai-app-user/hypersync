@@ -2559,7 +2559,7 @@ public:
             throw std::runtime_error("nfs_mount_async queue failed: " +
                                      std::string(error != nullptr ? error : "unknown error"));
         }
-        constexpr auto kMountTimeout = std::chrono::seconds(5);
+        constexpr auto kMountTimeout = std::chrono::seconds(30);
         if (!pump_nfs_until_done_until(nfs_, mount_state, std::chrono::steady_clock::now() + kMountTimeout)) {
             const std::string timed_out_url = connection_url_;
             abandon_stuck_context();
@@ -4971,8 +4971,8 @@ private:
 
 class LibNfsTargetWriterBackend final : public TargetWriterBackend {
 public:
-    explicit LibNfsTargetWriterBackend(std::string root_url)
-        : root_url_(std::move(root_url)), session_(root_url_) {
+    explicit LibNfsTargetWriterBackend(std::string root_url, std::size_t endpoint_index)
+        : root_url_(std::move(root_url)), session_(root_url_, endpoint_index) {
         known_directories_.insert("");
     }
 
@@ -5751,14 +5751,16 @@ std::unique_ptr<NfsBackend> make_nfs_backend(std::string root,
     return std::make_unique<LocalFilesystemBackend>(std::move(root));
 }
 
-std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root) {
+std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root, std::size_t endpoint_index) {
     if (is_nfs_url(root)) {
 #if HYPERSYNC_HAS_LIBNFS
-        return std::make_unique<LibNfsTargetWriterBackend>(std::move(root));
+        return std::make_unique<LibNfsTargetWriterBackend>(std::move(root), endpoint_index);
 #else
+        (void)endpoint_index;
         throw std::runtime_error("libnfs support is not available in this build; install libnfs and rebuild");
 #endif
     }
+    (void)endpoint_index;
     return std::make_unique<LocalTargetWriterBackend>(std::move(root));
 }
 

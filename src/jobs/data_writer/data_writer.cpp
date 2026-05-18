@@ -174,7 +174,7 @@ TargetWriterStats TargetMetaWriterJob::stats() const {
 }
 
 void TargetMetaWriterJob::run_worker(std::size_t worker_index) {
-    auto backend = make_target_writer_backend(config_.target_root);
+    auto backend = make_target_writer_backend(config_.target_root, worker_index);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
         try {
@@ -304,7 +304,7 @@ TargetWriterStats TargetDataWriterJob::stats() const {
 }
 
 void TargetDataWriterJob::run_worker(std::size_t worker_index) {
-    auto backend = make_target_writer_backend(config_.target_root);
+    auto backend = make_target_writer_backend(config_.target_root, worker_index);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
         std::vector<BufferHandle> batch;
