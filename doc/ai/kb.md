@@ -1285,3 +1285,13 @@ logical size: 335.99 TB
     `DataBufQueue` is sharded by file id, with `W` shards and one writer lane
     per shard. The command reports files/bytes read and files/bytes written,
     queue capacity, queue high watermark, and async read latency.
+  - agnopo validation target:
+    `nfs://172.27.255.2/volumes/8ed98ee4-b263-4319-be97-2093377beb65/<testdir>`.
+    The 32-lane small-file write test used:
+    `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-32]->(DataBufQueue-32x256)->[DataWriter-NFS-32]`.
+    Result: `94,601` files / `3.83 GB` written through libnfs in `16.46s`,
+    zero read/write failures, final `5.75K files/s`, `1.86 Gbit/s`, interval
+    writer throughput around `1.94 Gbit/s`, queue high watermark `7653 / 8192`.
+  - For multi-lane NFS target writes, concurrent directory creation must treat
+    `EEXIST`/`NFS3ERR_EXIST` as success. Multiple writer lanes can race creating
+    shared parent directories such as `/synthetic`.
