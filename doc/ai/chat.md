@@ -568,3 +568,16 @@ The run wrote `164,978,688` file records to 32 Parquet partition processes in
 `52.20s`, `3.16M records/s`, output size `810M`. Metadata queue high watermark
 was `4,690 / 32,768` and `metadata_queue_full=false`, so the current limiter is
 the DB writer side rather than `MetaReader-SYN-8`.
+
+**User:** Asked to replace `MetadataRecordWriter` with a discarder to see whether
+Unix socket transport was the overhead.
+
+**Codex:** Ran two isolation probes with the same synthetic profile and
+`MetaReader-SYN-8`. The socket-preserving path
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataRouteQueue-32x1024)->[BufferSender-1x32]->(UnixSocket)->[BufferDiscarder-1x32]`
+processed `485,113,856` records in `35.84s`, `13.54M records/s`, queue high
+watermark `171 / 32,768`. The no-socket route-discard path
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataBufQueue-4096)->[PartitionedRouter-8]->(RouteDiscardQueue-32x1024)->[BufferDiscarder-1x32]`
+processed `455,806,976` records in `35.61s`, `15.20M records/s`, high watermark
+`4 / 4,096`. Conclusion: socket transport costs around `11%`, but the real
+drop from `13.54M` to `3.16M records/s` is the Parquet/DB writer side.

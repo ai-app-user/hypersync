@@ -2660,3 +2660,30 @@ output_size                   810M
 Interpretation: this is the intended DB writer test shape. The metadata queue
 did not fill, so `MetaReader-SYN-8` was not the bottleneck for this run. Current
 writer throughput is about `3.16M records/s` to 32 Parquet partition processes.
+
+### Writer-Replaced-By-Discarder Isolation
+
+Same host/profile/settings, replacing `MetadataRecordWriter-32` with discarders:
+
+```text
+socket path:
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataRouteQueue-32x1024)->[BufferSender-1x32]->(UnixSocket)->[BufferDiscarder-1x32]
+
+no-socket route path:
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataBufQueue-4096)->[PartitionedRouter-8]->(RouteDiscardQueue-32x1024)->[BufferDiscarder-1x32]
+```
+
+Results:
+
+```text
+path                files_seen   elapsed_s  records/s  queue_high_watermark
+DB writer           164,978,688  52.196     3.16M      4,690 / 32,768
+socket discard      485,113,856  35.840     13.54M       171 / 32,768
+no-socket discard   455,806,976  35.613     15.20M         4 / 4,096
+```
+
+Interpretation: Unix socket transport is not the main bottleneck. It costs about
+`11%` compared with the no-socket route-discard path (`13.54M` vs `15.20M`
+records/s), while the Parquet writer path drops to `3.16M records/s`. The
+remaining slowdown is DB writer/Parquet encoding/compression/process-side work,
+not metadata generation and not queue starvation.
