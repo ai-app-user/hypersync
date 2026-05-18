@@ -18,6 +18,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <poll.h>
@@ -531,25 +532,72 @@ std::vector<std::string> expand_server_expression(std::string_view expression) {
     return servers;
 }
 
-std::string choose_random_string(const std::vector<std::string>& values) {
-    if (values.empty()) {
-        throw std::invalid_argument("cannot choose from an empty server list");
+[[maybe_unused]] std::string nfs_endpoint_key(std::string_view url) {
+    constexpr std::string_view kPrefix = "nfs://";
+    if (url.rfind(kPrefix, 0) != 0) {
+        return std::string(url);
     }
-    if (values.size() == 1U) {
-        return values.front();
-    }
-    thread_local std::mt19937_64 rng(std::random_device{}());
-    std::uniform_int_distribution<std::size_t> distribution(0U, values.size() - 1U);
-    return values[distribution(rng)];
+    const std::size_t server_begin = kPrefix.size();
+    const std::size_t server_end = url.find('/', server_begin);
+    return std::string(url.substr(server_begin, server_end == std::string_view::npos
+                                                    ? std::string_view::npos
+                                                    : server_end - server_begin));
 }
 
-[[maybe_unused]] std::string choose_nfs_connection_url(std::string_view root_url,
-                                                       std::size_t endpoint_index = kNfsEndpointAny) {
+struct NfsEndpointHealth {
+    std::chrono::steady_clock::time_point retry_after {};
+    std::uint32_t failures = 0;
+};
+
+std::mutex g_nfs_endpoint_health_mutex;
+std::unordered_map<std::string, NfsEndpointHealth> g_nfs_endpoint_health;
+
+[[maybe_unused]] bool nfs_endpoint_ready_for_probe(std::string_view url) {
+    const std::string key = nfs_endpoint_key(url);
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_nfs_endpoint_health_mutex);
+    const auto it = g_nfs_endpoint_health.find(key);
+    return it == g_nfs_endpoint_health.end() || now >= it->second.retry_after;
+}
+
+[[maybe_unused]] void mark_nfs_endpoint_healthy(std::string_view url) {
+    const std::string key = nfs_endpoint_key(url);
+    std::lock_guard<std::mutex> lock(g_nfs_endpoint_health_mutex);
+    g_nfs_endpoint_health.erase(key);
+}
+
+[[maybe_unused]] void mark_nfs_endpoint_unhealthy(std::string_view url) {
+    const std::string key = nfs_endpoint_key(url);
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_nfs_endpoint_health_mutex);
+    NfsEndpointHealth& health = g_nfs_endpoint_health[key];
+    health.failures = std::min<std::uint32_t>(health.failures + 1U, 8U);
+    const auto cooldown = std::chrono::seconds(std::min<int>(300, 15 * (1 << std::min<std::uint32_t>(health.failures - 1U, 4U))));
+    health.retry_after = now + cooldown;
+}
+
+[[maybe_unused]] std::vector<std::string> ordered_nfs_connection_urls(std::string_view root_url,
+                                                                      std::size_t endpoint_index) {
     std::vector<std::string> candidates = expand_nfs_url_server_candidates(root_url);
-    if (endpoint_index != kNfsEndpointAny && !candidates.empty()) {
-        return candidates[endpoint_index % candidates.size()];
+    if (candidates.size() <= 1U) {
+        return candidates;
     }
-    return choose_random_string(candidates);
+
+    std::size_t first = 0;
+    if (endpoint_index != kNfsEndpointAny) {
+        first = endpoint_index % candidates.size();
+    } else {
+        thread_local std::mt19937_64 rng(std::random_device{}());
+        std::uniform_int_distribution<std::size_t> distribution(0U, candidates.size() - 1U);
+        first = distribution(rng);
+    }
+
+    std::vector<std::string> ordered;
+    ordered.reserve(candidates.size());
+    for (std::size_t offset = 0; offset < candidates.size(); ++offset) {
+        ordered.push_back(std::move(candidates[(first + offset) % candidates.size()]));
+    }
+    return ordered;
 }
 
 void local_pwrite_all(int fd, std::string_view data, std::uint64_t offset) {
@@ -2536,9 +2584,46 @@ std::uint64_t nfs_stream_hash(struct nfs_context* nfs, const std::string& remote
 class LibNfsSession {
 public:
     explicit LibNfsSession(const std::string& root_url, std::size_t endpoint_index = kNfsEndpointAny)
-        : root_url_(root_url),
-          connection_url_(choose_nfs_connection_url(root_url, endpoint_index)),
-          nfs_(nfs_init_context()) {
+        : root_url_(root_url) {
+        std::vector<std::string> connection_urls = ordered_nfs_connection_urls(root_url, endpoint_index);
+        if (connection_urls.empty()) {
+            throw std::runtime_error("NFS URL has no candidate endpoints: " + root_url);
+        }
+
+        std::string last_error;
+        bool skipped_unhealthy = false;
+        for (const std::string& candidate : connection_urls) {
+            if (!nfs_endpoint_ready_for_probe(candidate)) {
+                skipped_unhealthy = true;
+                continue;
+            }
+            try {
+                mount_connection(candidate);
+                mark_nfs_endpoint_healthy(candidate);
+                return;
+            } catch (const std::exception& error) {
+                last_error = error.what();
+                mark_nfs_endpoint_unhealthy(candidate);
+                cleanup_context();
+            }
+        }
+
+        if (skipped_unhealthy) {
+            for (const std::string& candidate : connection_urls) {
+                if (nfs_endpoint_ready_for_probe(candidate)) {
+                    continue;
+                }
+                last_error = "all healthy NFS endpoints failed; unhealthy endpoints are cooling down";
+                break;
+            }
+        }
+        throw std::runtime_error(last_error.empty() ? "failed to mount any NFS endpoint for " + root_url
+                                                    : last_error);
+    }
+
+    void mount_connection(const std::string& connection_url) {
+        connection_url_ = connection_url;
+        nfs_ = nfs_init_context();
         if (nfs_ == nullptr) {
             throw std::runtime_error("failed to initialize libnfs context");
         }
@@ -2601,6 +2686,17 @@ public:
     }
 
 private:
+    void cleanup_context() noexcept {
+        if (url_ != nullptr) {
+            nfs_destroy_url(url_);
+            url_ = nullptr;
+        }
+        if (nfs_ != nullptr) {
+            nfs_destroy_context(nfs_);
+            nfs_ = nullptr;
+        }
+    }
+
     std::string root_url_;
     std::string connection_url_;
     struct nfs_context* nfs_ = nullptr;
