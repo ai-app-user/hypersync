@@ -1845,6 +1845,9 @@ private:
 struct AsyncCommandState {
     bool done = false;
     int status = 0;
+    int nfs_status = 0;
+    std::size_t byte_count = 0;
+    int committed = 0;
     void* data = nullptr;
     std::string error;
     NfsAsyncCommandKind kind = NfsAsyncCommandKind::other;
@@ -2088,6 +2091,36 @@ void generic_rpc_callback(struct rpc_context* rpc, int status, void* data, void*
     if (status < 0 && data != nullptr) {
         state->error = static_cast<const char*>(data);
     }
+}
+
+void raw_write_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
+    (void)rpc;
+    auto* state = static_cast<AsyncCommandState*>(private_data);
+    state->status = status;
+    state->data = nullptr;
+    record_async_command_completed(state->kind, state->queued_at, status);
+    if (status != RPC_STATUS_SUCCESS) {
+        if (data != nullptr) {
+            state->error = static_cast<const char*>(data);
+        }
+        state->done = true;
+        return;
+    }
+
+    auto* result = static_cast<WRITE3res*>(data);
+    if (result == nullptr) {
+        state->status = -EIO;
+        state->error = "rpc_nfs_write_async completed without a WRITE3 result";
+        state->done = true;
+        return;
+    }
+
+    state->nfs_status = result->status;
+    if (result->status == NFS3_OK) {
+        state->byte_count = result->WRITE3res_u.resok.count;
+        state->committed = result->WRITE3res_u.resok.committed;
+    }
+    state->done = true;
 }
 
 void raw_readdirplus_callback(struct rpc_context* rpc, int status, void* data, void* private_data) {
@@ -5372,7 +5405,7 @@ private:
                 }
                 const std::size_t remaining = transaction.data.size() - transaction.bytes_written;
                 queue_result = rpc_nfs_write_async(rpc,
-                                                   generic_rpc_callback,
+                                                   raw_write_callback,
                                                    raw_handle,
                                                    const_cast<char*>(transaction.data.data() + transaction.bytes_written),
                                                    transaction.offset + transaction.bytes_written,
@@ -5443,18 +5476,16 @@ private:
                             if (transaction.write_state.status != RPC_STATUS_SUCCESS) {
                                 throw std::runtime_error("rpc_nfs_write_async failed: " + transaction.write_state.error);
                             }
-                            auto* result = static_cast<WRITE3res*>(transaction.write_state.data);
-                            if (result == nullptr) {
-                                throw std::runtime_error("rpc_nfs_write_async completed without a WRITE3 result");
-                            }
-                            if (result->status != NFS3_OK) {
+                            if (transaction.write_state.nfs_status != NFS3_OK) {
                                 throw std::runtime_error("rpc_nfs_write_async returned NFS error " +
-                                                         std::to_string(static_cast<int>(result->status)));
+                                                         std::to_string(transaction.write_state.nfs_status));
                             }
                             const std::size_t remaining = transaction.data.size() - transaction.bytes_written;
-                            const std::size_t written = result->WRITE3res_u.resok.count;
+                            const std::size_t written = transaction.write_state.byte_count;
                             if (written == 0U || written > remaining) {
-                                throw std::runtime_error("rpc_nfs_write_async short write");
+                                throw std::runtime_error("rpc_nfs_write_async short write count=" +
+                                                         std::to_string(written) + " remaining=" +
+                                                         std::to_string(remaining));
                             }
                             transaction.bytes_written += written;
                             if (transaction.bytes_written < transaction.data.size()) {
