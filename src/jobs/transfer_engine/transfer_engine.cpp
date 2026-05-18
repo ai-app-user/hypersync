@@ -6961,13 +6961,24 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
                                       std::ref(stats));
     }
 
+    std::exception_ptr pipeline_error;
     for (auto& worker : metadata_workers) {
         worker.join();
     }
     mark_data_file_input_done(file_queue);
 
-    data_reader_job.wait();
-    writer_job.wait();
+    try {
+        data_reader_job.wait();
+        writer_job.wait();
+    } catch (...) {
+        pipeline_error = std::current_exception();
+        try {
+            data_reader_job.stop();
+        } catch (...) {}
+        try {
+            writer_job.stop();
+        } catch (...) {}
+    }
 
     stats.printer_done.store(true, std::memory_order_relaxed);
     stats.printer_cv.notify_all();
@@ -6989,6 +7000,9 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     }
     if (file_queue.error) {
         std::rethrow_exception(file_queue.error);
+    }
+    if (pipeline_error) {
+        std::rethrow_exception(pipeline_error);
     }
 
     writer_stats = writer_job.stats();
