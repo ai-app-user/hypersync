@@ -514,6 +514,17 @@ std::size_t metadata_partition_for_path(std::string_view path, std::size_t parti
     return static_cast<std::size_t>(hash64(path) % std::max<std::size_t>(1U, partitions));
 }
 
+std::size_t metadata_partition_for_flat_folder_buffer(const FlatFolderBufferInfo& info,
+                                                      std::size_t partitions) {
+    const std::size_t safe_partitions = std::max<std::size_t>(1U, partitions);
+    std::uint64_t key = hash64(info.folder_path);
+    key ^= (static_cast<std::uint64_t>(info.sequence) + 0x9e3779b97f4a7c15ULL + (key << 6U) + (key >> 2U));
+    key ^= (info.metadata_hash + 0xbf58476d1ce4e5b9ULL + (key << 6U) + (key >> 2U));
+    key ^= (static_cast<std::uint64_t>(info.child_record_count) + 0x94d049bb133111ebULL +
+            (key << 6U) + (key >> 2U));
+    return static_cast<std::size_t>(key % safe_partitions);
+}
+
 std::size_t metadata_transport_payload_bytes(RawBufferPool& pool, const BufferHandle& handle) {
     if (handle.pool_id == kMetadataBufferPoolId) {
         const auto& buffer = metadata_buffer(pool, handle);
@@ -731,7 +742,7 @@ public:
         }
 
         const FlatFolderBufferInfo info = flat_folder_buffer_info(buffer);
-        const std::size_t partition = metadata_partition_for_path(info.folder_path, partitions_);
+        const std::size_t partition = metadata_partition_for_flat_folder_buffer(info, partitions_);
         RouteSendState& state = *route_states_[partition];
         std::lock_guard<std::mutex> lock(state.mutex);
         if (!state.queue.push_wait(handle)) {
@@ -4505,7 +4516,10 @@ protected:
                     [this, worker_index](const BufferHandle& handle) {
                         bool pushed = false;
                         if (!output_queues_.empty()) {
-                            BufQueue& queue = *output_queues_[worker_index % output_queues_.size()];
+                            const MetadataBatchBuffer& buffer = metadata_batch_buffer(output_pool_, handle);
+                            const FlatFolderBufferInfo info = flat_folder_buffer_info(buffer);
+                            BufQueue& queue =
+                                *output_queues_[metadata_partition_for_flat_folder_buffer(info, output_queues_.size())];
                             pushed = wait_for_output(worker_index, queue, handle);
                         } else {
                             pushed = sharded_output_ != nullptr
@@ -4759,7 +4773,8 @@ protected:
             throw std::runtime_error("metadata router has no output route");
         }
         const FlatFolderBufferInfo info = flat_folder_buffer_info(buffer);
-        const std::size_t partition = metadata_partition_for_path(info.folder_path, partition_queues_->size());
+        const std::size_t partition =
+            metadata_partition_for_flat_folder_buffer(info, partition_queues_->size());
         if (!(*partition_queues_)[partition]->push_wait(handle)) {
             pool.release(handle);
             throw std::runtime_error("metadata route discard queue closed while pushing scan buffer");
