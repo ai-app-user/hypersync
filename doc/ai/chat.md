@@ -730,3 +730,7 @@ Bounded-window agnopo probes with `[FolderSeeder-1]->(FolderQueue)->[MetaReader-
 - `file_window=32`: reached interval `~1.35K files/s`, then the benchmark harness aborted because `--assume-target-directories` advanced to `synthetic/batch_8198` while only `batch_0..8191` had been pre-created.
 
 Current conclusion: bounded lifecycle state fixes the unsafe crash pattern, but high-level NFS CREATE/WRITE/CLOSE small-file writes remain far below `50K/s` on this target. The next architectural options are a raw NFSv3 create/write state machine, a real metadata-writer stage that precreates all target directories before data writer assumes them, or a small-file packaging/container strategy for the destination.
+
+**User:** Re-raised the small-file NFS write diagnosis and asked whether target storage exposes multiple IPs for connection sharding or whether all TCP connections route to one target IP.
+
+**Codex:** Clarified that agnopo uses the 16-IP NFS target range `172.27.255.2-172.27.255.17`. `DataWriter-NFS` already creates independent libnfs contexts per writer worker and pins worker indices across that range, so the current implementation is not routing all writes through a single `nfs_context` or single target IP. The remaining design question is whether to move from one context per worker to explicit storage-shard squads with one service loop/context per shard and multiple workers feeding that shard, but that would be a different ownership model and must be benchmarked carefully because sharing a context can reintroduce locking.
