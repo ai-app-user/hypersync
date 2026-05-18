@@ -10414,7 +10414,7 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                 metadata_queue,
                 registry,
                 &stats_discarder,
-                *route_discard_queues);
+                route_discard_queues);
         } else if (partitioned_writer != nullptr) {
             metadata_consumer = std::make_unique<PartitionedFlatFolderMetadataRouterJob>(
                 metadata_consumer_threads,
