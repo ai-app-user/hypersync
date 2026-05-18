@@ -1255,6 +1255,22 @@ void test_synthetic_profile_backend_can_fill_fast_prng_payload() {
         backend->read_file_into("phase_0/folder_0/file_1.bin", 4096, other.data(), other.size());
     EXPECT_EQ(other_bytes, 4096U);
     EXPECT_TRUE(first != other);
+
+    hypersync::DataSlotPool slot_pool(1, 2);
+    std::uint64_t pooled_bytes = 0;
+    const std::uint64_t streamed = backend->read_file_pooled_chunks(
+        "phase_0/folder_0/file_0.bin",
+        4096,
+        1,
+        slot_pool,
+        [&](hypersync::PooledFileChunk&& chunk) {
+            const hypersync::DataBufTrailer& trailer = slot_pool.trailer(chunk.handle);
+            EXPECT_EQ(chunk.offset, trailer.data_offset);
+            pooled_bytes += trailer.data_len;
+            slot_pool.release(chunk.handle);
+        });
+    EXPECT_EQ(streamed, 4096U);
+    EXPECT_EQ(pooled_bytes, 4096U);
 }
 
 void test_synthetic_payload_pool_returns_preallocated_blocks() {

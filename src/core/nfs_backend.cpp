@@ -1517,6 +1517,38 @@ public:
         return total;
     }
 
+    [[nodiscard]] std::uint64_t read_file_pooled_chunks(
+        std::string_view rel_path,
+        std::uint64_t declared_size,
+        std::size_t outstanding_requests,
+        DataSlotPool& pool,
+        const std::function<void(PooledFileChunk&&)>& data_visitor) const override {
+        (void)outstanding_requests;
+        apply_data_latency(rel_path, declared_size);
+        std::uint64_t total = 0;
+        while (total < declared_size) {
+            const std::size_t chunk_size = static_cast<std::size_t>(
+                std::min<std::uint64_t>(kLargeChunkBytes, declared_size - total));
+            DataSlotHandle handle = pool.acquire_wait_or_throw(DataSlotClass::large, chunk_size);
+            fill_payload(reinterpret_cast<std::byte*>(pool.data(handle)), chunk_size, rel_path, total);
+            DataBufTrailer& trailer = pool.trailer(handle);
+            trailer = {};
+            trailer.data_offset = total;
+            trailer.data_len = chunk_size;
+
+            PooledFileChunk chunk;
+            chunk.offset = total;
+            chunk.handle = handle;
+            total += chunk_size;
+            if (data_visitor) {
+                data_visitor(std::move(chunk));
+            } else {
+                pool.release(handle);
+            }
+        }
+        return total;
+    }
+
     [[nodiscard]] std::optional<FileSpec> stat_path(std::string_view rel_path) const override {
         FileSpec spec;
         spec.rel_path = std::string(rel_path);
