@@ -1307,3 +1307,20 @@ logical size: 335.99 TB
     `pwrite`/`fsync`/`close`/metadata operations. To approach `200 Gbit/s`
     large writes and `50K files/s` small writes, implement async write windows
     per context and configurable/deferred fsync + metadata application.
+  - 2026-05-18 PDT: added writer bandwidth knobs:
+    - `benchmark-data-write --min-file-size-bytes <n>` for large-only write
+      probes.
+    - `benchmark-data-write --data-writer-async-window <n>` for writer-side
+      async batching per NFS context.
+  - NFS endpoint handling for URL ranges is now deterministic and health-aware:
+    `DataWriter-NFS` worker `i` starts with endpoint `i % endpoint_count`.
+    If an endpoint times out or fails during the mount handshake, the process
+    marks that endpoint unhealthy, new contexts skip it and try the next IP,
+    and the endpoint is eligible for probing again after a cooldown. This lets
+    ranges such as `172.27.255.2-172.27.255.17` survive a bad member like
+    `.9` without aborting the whole run.
+  - Latest large-only agnopo validation after endpoint health:
+    `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-128]->(DataBufQueue-128x64)->[DataWriter-NFS-128 aw=2 health=auto]`.
+    Result: `627` large files / `717.1 GB` written, zero failures, final
+    `162.6 Gbit/s` over `35.3s`; interval throughput held near `164-166 Gbit/s`.
+    The high-level libnfs writer lifecycle remains the main gap to 200G.

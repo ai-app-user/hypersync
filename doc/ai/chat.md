@@ -656,3 +656,29 @@ conclusion: breadth helps up to about 256 contexts, but to approach 200G the
 writer needs real async write windows per context and probably configurable
 fsync/metadata application instead of synchronous pwrite/fsync/close/chmod per
 file.
+
+**User:** Asked to first chase maximum write bandwidth with large files only,
+use async APIs for more per-thread parallelism, make sure all 16 NFS IPs are
+used, and automatically handle bad IPs by temporarily removing them while
+periodically checking for recovery.
+
+**Codex:** Added `benchmark-data-write` knobs for large-only selection and
+writer-side async batching: `--min-file-size-bytes` and
+`--data-writer-async-window`. `DataWriter-NFS` workers now pin initial endpoint
+selection by worker index, so a range like `172.27.255.2-172.27.255.17` is used
+deterministically rather than randomly. Added process-local endpoint health:
+failed or timed-out NFS mount attempts mark that endpoint unhealthy with a
+cooldown, new contexts skip it and try the next endpoint, and the endpoint
+becomes eligible for probing again after the cooldown. Local build and unit
+suite passed (`73/73`), commits were pushed to `dev`.
+
+**Codex:** Deployed the endpoint health build to agnopo and reran large-only
+synthetic PRNG writes through `DataWriter-NFS`. The validated pipeline was
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-128]->(DataBufQueue-128x64)->[DataWriter-NFS-128 aw=2 health=auto]`.
+The run completed without aborting on the previously bad `.9` endpoint:
+`627` large files written, `717.1 GB`, zero read/write failures, final average
+`162.6 Gbit/s` over `35.3s`; interval samples held around `164-166 Gbit/s`.
+This confirms automatic endpoint fallback works. Remaining gap to 200G is now
+dominated by high-level libnfs target writer lifecycle work
+(`create/open/pwrite/close/fsync/metadata`); the reader-style raw-handle fast
+path is still the next architecture step for writes.
