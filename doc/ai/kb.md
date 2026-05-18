@@ -1345,3 +1345,9 @@ logical size: 335.99 TB
   `sudo hypersync network-preflight --iface ens3 --apply` restored the tuned
   host profile. Validator CPU masks must compare normalized masks because Linux
   drops leading zero groups (for example `0000ffff,...` vs `ffff,...`).
+
+- `network-preflight` must show RPC slots using human-readable names:
+  `rpc_slots_current=65536` and `rpc_slots_max=65536`. It may also print the
+  raw kernel file names as informational traceability lines, but user-facing
+  reports should not rely only on the raw `sunrpc.tcp_*_slot_table_entries`
+  names.

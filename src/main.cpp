@@ -344,13 +344,17 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
     check("rx-0/rps_flow_cnt", rx0_flow, std::to_string(options.rps_flow_cnt));
     check("tx-0/xps_cpus", normalize_cpu_mask(tx0), normalize_cpu_mask(mask));
 
-    const std::string tcp_max_slots = read_text_file("/proc/sys/sunrpc/tcp_max_slot_table_entries");
-    if (!tcp_max_slots.empty()) {
-        check("sunrpc.tcp_max_slot_table_entries", tcp_max_slots, "65536");
+    const std::string rpc_slots_max = read_text_file("/proc/sys/sunrpc/tcp_max_slot_table_entries");
+    if (!rpc_slots_max.empty()) {
+        check("rpc_slots_max", rpc_slots_max, "65536");
+        std::cout << "network_preflight info setting=sunrpc.tcp_max_slot_table_entries current="
+                  << shell_quote(rpc_slots_max) << '\n';
     }
-    const std::string tcp_slots = read_text_file("/proc/sys/sunrpc/tcp_slot_table_entries");
-    if (!tcp_slots.empty()) {
-        check("sunrpc.tcp_slot_table_entries", tcp_slots, "65536");
+    const std::string rpc_slots_current = read_text_file("/proc/sys/sunrpc/tcp_slot_table_entries");
+    if (!rpc_slots_current.empty()) {
+        check("rpc_slots_current", rpc_slots_current, "65536");
+        std::cout << "network_preflight info setting=sunrpc.tcp_slot_table_entries current="
+                  << shell_quote(rpc_slots_current) << '\n';
     }
 
     const std::string speed = command_output("ethtool " + qiface + " | awk -F': ' '/Speed:/ {print $2}'");
