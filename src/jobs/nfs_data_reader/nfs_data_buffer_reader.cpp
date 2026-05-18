@@ -36,7 +36,26 @@ NfsDataBufferReaderJob::NfsDataBufferReaderJob(NfsDataReaderConfig config,
     : ThreadedJob(std::max<std::size_t>(1, config.data_reader_worker_count)),
       config_(std::move(config)),
       data_pool_(data_pool),
-      output_(output),
+      output_(&output),
+      file_provider_(std::move(file_provider)),
+      stop_predicate_(std::move(stop_predicate)) {
+    if (data_pool_.pool_id() != kDataBufferPoolId) {
+        throw std::invalid_argument("nfs data buffer reader requires the data buffer pool");
+    }
+    if (!file_provider_) {
+        throw std::invalid_argument("nfs data buffer reader requires a file provider");
+    }
+}
+
+NfsDataBufferReaderJob::NfsDataBufferReaderJob(NfsDataReaderConfig config,
+                                               RawBufferPool& data_pool,
+                                               ShardedBufQueue& output,
+                                               FileProvider file_provider,
+                                               StopPredicate stop_predicate)
+    : ThreadedJob(std::max<std::size_t>(1, config.data_reader_worker_count)),
+      config_(std::move(config)),
+      data_pool_(data_pool),
+      sharded_output_(&output),
       file_provider_(std::move(file_provider)),
       stop_predicate_(std::move(stop_predicate)) {
     if (data_pool_.pool_id() != kDataBufferPoolId) {
@@ -119,7 +138,7 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
                     },
                     data_pool_,
                     [&](BufferHandle handle, std::uint64_t file_count, std::uint64_t bytes_read) {
-                        if (!wait_for_output(worker_index, output_, handle)) {
+                        if (!publish_buffer(worker_index, handle)) {
                             data_pool_.release(handle);
                             throw NfsDataReaderStopped {};
                         }
@@ -161,7 +180,7 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
                                          file_logical_size(completed.file),
                                          buffer.trailer,
                                          0);
-                        if (!wait_for_output(worker_index, output_, completed.handle)) {
+                        if (!publish_buffer(worker_index, completed.handle)) {
                             data_pool_.release(completed.handle);
                             throw NfsDataReaderStopped {};
                         }
@@ -189,11 +208,21 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
 }
 
 void NfsDataBufferReaderJob::on_stop_requested() {
-    output_.close();
+    if (output_ != nullptr) {
+        output_->close();
+    }
+    if (sharded_output_ != nullptr) {
+        sharded_output_->close();
+    }
 }
 
 void NfsDataBufferReaderJob::on_all_workers_finished() {
-    output_.close();
+    if (output_ != nullptr) {
+        output_->close();
+    }
+    if (sharded_output_ != nullptr) {
+        sharded_output_->close();
+    }
 }
 
 void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
@@ -210,7 +239,7 @@ void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
                                           const std::uint64_t bytes_read = buffer.trailer.data_len;
                                           complete_trailer(record, logical_size, buffer.trailer, chunk.offset);
 
-                                          if (!wait_for_output(worker_index, output_, chunk.handle)) {
+                                          if (!publish_buffer(worker_index, chunk.handle)) {
                                               data_pool_.release(chunk.handle);
                                               throw NfsDataReaderStopped {};
                                           }
@@ -222,6 +251,32 @@ void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
     if (should_stop_now() && bytes_streamed < logical_size) {
         throw NfsDataReaderStopped {};
     }
+}
+
+bool NfsDataBufferReaderJob::publish_buffer(std::size_t worker_index, const BufferHandle& handle) {
+    if (output_ != nullptr) {
+        return wait_for_output(worker_index, *output_, handle);
+    }
+    if (sharded_output_ == nullptr) {
+        return false;
+    }
+    const DataBuffer& buffer = data_buffer(data_pool_, handle);
+    const std::size_t shard = output_shard_for(buffer);
+    if (sharded_output_->shard(shard).try_push(handle)) {
+        return true;
+    }
+    auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_output_full);
+    return sharded_output_->shard(shard).push_wait(handle);
+}
+
+std::size_t NfsDataBufferReaderJob::output_shard_for(const DataBuffer& buffer) const {
+    if (sharded_output_ == nullptr || sharded_output_->shard_count() == 0U) {
+        return 0U;
+    }
+    const std::uint64_t key = is_packed_small_file_buffer(buffer) && buffer.trailer.folder_hash != 0U
+                                  ? buffer.trailer.folder_hash
+                                  : buffer.trailer.file_id;
+    return static_cast<std::size_t>(key % sharded_output_->shard_count());
 }
 
 void NfsDataBufferReaderJob::complete_trailer(const RecBuf& record,

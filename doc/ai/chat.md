@@ -595,3 +595,18 @@ one writer. Retested the 32-writer synthetic metadata DB pipeline:
 The run wrote `508,932,096` file records in `50.98s`, `9.98M records/s`, queue
 high watermark `285 / 32,768`, `metadata_queue_full=false`. All 32 Parquet part
 files were active and balanced, roughly `76.6M-81.0M` bytes each.
+
+**User:** Asked to add NFS target-side writer jobs so Hypersync can work as a
+real sync/copy tool, not only scan/diff/read benchmarks.
+
+**Codex:** Implemented the first pipeline-native target writer jobs:
+`MetaWriter-<backend>` for directory metadata buffers and `DataWriter-<backend>`
+for data buffers. The writer jobs reuse the existing target backend abstraction,
+so local FS works in unit tests and NFS is available in Linux/libnfs builds.
+Added sharded output support to `NfsDataBufferReaderJob`; the safe multi-thread
+copy shape is now
+`[DataReader-NFS-N]->(DataBufQueue-sharded-by-file)->[DataWriter-NFS-N]`.
+This keeps all chunks for a large file on one writer lane/context and avoids
+cross-lane create/truncate races. Verified locally with five focused unit tests:
+target data writer regular+packed buffers, target metadata directory creation,
+and the existing data-buffer reader paths.

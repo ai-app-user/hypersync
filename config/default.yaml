@@ -102,6 +102,13 @@ jobs:
   data_writer:
     handle_cache_limit: 10000
     verify_hash: true
+  target_meta_writer:
+    worker_count: 8
+    target_root: .
+  target_data_writer:
+    worker_count: 32
+    target_root: .
+    verify_hash: false
   scan_writer:
     scan_side: S
     flush_per_file: true

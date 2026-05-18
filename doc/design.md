@@ -1737,6 +1737,31 @@ Goal: end-to-end transfer working correctly. Single folder, single MetaReader+Ch
 - FILE_ACK and FOLDER_ACK on priority channel
 - No DataCacher — pure in-memory pipeline
 
+### Writer Job Contract
+
+The target side is represented as explicit pipeline jobs, symmetric with the
+source-side readers:
+
+- `MetaWriter-<backend>` consumes flat-folder metadata buffers and creates or
+  applies directory metadata on the target backend.
+- `DataWriter-<backend>` consumes data buffers and writes file payloads on the
+  target backend.
+- Backend suffixes are visible in pipeline/status names: `NFS`, `SYN`, and `FS`.
+- Multi-threaded data writes must use a sharded data queue keyed by file id.
+  This preserves the invariant that all chunks for one large file are written by
+  one writer lane/context, avoiding cross-lane truncation or open-handle races.
+- Packed small-file buffers are written as independent whole files by
+  `DataWriter-<backend>`; no extra unpacking job is required.
+- Safe copy shape:
+  `[MetaReader-NFS]->(FileQueue)->[DataReader-NFS]->(DataBufQueue-sharded-by-file)->[DataWriter-NFS]`
+  with a parallel metadata stream:
+  `[MetaReader-NFS]->(MetadataBufQueue)->[MetaWriter-NFS]`.
+
+Small/large writer prioritization should reuse the same bucket policy as the
+reader side: small-file writers optimize file completion rate, large-file writers
+consume remaining bandwidth, and the controller shifts capacity according to ETA
+tension while preserving per-file queue affinity.
+
 ### Phase 2 — NVMe Cache
 
 Goal: decouple reader and writer. Enable transfers larger than RAM.

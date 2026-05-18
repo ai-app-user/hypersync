@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -98,6 +99,10 @@ using hypersync::SyntheticProfileCaptureConfig;
 using hypersync::SyntheticReplayConfig;
 using hypersync::SyntheticReplayCursor;
 using hypersync::SyntheticWorkloadProfile;
+using hypersync::TargetDataWriterConfig;
+using hypersync::TargetDataWriterJob;
+using hypersync::TargetMetaWriterConfig;
+using hypersync::TargetMetaWriterJob;
 using hypersync::ScanWriter;
 using hypersync::SpscRing;
 using hypersync::TransferEngine;
@@ -2435,6 +2440,113 @@ void test_nfs_data_buffer_reader_slides_small_files_without_packing() {
     EXPECT_EQ(reader.stats().files_read, 3U);
     EXPECT_EQ(reader.stats().files_failed, 0U);
     EXPECT_EQ(reader.stats().bytes_read, 12U);
+    EXPECT_EQ(pool.in_use(), 0U);
+    EXPECT_EQ(pool.available(), pool.capacity());
+}
+
+void test_target_data_writer_writes_regular_and_packed_buffers() {
+    TempDir target("hypersync_target_data_writer");
+    RawBufferPool pool = hypersync::make_data_buffer_pool(8U);
+    ShardedBufQueue queue(2U, 4U);
+
+    BufferHandle large_a = pool.acquire_wait();
+    hypersync::DataBuffer& large_a_buffer = hypersync::data_buffer(pool, large_a);
+    large_a_buffer.trailer = {};
+    large_a_buffer.trailer.file_id = 42U;
+    large_a_buffer.trailer.file_size = 11U;
+    large_a_buffer.trailer.data_offset = 0U;
+    large_a_buffer.trailer.data_len = 6U;
+    large_a_buffer.trailer.mode = 0644U;
+    large_a_buffer.trailer.uid = static_cast<std::uint32_t>(::getuid());
+    large_a_buffer.trailer.gid = static_cast<std::uint32_t>(::getgid());
+    large_a_buffer.trailer.rel_path = "large.bin";
+    std::memcpy(large_a_buffer.bytes.data(), "hello ", 6U);
+
+    BufferHandle large_b = pool.acquire_wait();
+    hypersync::DataBuffer& large_b_buffer = hypersync::data_buffer(pool, large_b);
+    large_b_buffer.trailer = large_a_buffer.trailer;
+    large_b_buffer.trailer.data_offset = 6U;
+    large_b_buffer.trailer.data_len = 5U;
+    large_b_buffer.trailer.flags = hypersync::kFlagLastChunk;
+    std::memcpy(large_b_buffer.bytes.data(), "world", 5U);
+
+    BufferHandle packed = pool.acquire_wait();
+    hypersync::DataBuffer& packed_buffer = hypersync::data_buffer(pool, packed);
+    hypersync::reset_packed_small_file_buffer(packed_buffer);
+    hypersync::PackedSmallFileMeta small;
+    small.file_id = 7U;
+    small.folder_hash = 1U;
+    small.file_size = 3U;
+    small.mode = 0600U;
+    small.uid = static_cast<std::uint32_t>(::getuid());
+    small.gid = static_cast<std::uint32_t>(::getgid());
+    small.rel_path = "tiny/a.txt";
+    EXPECT_TRUE(hypersync::append_packed_small_file(packed_buffer, small, "abc"));
+
+    EXPECT_TRUE(queue.shard(0U).push_wait(large_a));
+    EXPECT_TRUE(queue.shard(0U).push_wait(large_b));
+    EXPECT_TRUE(queue.shard(1U).push_wait(packed));
+    queue.close();
+
+    TargetDataWriterJob writer(TargetDataWriterConfig(2U, target.path.string(), false), pool, queue);
+    writer.start();
+    writer.wait();
+
+    EXPECT_EQ(writer.stats().files_written, 2U);
+    EXPECT_EQ(writer.stats().files_failed, 0U);
+    EXPECT_EQ(writer.stats().buffers_processed, 3U);
+    EXPECT_EQ(pool.in_use(), 0U);
+    EXPECT_EQ(pool.available(), pool.capacity());
+
+    std::ifstream large_in(target.path / "large.bin", std::ios::binary);
+    std::string large_payload((std::istreambuf_iterator<char>(large_in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(large_payload, std::string("hello world"));
+    std::ifstream small_in(target.path / "tiny/a.txt", std::ios::binary);
+    std::string small_payload((std::istreambuf_iterator<char>(small_in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(small_payload, std::string("abc"));
+}
+
+void test_target_meta_writer_creates_flat_folder_directories() {
+    TempDir target("hypersync_target_meta_writer");
+    RawBufferPool pool = hypersync::make_metadata_batch_buffer_pool(4U);
+    BufQueue queue(4U);
+
+    BufferHandle handle = pool.acquire_wait();
+    hypersync::MetadataBatchBuffer& buffer = hypersync::metadata_batch_buffer(pool, handle);
+    FileSpec folder;
+    folder.rel_path = "root";
+    folder.mode = 0755U;
+    folder.uid = static_cast<std::uint32_t>(::getuid());
+    folder.gid = static_cast<std::uint32_t>(::getgid());
+    hypersync::reset_flat_folder_buffer(buffer,
+                                        folder,
+                                        0U,
+                                        true,
+                                        false,
+                                        "",
+                                        0U,
+                                        1U,
+                                        0U,
+                                        0U,
+                                        0U,
+                                        0U);
+    FileSpec child;
+    child.rel_path = "root/child";
+    child.mode = 0750U;
+    child.uid = static_cast<std::uint32_t>(::getuid());
+    child.gid = static_cast<std::uint32_t>(::getgid());
+    EXPECT_TRUE(hypersync::append_flat_folder_folder(buffer, child, "metadata"));
+    EXPECT_TRUE(queue.push_wait(handle));
+    queue.close();
+
+    TargetMetaWriterJob writer(TargetMetaWriterConfig(1U, target.path.string()), pool, queue);
+    writer.start();
+    writer.wait();
+
+    EXPECT_TRUE(fs::is_directory(target.path / "root"));
+    EXPECT_TRUE(fs::is_directory(target.path / "root/child"));
+    EXPECT_EQ(writer.stats().buffers_processed, 1U);
+    EXPECT_EQ(writer.stats().folders_written, 2U);
     EXPECT_EQ(pool.in_use(), 0U);
     EXPECT_EQ(pool.available(), pool.capacity());
 }
@@ -5035,6 +5147,12 @@ int main(int argc, char** argv) {
         {"nfs_data_buffer_reader_slides_small_files_without_packing",
          TestSuite::unit,
          test_nfs_data_buffer_reader_slides_small_files_without_packing},
+        {"target_data_writer_writes_regular_and_packed_buffers",
+         TestSuite::unit,
+         test_target_data_writer_writes_regular_and_packed_buffers},
+        {"target_meta_writer_creates_flat_folder_directories",
+         TestSuite::unit,
+         test_target_meta_writer_creates_flat_folder_directories},
         {"scan_index_round_trip_and_folder_hashes", TestSuite::unit, test_scan_index_round_trip_and_folder_hashes},
         {"scan_index_rejects_bad_csv", TestSuite::unit, test_scan_index_rejects_bad_csv},
         {"state_machines_accept_valid_paths_and_reject_invalid_ones",

@@ -9,6 +9,7 @@
 
 #include "common/buffer_pool.hpp"
 #include "common/types.hpp"
+#include "core/pipeline_buffers.hpp"
 #include "jobs/nfs_data_reader/nfs_data_reader.hpp"
 #include "jobs/threaded_job.hpp"
 
@@ -42,6 +43,11 @@ public:
                            BufQueue& output,
                            FileProvider file_provider,
                            StopPredicate stop_predicate = {});
+    NfsDataBufferReaderJob(NfsDataReaderConfig config,
+                           RawBufferPool& data_pool,
+                           ShardedBufQueue& output,
+                           FileProvider file_provider,
+                           StopPredicate stop_predicate = {});
     ~NfsDataBufferReaderJob() override;
 
     void set_bytes_read_callback(BytesReadCallback callback);
@@ -57,6 +63,8 @@ protected:
 
 private:
     void publish_file_chunks(NfsDataReader& reader, const FileSpec& file, std::size_t worker_index);
+    [[nodiscard]] bool publish_buffer(std::size_t worker_index, const BufferHandle& handle);
+    [[nodiscard]] std::size_t output_shard_for(const DataBuffer& buffer) const;
     void complete_trailer(const RecBuf& record,
                           std::uint64_t logical_size,
                           DataBufTrailer& trailer,
@@ -70,7 +78,8 @@ private:
 
     NfsDataReaderConfig config_;
     RawBufferPool& data_pool_;
-    BufQueue& output_;
+    BufQueue* output_ = nullptr;
+    ShardedBufQueue* sharded_output_ = nullptr;
     FileProvider file_provider_;
     StopPredicate stop_predicate_;
     BytesReadCallback bytes_read_callback_;

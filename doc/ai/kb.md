@@ -1255,3 +1255,27 @@ logical size: 335.99 TB
     right baseline for downstream jobs that need realistic metadata plus actual
     data bytes. For metadata-only jobs, keep using the separate SyntheticMetaReader
     baseline (`MetaReader-SYN-8` common, `32` for max metadata generator throughput).
+
+## Target Writer Job Contract
+
+- 2026-05-17 22:53 PDT:
+  - Added first pipeline-native target writer slice:
+    - `MetaWriter-<backend>` consumes flat-folder metadata buffers and creates
+      or applies target directory metadata.
+    - `DataWriter-<backend>` consumes `DataBuffer` handles and writes regular
+      chunk buffers plus packed-small-file buffers.
+  - Existing backend abstraction is reused: local filesystem now works in unit
+    tests, and NFS uses the existing libnfs target writer backend when built on
+    Linux with libnfs.
+  - Important invariant: multi-worker data writing requires sharded input by
+    file id. All chunks for a large file must stay on one writer lane/context,
+    otherwise separate target contexts can independently create/truncate the
+    same file. The single `BufQueue` constructor is intentionally limited to one
+    data writer worker.
+  - Added sharded output support to `NfsDataBufferReaderJob`, routing buffers by
+    file id so the safe writer pipeline can be:
+    `[DataReader-NFS-N]->(DataBufQueue-sharded-by-file)->[DataWriter-NFS-N]`.
+  - Focused local verification passed:
+    `target_data_writer_writes_regular_and_packed_buffers`,
+    `target_meta_writer_creates_flat_folder_directories`, and existing
+    `nfs_data_buffer_reader_*` buffer tests.
