@@ -1397,3 +1397,11 @@ logical size: 335.99 TB
 - Bounded-window small-file write probes on agnopo with 96 NFS writer lanes, all 16 IPs, `files-per-batch=16`, precreated target dirs, no fsync/metadata restore: `file_window=8` produced about `1.15K files/s`; `file_window=16` about `1.11K files/s`; `file_window=32` reached about `1.35K files/s` before the test harness exceeded the precreated directory range. This is stable but not near the `50K files/s` goal.
 
 - 2026-05-18 PDT small-file NFS write CPU diagnostic on agnopo: with 96 meta readers, 96 synthetic data readers, 96 `DataWriter-NFS` workers, all 16 IPs, `data_writer_file_window=32`, packed small files, no fsync/metadata restore, precreated target dirs, throughput was only about `1.32K files/s` but CPU was fully saturated. `mpstat`: `80` cores, avg busy `99.99%`, avg system `84.88%`, avg iowait `0.00%`, avg softirq `0.18%`, `80` cores >80% busy. Hottest `hypersync` threads were runnable at roughly `85-98%` CPU. Conclusion: the small-file write plateau is not idle backend wait; it is client/kernel-side CPU/system-time saturation in the current high-level libnfs write path and/or thread topology.
+
+- 2026-05-18 PDT: `DataWriter-NULL` is a runtime target backend, not a compile-time flag. Use `--target null://` to keep the same pipeline and drop only target I/O. Pipeline suffix becomes `DataWriter-NULL`.
+- Null-writer isolation on agnopo after commit `7f18ee0`:
+  `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue)->[DataReader-SYN-96]->(DataQueue)->[DataWriter-NULL-96]`.
+  Settings: synthetic zero payload, `files-per-batch=16`, packed small files, writer async window `16`, file window `32`, `max_file_size_bytes=131072`, data queue shards `96`.
+  30-second result: `7,252,133` files read/written, `454.18 GB`, `241,665 files/s`, `121.08 Gbit/s`, zero failures, data queue high watermark `21 / 24,576`.
+  20-second CPU repeat: `240,062 files/s`, `120.27 Gbit/s`; `mpstat` all-CPU average user `3.14%`, system `40.90%`, idle `55.94%`.
+  Interpretation: the piper queue/data reader/packed-buffer pipeline is healthy and has >4x headroom over the `50K files/s` goal. The real `DataWriter-NFS` small-file plateau is isolated to the high-level libnfs/kernel socket/syscall target writer path.
