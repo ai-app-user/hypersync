@@ -702,3 +702,7 @@ path is still the next architecture step for writes.
 **User:** Asked to call the network preflight/apply feature `tuning`.
 
 **Codex:** Renamed the user-facing command and output prefix to `tuning`: `hypersync tuning --iface ens3 [--peer <ip>] [--apply]`. Kept `network-preflight` as a compatibility alias for now so existing scripts do not break immediately.
+
+**User:** Asked to verify the target is tuned again and retest the NFS writer with different thread counts, expecting max performance with fewer threads after tuning.
+
+**Codex:** Redeployed `dev` to agnopo and ran `sudo hypersync tuning --iface ens3 --peer 172.27.255.2`; the target reported `mismatches=0`. A non-root write sweep was invalid because the high-level writer attempted metadata restore and hit `NFS3ERR_PERM` from `nfs_chown_async`; reran as root for meaningful write-path numbers. Large-only synthetic PRNG writes through all 16 IPs with `data_writer_async_window=2`, `min_file_size_bytes=1048576`, and matched reader/writer lanes produced: 32 lanes `92.7 Gbit/s`, 48 lanes `135.2 Gbit/s`, 64 lanes `154.5 Gbit/s`, 96 lanes `189.4 Gbit/s`, 112 lanes `195.3 Gbit/s`, 128 lanes `194.6 Gbit/s` repeat (`194.1 Gbit/s` previous 128-lane run). Current recommendation for tuned agnopo large writes is 112 data readers / 112 NFS data writers, async write window 2, root or metadata-restore disabled when synthetic ownership cannot be applied.

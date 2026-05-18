@@ -1368,3 +1368,19 @@ logical size: 335.99 TB
   report-only checks and add `--apply` to set the tuned profile. The old
   `network-preflight` command may remain as a temporary compatibility alias,
   but docs and responses should use `tuning`.
+
+- Tuned agnopo large-write sweep, 2026-05-18 PDT, all 16 target IPs, root run,
+  synthetic PRNG profile, `min_file_size_bytes=1048576`, writer async window 2,
+  matched DataReader/DataWriter lanes:
+  - 32 lanes: `291.0 GB` in `25.12s`, `92.7 Gbit/s`.
+  - 48 lanes: `424.9 GB` in `25.14s`, `135.2 Gbit/s`.
+  - 64 lanes: `485.4 GB` in `25.13s`, `154.5 Gbit/s`.
+  - 96 lanes: `596.6 GB` in `25.19s`, `189.4 Gbit/s`.
+  - 112 lanes: `615.7 GB` in `25.22s`, `195.3 Gbit/s`.
+  - 128 lanes: `613.4 GB` in `25.21s`, `194.6 Gbit/s`; earlier 128-lane run was
+    `611.8 GB` in `25.22s`, `194.1 Gbit/s`.
+  Recommendation: use 112 reader/writer lanes for tuned agnopo large-write
+  benchmarks unless a later run shows 128 is materially better. Non-root runs
+  can abort on `nfs_chown_async` / `NFS3ERR_PERM` when synthetic profile metadata
+  contains ownership the export will not allow; use root or add a metadata-restore
+  skip mode before treating non-root write throughput as valid.
