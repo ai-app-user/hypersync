@@ -159,7 +159,7 @@ std::string linux_online_cpu_mask() {
     return out.str();
 }
 
-struct NetworkPreflightOptions {
+struct TuningOptions {
     std::string iface = "ens3";
     bool apply = false;
     std::string cpu_mask;
@@ -278,7 +278,7 @@ std::string first_nfs_mount_peer() {
     return {};
 }
 
-int run_network_preflight(const NetworkPreflightOptions& options) {
+int run_tuning(const TuningOptions& options) {
     const std::string iface = options.iface;
     const std::string mask = options.cpu_mask.empty() ? linux_online_cpu_mask() : options.cpu_mask;
     const std::string qiface = shell_quote(iface);
@@ -323,7 +323,7 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
         for (const std::string& command : commands) {
             const int rc = std::system(command.c_str());
             if (rc != 0) {
-                std::cerr << "network_preflight apply_failed command=" << command << " rc=" << rc << '\n';
+                std::cerr << "tuning apply_failed command=" << command << " rc=" << rc << '\n';
             }
         }
     }
@@ -334,7 +334,7 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
         if (!ok) {
             ++mismatches;
         }
-        std::cout << "network_preflight " << (ok ? "ok" : "mismatch")
+        std::cout << "tuning " << (ok ? "ok" : "mismatch")
                   << " setting=" << name
                   << " current=" << shell_quote(trim_copy(current))
                   << " expected=" << shell_quote(trim_copy(expected)) << '\n';
@@ -361,7 +361,7 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
     if (!ring_ok) {
         ++mismatches;
     }
-    std::cout << "network_preflight " << (ring_ok ? "ok" : "mismatch")
+    std::cout << "tuning " << (ring_ok ? "ok" : "mismatch")
               << " setting=rx_tx_ring expected='" << options.ring << "/" << options.ring << "'\n";
 
     const std::string coalesce = command_output("ethtool -c " + qiface);
@@ -370,14 +370,14 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
     if (!coalesce_ok) {
         ++mismatches;
     }
-    std::cout << "network_preflight " << (coalesce_ok ? "ok" : "mismatch")
+    std::cout << "tuning " << (coalesce_ok ? "ok" : "mismatch")
               << " setting=rx_coalesce expected='adaptive-rx off rx-usecs 12'\n";
 
     const std::string rx_queue_count =
         trim_copy(command_output("ls -d /sys/class/net/" + iface + "/queues/rx-* 2>/dev/null | wc -l"));
     const std::string tx_queue_count =
         trim_copy(command_output("ls -d /sys/class/net/" + iface + "/queues/tx-* 2>/dev/null | wc -l"));
-    std::cout << "network_preflight info setting=rx_tx_queues current="
+    std::cout << "tuning info setting=rx_tx_queues current="
               << shell_quote(rx_queue_count + "/" + tx_queue_count) << '\n';
 
     const std::string rx0 = read_text_file("/sys/class/net/" + iface + "/queues/rx-0/rps_cpus");
@@ -409,30 +409,30 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
     const std::string rpc_slots_max = read_text_file("/proc/sys/sunrpc/tcp_max_slot_table_entries");
     if (!rpc_slots_max.empty()) {
         check("rpc_slots_max", rpc_slots_max, "65536");
-        std::cout << "network_preflight info setting=sunrpc.tcp_max_slot_table_entries current="
+        std::cout << "tuning info setting=sunrpc.tcp_max_slot_table_entries current="
                   << shell_quote(rpc_slots_max) << '\n';
     }
     const std::string rpc_slots_current = read_text_file("/proc/sys/sunrpc/tcp_slot_table_entries");
     if (!rpc_slots_current.empty()) {
         check("rpc_slots_current", rpc_slots_current, "65536");
-        std::cout << "network_preflight info setting=sunrpc.tcp_slot_table_entries current="
+        std::cout << "tuning info setting=sunrpc.tcp_slot_table_entries current="
                   << shell_quote(rpc_slots_current) << '\n';
     }
 
     const std::string speed = command_output("ethtool " + qiface + " | awk -F': ' '/Speed:/ {print $2}'");
     if (!speed.empty()) {
-        std::cout << "network_preflight info setting=speed current="
+        std::cout << "tuning info setting=speed current="
                   << shell_quote(trim_copy(speed)) << '\n';
     }
     const std::string channels = command_output("ethtool -l " + qiface);
     const std::optional<std::uint64_t> combined = ethtool_named_value(channels, "Combined");
     if (combined.has_value()) {
-        std::cout << "network_preflight info setting=combined_channels current="
+        std::cout << "tuning info setting=combined_channels current="
                   << combined.value() << '\n';
     }
     const std::string numa_node = read_text_file("/sys/class/net/" + iface + "/device/numa_node");
     if (!numa_node.empty()) {
-        std::cout << "network_preflight info setting=nic_numa_node current="
+        std::cout << "tuning info setting=nic_numa_node current="
                   << shell_quote(numa_node) << '\n';
     }
     const std::string peer = options.peer.empty() ? first_nfs_mount_peer() : options.peer;
@@ -445,15 +445,15 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
         command_output("iptables -t mangle -S | grep -c TCPMSS || true");
     if (!tcp_mss_rules.empty() && trim_copy(tcp_mss_rules) != "0") {
         ++mismatches;
-        std::cout << "network_preflight mismatch setting=tcpmss_rules current="
+        std::cout << "tuning mismatch setting=tcpmss_rules current="
                   << shell_quote(trim_copy(tcp_mss_rules)) << " expected='0'\n";
     } else {
-        std::cout << "network_preflight ok setting=tcpmss_rules current='0' expected='0'\n";
+        std::cout << "tuning ok setting=tcpmss_rules current='0' expected='0'\n";
     }
 
     const std::string nfs_mounts =
         command_output("findmnt -rn -t nfs,nfs4 -o TARGET,SOURCE,OPTIONS || true");
-    std::cout << "network_preflight info setting=optimized_nfs_mounts count="
+    std::cout << "tuning info setting=optimized_nfs_mounts count="
               << count_lines(nfs_mounts) << '\n';
     if (!nfs_mounts.empty()) {
         std::cout << nfs_mounts;
@@ -479,7 +479,7 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
             if (!ok) {
                 ++mismatches;
             }
-            std::cout << "network_preflight " << (ok ? "ok" : "mismatch")
+            std::cout << "tuning " << (ok ? "ok" : "mismatch")
                       << " setting=" << prefix << option
                       << " current=" << shell_quote(mount_options)
                       << " expected=" << shell_quote(option) << '\n';
@@ -505,7 +505,7 @@ int run_network_preflight(const NetworkPreflightOptions& options) {
         ++mount_index;
     }
 
-    std::cout << "network_preflight summary iface=" << iface
+    std::cout << "tuning summary iface=" << iface
               << " apply=" << (options.apply ? "true" : "false")
               << " mismatches=" << mismatches
               << " cpu_mask=" << shell_quote(mask) << '\n';
@@ -1512,7 +1512,7 @@ void print_usage() {
         << "Usage:\n"
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
         << "  hypersync status --socket <path>\n"
-        << "  hypersync network-preflight [--iface <name>] [--cpu-mask <mask>] [--peer <ip>] [--apply]\n"
+        << "  hypersync tuning [--iface <name>] [--cpu-mask <mask>] [--peer <ip>] [--apply]\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--checker-threads <n>] [--checker-request-queue-depth <n>] [--checker-batch-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
@@ -1583,22 +1583,22 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        if (command == "network-preflight") {
-            NetworkPreflightOptions preflight;
+        if (command == "tuning" || command == "network-preflight") {
+            TuningOptions tuning;
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--iface") {
-                    preflight.iface = require_option(args, i, "--iface");
+                    tuning.iface = require_option(args, i, "--iface");
                 } else if (args[i] == "--cpu-mask") {
-                    preflight.cpu_mask = require_option(args, i, "--cpu-mask");
+                    tuning.cpu_mask = require_option(args, i, "--cpu-mask");
                 } else if (args[i] == "--peer") {
-                    preflight.peer = require_option(args, i, "--peer");
+                    tuning.peer = require_option(args, i, "--peer");
                 } else if (args[i] == "--apply") {
-                    preflight.apply = true;
+                    tuning.apply = true;
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
             }
-            return run_network_preflight(preflight);
+            return run_tuning(tuning);
         }
 
         hypersync::ConfigStore config_store(

@@ -1326,8 +1326,8 @@ logical size: 335.99 TB
     The high-level libnfs writer lifecycle remains the main gap to 200G.
 
 - 2026-05-18 PDT: Hypersync owns network preflight now through
-  `hypersync network-preflight [--iface ens3] [--cpu-mask <mask>] [--apply]`.
-  Report-only mode prints `network_preflight ok|mismatch` records and returns
+  `hypersync tuning [--iface ens3] [--cpu-mask <mask>] [--apply]`.
+  Report-only mode prints `tuning ok|mismatch` records and returns
   non-zero if optimized settings are missing. `--apply` attempts to set the
   tuned profile: MTU 9000, RX/TX rings 8192, adaptive-rx off with rx-usecs 12,
   RPS/RFS/XPS masks, `net.core.rps_sock_flow_entries=262144`, 2GB TCP buffer
@@ -1342,17 +1342,17 @@ logical size: 335.99 TB
   The mounted NFS volume still had the desired mount flags (`nconnect=32`,
   `rsize/wsize=1048576`, `remoteports=172.27.255.2-172.27.255.17`,
   `spread_reads`, `spread_writes`). Running
-  `sudo hypersync network-preflight --iface ens3 --apply` restored the tuned
+  `sudo hypersync tuning --iface ens3 --apply` restored the tuned
   host profile. Validator CPU masks must compare normalized masks because Linux
   drops leading zero groups (for example `0000ffff,...` vs `ffff,...`).
 
-- `network-preflight` must show RPC slots using human-readable names:
+- `tuning` must show RPC slots using human-readable names:
   `rpc_slots_current=65536` and `rpc_slots_max=65536`. It may also print the
   raw kernel file names as informational traceability lines, but user-facing
   reports should not rely only on the raw `sunrpc.tcp_*_slot_table_entries`
   names.
 
-- `network-preflight` coverage must match the old transfer1/nopo high-throughput
+- `tuning` coverage must match the old transfer1/nopo high-throughput
   table, not just sysctls. It now checks/reports NIC driver, RX/TX queue counts,
   all queue RPS/RFS/XPS masks, irqbalance status, NIC NUMA node, PMTU probe,
   exact NFS mount options, and NFS BDI read-ahead. `--apply` also sets NFS BDI
@@ -1360,5 +1360,11 @@ logical size: 335.99 TB
 
 - agnopo expanded preflight result after `15303ab`: first expanded run found only
   `nfs_mount_0_bdi_read_ahead_kb current=128 expected=16384`. Applying
-  `sudo hypersync network-preflight --iface ens3 --peer 172.27.255.2 --apply`
+  `sudo hypersync tuning --iface ens3 --peer 172.27.255.2 --apply`
   corrected it; final expanded preflight returned `mismatches=0`.
+
+- User-facing name for the host/network profile verifier is `tuning`, not
+  `network-preflight`. Use `hypersync tuning --iface ens3 [--peer <ip>]` for
+  report-only checks and add `--apply` to set the tuned profile. The old
+  `network-preflight` command may remain as a temporary compatibility alias,
+  but docs and responses should use `tuning`.
