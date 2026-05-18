@@ -1419,3 +1419,15 @@ logical size: 335.99 TB
   - `file_window=64`: about `9,252 files/s`.
   - `file_window=128`: about `9,751 files/s`.
   - with file window `32`, `DataWriter-NFS-32`: about `9,512 files/s`; `DataWriter-NFS-64`: about `9,263 files/s`; `DataWriter-NFS-96`: about `10,868 files/s`.
+
+- 2026-05-18 PDT NFS writer reactor locality tuning:
+  - `NfsTargetWriteReactorFleet` reactor threads pin to CPUs `0..15` on Linux using `pthread_setaffinity_np`.
+  - piper `ThreadedJob` workers pin round-robin to CPUs `16..N-1` on Linux hosts with more than 16 CPUs. This keeps pipeline workers away from the dedicated reactor cores.
+  - Reactor `fill_window()` now queues at most `32` new CREATE transactions per service turn before `nfs_service()`, giving libnfs/TCP a bounded batch of outbound work while preserving completion progress.
+  - Reactor transactions now carry `std::string_view` payload descriptors into the async write state machine instead of copying small-file bytes into a transaction-owned `std::string`. This is zero-copy only within the current synchronous `write_files()` lifetime; a later buffer-ownership API is required before producer workers can submit and release buffers immediately.
+- agnopo result after reactor affinity + piper worker affinity + bounded queue batch + no-copy string_view payload:
+  `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue)->[DataReader-SYN-96]->(DataQueue)->[DataWriter-NFS-96/reactors=16 pinned workers=16+]`.
+  Settings: all 16 target IPs, packed small files, no fsync/metadata restore, assumed target dirs, `files-per-batch=1024`, `data_writer_file_window=32`.
+  Result: `434,076` files in `30.50s`, `14,234 files/s`, `7.12 Gbit/s`, zero failures.
+  CPU average: user `19.59%`, system `56.49%`, idle `22.94%`; `64/80` cores >=80% busy, `1/80` >=95% busy.
+  Compared with previous reactor result (`10,868 files/s`, system `63.78%`) this is a useful gain; compared with old 96-context result (`~1.32K files/s`, system `84.88%`) this is about `10.8x` faster.
