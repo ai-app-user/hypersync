@@ -2568,3 +2568,95 @@ At `32` readers it already reaches the same practical plateau as `64` readers:
 about `967-971 Gbit/s` and `50K files/s`. `32` is the better current default
 for PRNG synthetic data because it achieves the plateau with half the reader
 threads.
+
+## DataReader-SYN With Hash DB Writer, 2026-05-18
+
+Host: transfer1  
+Commits: `a07063f`, `5b6be35`
+
+Pipeline tested:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-32]->(HashQueue)->[DataHasher-32]->(RecordQueue)->[MetadataRecordWriter]
+```
+
+Fixes required before the test could complete:
+
+- `a07063f`: serialized shared `MetadataRecordWriter` access from hash metadata
+  workers and hash workers.
+- `5b6be35`: implemented `SyntheticProfileBackend::read_file_pooled_chunks()`.
+  The old hash inventory path uses pooled chunks, while the newer data benchmark
+  uses raw buffer chunks. Before this fix synthetic pooled reads fell back to
+  `load_file()`, which is only a 1-byte synthetic stub.
+
+Sanity result on a bounded synthetic small-file profile:
+
+```text
+profile       10,000 files, 4 KiB bucket, payload=prng
+output        parquet
+files_hashed  10,000
+rows_written  10,000
+bytes_read    20,375,638
+elapsed_s     31.852
+rate          ~314 files/s
+output_size   192 KiB
+```
+
+Interpretation: the path is now functionally correct, but far too slow. The
+limiter is not `DataReader-SYN`: the buffer-native `benchmark-data-hash` path
+with the same synthetic profile family reaches `224.5 Gbit/s`. The old `hash`
+inventory writer path writes one completed file at a time through
+`MetadataRecordWriter`, so it serializes tiny write batches and cannot represent
+the intended high-throughput DB writer architecture. The next fix should batch
+completed hash records into buffer-sized groups and hand those batches to the
+writer, or replace this path with the normal buffer queue writer pipeline.
+
+## MetaReader-SYN To DB Writer, 2026-05-18
+
+Host: transfer1  
+Commit: `5b6be35`  
+Profile:
+`/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-data-sampled-fastpath-20260517T200342Z/profile.txt`
+
+Correct metadata-only writer pipeline:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataBufQueue)->[MetadataRecordWriter-32]
+```
+
+Command shape:
+
+```text
+benchmark-meta --source synthetic-profile://<profile>
+  --metadata-output <output>/metadata.parquet
+  --metadata-output-format parquet
+  --metadata-records files
+  --metadata-output-partitions 32
+  --metadata-output-partition-mode processes
+  --meta-reader-threads 8
+  --metadata-async-depth 256
+  --record-buffer-slots 4096
+  --max-duration-seconds 30
+  --stats-interval-seconds 10
+  --no-pipeline-autoscale
+```
+
+Result:
+
+```text
+files_written                 164,978,688
+folders_found                 40,279
+logical_size_bytes            256,872,172,875,623
+elapsed_s                     52.196
+records_per_second            3.16M
+metadata_queue_shards         32
+metadata_queue_capacity       32,768
+metadata_queue_high_watermark 4,690
+metadata_queue_full           false
+output_partitions             32
+output_size                   810M
+```
+
+Interpretation: this is the intended DB writer test shape. The metadata queue
+did not fill, so `MetaReader-SYN-8` was not the bottleneck for this run. Current
+writer throughput is about `3.16M records/s` to 32 Parquet partition processes.

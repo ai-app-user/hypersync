@@ -538,3 +538,33 @@ where aggregate buffer/discard/scheduling pressure is becoming visible.
 sample at `1,023.63 Gbit/s` / `52.95K files/s`. This is effectively the same
 plateau as `64` readers while using half the reader threads, so `32` is the
 better current default for PRNG synthetic data tests.
+
+## 2026-05-18
+
+**User:** Asked to test the DB writer again with `DataReader-SYN`.
+
+**Codex:** Tried the existing `hash` command because it is the current CLI path
+that combines metadata scan, data read, hash, and Parquet/DB output. Initial
+tests failed because the path used old pooled reads, not the buffer-native raw
+chunk reader. Fixed two compatibility bugs: serialized shared
+`MetadataRecordWriter` access (`a07063f`) and added synthetic pooled data reads
+with PRNG payload support (`5b6be35`). After deploying to transfer1, a bounded
+10K-file synthetic small-file profile completed successfully and wrote 10K
+Parquet rows, but only at about `314 files/s` (`31.85s` elapsed). Conclusion:
+`DataReader-SYN` is not the bottleneck; the old hash inventory writer path
+writes one file at a time into `MetadataRecordWriter`. The next architectural
+fix is batching completed hash records into buffer-sized groups or replacing
+this path with the normal buffer queue writer pipeline.
+
+**User:** Clarified that the intended DB writer test was metadata-only:
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[MetadataRecordWriter-32]`,
+not the data/hash writer path.
+
+**Codex:** Confirmed the earlier test was not the requested shape and reran the
+correct metadata writer pipeline on transfer1 using the archived synthetic
+profile. Actual pipeline:
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataBufQueue)->[MetadataRecordWriter-32]`.
+The run wrote `164,978,688` file records to 32 Parquet partition processes in
+`52.20s`, `3.16M records/s`, output size `810M`. Metadata queue high watermark
+was `4,690 / 32,768` and `metadata_queue_full=false`, so the current limiter is
+the DB writer side rather than `MetaReader-SYN-8`.
