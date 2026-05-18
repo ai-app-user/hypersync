@@ -262,11 +262,11 @@ bool NfsDataBufferReaderJob::publish_buffer(std::size_t worker_index, const Buff
     }
     const DataBuffer& buffer = data_buffer(data_pool_, handle);
     const std::size_t shard = output_shard_for(buffer);
-    if (sharded_output_->shard(shard).try_push(handle)) {
+    if (sharded_output_->try_push(shard, handle)) {
         return true;
     }
     auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_output_full);
-    return sharded_output_->shard(shard).push_wait(handle);
+    return sharded_output_->push_wait(shard, handle);
 }
 
 std::size_t NfsDataBufferReaderJob::output_shard_for(const DataBuffer& buffer) const {

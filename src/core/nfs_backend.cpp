@@ -5166,12 +5166,21 @@ private:
         const std::string remote_path = "/" + rel_path;
         const auto stat = try_stat64(session_.context(), remote_path);
         if (!stat.has_value()) {
-            run_async_command(
-                session_.context(),
-                [&](AsyncCommandState* state) {
-                    return nfs_mkdir2_async(session_.context(), remote_path.c_str(), 0755, generic_nfs_callback, state);
-                },
-                "nfs_mkdir2_async");
+            AsyncCommandState mkdir_state;
+            mkdir_state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result = nfs_mkdir2_async(session_.context(),
+                                                      remote_path.c_str(),
+                                                      0755,
+                                                      generic_nfs_callback,
+                                                      &mkdir_state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_mkdir2_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+            pump_nfs_until_done(session_.context(), mkdir_state);
+            if (mkdir_state.status < 0 && mkdir_state.status != -EEXIST) {
+                throw std::runtime_error("nfs_mkdir2_async failed: " + mkdir_state.error);
+            }
         } else if (!S_ISDIR(stat->nfs_mode)) {
             throw std::runtime_error("remote path exists but is not a directory: " + remote_path);
         }
