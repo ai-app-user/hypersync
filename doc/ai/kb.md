@@ -1235,3 +1235,23 @@ logical size: 335.99 TB
   - Final report elapsed `231.653s`; writer drain continued after scan timer.
     Final `records_per_second=3.613M`; early/mid cumulative file rates were about
     `5.1M-5.3M files/s` through 80s.
+
+## Synthetic Metadata Plus Data Baseline
+
+- 2026-05-18 PDT, transfer1, commit lineage through `6dc122a`:
+  - Use this as the default synthetic pipeline for jobs that need both metadata
+    and actual data bytes, not just metadata counts.
+  - Profile:
+    `/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-data-sampled-fastpath-20260517T200342Z/profile.txt`
+  - Pipeline:
+    `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-32]->(DataBufQueue)->[BufferDiscarder-1]`
+  - Command shape:
+    `benchmark-data --source synthetic-profile://<profile>?payload=prng --meta-reader-threads 8 --metadata-async-depth 256 --data-reader-threads 32 --data-outstanding-requests 2 --max-files-queued 5000000 --data-buffer-slots 8192 --data-queue-depth 4096 --data-copy-mode copy`
+  - Result: `967.32 Gbit/s`, `50.04K files/s` final average; 10-second interval
+    sample was `1,023.63 Gbit/s`, `52.95K files/s`.
+  - Why this is the remembered default: `32` readers reaches the same practical
+    PRNG data plateau as `64` readers while using half the threads. It exercises
+    real pseudo-random payload generation and real buffer writes, so it is the
+    right baseline for downstream jobs that need realistic metadata plus actual
+    data bytes. For metadata-only jobs, keep using the separate SyntheticMetaReader
+    baseline (`MetaReader-SYN-8` common, `32` for max metadata generator throughput).
