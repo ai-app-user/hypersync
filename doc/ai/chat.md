@@ -532,3 +532,9 @@ reached `120.77 Gbit/s` / `6.09K files/s`, `16` readers reached `487.19 Gbit/s`
 / `25.35K files/s`, and `64` readers reached `970.83 Gbit/s` / `50.38K files/s`.
 The path is nearly linear through `16` readers and begins bending near `64`,
 where aggregate buffer/discard/scheduling pressure is becoming visible.
+
+**Codex:** Added the missing midpoint test at `DataReader-SYN-32`. It reached
+`967.32 Gbit/s` and `50.04K files/s` final average, with the 10-second interval
+sample at `1,023.63 Gbit/s` / `52.95K files/s`. This is effectively the same
+plateau as `64` readers while using half the reader threads, so `32` is the
+better current default for PRNG synthetic data tests.
