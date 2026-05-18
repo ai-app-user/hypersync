@@ -524,3 +524,11 @@ non-zero, and distinct for different synthetic files. Deployed transfer1 from
 The `copy` run with `payload=prng` reached `948.09 Gbit/s` and `49.15K files/s`
 over `10.01s`, which is about `11%` below the zero-fill copy baseline because
 payload generation is now real CPU work.
+
+**Codex:** Swept `DataReader-SYN` thread counts with the same profile,
+`payload=prng`, `copy` mode, `MetaReader-SYN-8`, and data outstanding requests
+`2`. Results: `1` reader reached `30.50 Gbit/s` / `1.61K files/s`, `4` readers
+reached `120.77 Gbit/s` / `6.09K files/s`, `16` readers reached `487.19 Gbit/s`
+/ `25.35K files/s`, and `64` readers reached `970.83 Gbit/s` / `50.38K files/s`.
+The path is nearly linear through `16` readers and begins bending near `64`,
+where aggregate buffer/discard/scheduling pressure is becoming visible.

@@ -2551,3 +2551,18 @@ Interpretation: pseudo-random payload generation is now real CPU work in the
 synthetic data path. The fast xorshift64-style fill keeps the benchmark near
 `950 Gbit/s`, about `11%` below the zero-fill copy baseline, while preserving
 the same profile-backed file-size distribution and normal buffer pipeline.
+
+Fast PRNG thread scaling sweep, same profile and pipeline, `copy` mode:
+
+```text
+DataReader-SYN  files_read  bytes_read        elapsed_s  Gbit/s   files/s
+1               17,365      41,248,336,991    10.818     30.50    1.61K
+4               65,646      162,675,751,007   10.776     120.77   6.09K
+16              272,507     654,533,313,276   10.748     487.19   25.35K
+64              504,268     1,214,722,957,168 10.010     970.83   50.38K
+```
+
+Interpretation: the PRNG copy path scales almost linearly through `16` readers.
+At `64` readers the synthetic pipeline reaches about `971 Gbit/s`; the curve is
+starting to bend, so the next limit is no longer one reader thread but aggregate
+buffer/discard/scheduling pressure.
