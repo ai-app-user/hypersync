@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -5134,17 +5135,407 @@ private:
     mutable std::unique_ptr<LibNfsSession> session_;
 };
 
+class NfsTargetWriteReactorFleet;
+
+std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
+    const std::string& root_url,
+    const TargetWriterBackend::Options& options);
+
+class NfsTargetWriteReactorFleet final : public std::enable_shared_from_this<NfsTargetWriteReactorFleet> {
+public:
+    explicit NfsTargetWriteReactorFleet(std::string root_url, TargetWriterBackend::Options options)
+        : root_url_(std::move(root_url)), options_(options) {
+        const std::vector<std::string> endpoints = expand_nfs_url_server_candidates(root_url_);
+        const std::size_t reactor_count =
+            std::max<std::size_t>(1U, std::min<std::size_t>(16U, endpoints.empty() ? 1U : endpoints.size()));
+        reactors_.reserve(reactor_count);
+        for (std::size_t index = 0; index < reactor_count; ++index) {
+            reactors_.push_back(std::make_unique<Reactor>(*this, index));
+        }
+        for (auto& reactor : reactors_) {
+            reactor->start();
+        }
+    }
+
+    ~NfsTargetWriteReactorFleet() {
+        stop();
+    }
+
+    NfsTargetWriteReactorFleet(const NfsTargetWriteReactorFleet&) = delete;
+    NfsTargetWriteReactorFleet& operator=(const NfsTargetWriteReactorFleet&) = delete;
+
+    void write_files(const std::vector<TargetWriterBackend::WriteChunk>& files) {
+        if (files.empty()) {
+            return;
+        }
+
+        auto completion = std::make_shared<BatchCompletion>();
+        completion->remaining.store(files.size(), std::memory_order_release);
+        for (const TargetWriterBackend::WriteChunk& file : files) {
+            auto transaction = std::make_shared<FileTransaction>();
+            transaction->completion = completion;
+            transaction->spec = file.spec;
+            transaction->spec.rel_path = normalize_path(transaction->spec.rel_path);
+            transaction->remote_path = "/" + transaction->spec.rel_path;
+            transaction->offset = file.offset;
+            transaction->data.assign(file.data.data(), file.data.size());
+            select_reactor(transaction->spec.rel_path).enqueue(std::move(transaction));
+        }
+
+        std::unique_lock<std::mutex> lock(completion->mutex);
+        completion->cv.wait(lock, [&completion] {
+            return completion->remaining.load(std::memory_order_acquire) == 0U;
+        });
+        if (!completion->first_error.empty()) {
+            throw std::runtime_error(completion->first_error);
+        }
+    }
+
+    [[nodiscard]] std::size_t reactor_count() const noexcept {
+        return reactors_.size();
+    }
+
+private:
+    struct BatchCompletion {
+        std::atomic<std::size_t> remaining {0};
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::string first_error;
+    };
+
+    struct FileTransaction {
+        enum class Phase { queued, creating, writing, syncing, closing, done };
+
+        FileSpec spec;
+        std::string remote_path;
+        std::string data;
+        std::uint64_t offset = 0;
+        struct nfsfh* handle = nullptr;
+        AsyncCommandState create_state;
+        AsyncCommandState write_state;
+        AsyncCommandState sync_state;
+        AsyncCommandState close_state;
+        Phase phase = Phase::queued;
+        std::shared_ptr<BatchCompletion> completion;
+        std::string error;
+    };
+
+    struct QueueNode {
+        explicit QueueNode(std::shared_ptr<FileTransaction> value)
+            : transaction(std::move(value)) {}
+
+        std::shared_ptr<FileTransaction> transaction;
+        QueueNode* next = nullptr;
+    };
+
+    class Reactor {
+    public:
+        Reactor(NfsTargetWriteReactorFleet& fleet, std::size_t index)
+            : fleet_(fleet), index_(index), session_(fleet.root_url_, index) {}
+
+        ~Reactor() {
+            stop();
+        }
+
+        Reactor(const Reactor&) = delete;
+        Reactor& operator=(const Reactor&) = delete;
+
+        void start() {
+            thread_ = std::thread([this] { run(); });
+        }
+
+        void stop() {
+            stop_requested_.store(true, std::memory_order_release);
+            if (thread_.joinable()) {
+                thread_.join();
+            }
+        }
+
+        void enqueue(std::shared_ptr<FileTransaction> transaction) {
+            auto* node = new QueueNode(std::move(transaction));
+            node->next = inbound_.exchange(node, std::memory_order_acq_rel);
+        }
+
+    private:
+        void run() {
+            try {
+                while (!stop_requested_.load(std::memory_order_acquire) || inbound_.load(std::memory_order_acquire) != nullptr ||
+                       !backlog_.empty() || !active_.empty()) {
+                    drain_inbound();
+                    fill_window();
+                    service_nfs_context(session_.context(), active_.empty() ? 1 : 0);
+                    advance_active();
+                    if (active_.empty() && backlog_.empty() && inbound_.load(std::memory_order_acquire) == nullptr) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
+                }
+            } catch (const std::exception& error) {
+                fail_all(error.what());
+            } catch (...) {
+                fail_all("NFS target writer reactor failed with an unknown error");
+            }
+        }
+
+        void drain_inbound() {
+            QueueNode* list = inbound_.exchange(nullptr, std::memory_order_acq_rel);
+            QueueNode* reversed = nullptr;
+            while (list != nullptr) {
+                QueueNode* next = list->next;
+                list->next = reversed;
+                reversed = list;
+                list = next;
+            }
+            while (reversed != nullptr) {
+                QueueNode* next = reversed->next;
+                backlog_.push_back(std::move(reversed->transaction));
+                delete reversed;
+                reversed = next;
+            }
+        }
+
+        void fill_window() {
+            const std::size_t max_active =
+                std::max<std::size_t>(1U, fleet_.options_.max_concurrent_file_transactions);
+            while (!backlog_.empty() && active_.size() < max_active) {
+                std::shared_ptr<FileTransaction> transaction = std::move(backlog_.front());
+                backlog_.pop_front();
+                queue_create(*transaction);
+                active_.push_back(std::move(transaction));
+            }
+        }
+
+        void queue_create(FileTransaction& transaction) {
+            transaction.phase = FileTransaction::Phase::creating;
+            transaction.create_state = {};
+            transaction.create_state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result = nfs_create_async(session_.context(),
+                                                      transaction.remote_path.c_str(),
+                                                      O_TRUNC,
+                                                      static_cast<int>(transaction.spec.mode),
+                                                      generic_nfs_callback,
+                                                      &transaction.create_state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_create_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+        }
+
+        void queue_write(FileTransaction& transaction) {
+            transaction.phase = FileTransaction::Phase::writing;
+            transaction.write_state = {};
+            transaction.write_state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result = nfs_pwrite_async(session_.context(),
+                                                      transaction.handle,
+                                                      transaction.offset,
+                                                      transaction.data.size(),
+                                                      transaction.data.data(),
+                                                      generic_nfs_callback,
+                                                      &transaction.write_state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_pwrite_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+        }
+
+        void queue_sync(FileTransaction& transaction) {
+            transaction.phase = FileTransaction::Phase::syncing;
+            transaction.sync_state = {};
+            transaction.sync_state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result =
+                nfs_fsync_async(session_.context(), transaction.handle, generic_nfs_callback, &transaction.sync_state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_fsync_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+        }
+
+        void queue_close(FileTransaction& transaction) {
+            transaction.phase = FileTransaction::Phase::closing;
+            transaction.close_state = {};
+            transaction.close_state.queued_at = std::chrono::steady_clock::now();
+            const int queue_result =
+                nfs_close_async(session_.context(), transaction.handle, generic_nfs_callback, &transaction.close_state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_close_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+        }
+
+        void advance_active() {
+            for (auto it = active_.begin(); it != active_.end();) {
+                FileTransaction& transaction = **it;
+                try {
+                    if (transaction.phase == FileTransaction::Phase::creating && transaction.create_state.done) {
+                        if (transaction.create_state.status < 0) {
+                            throw std::runtime_error("nfs_create_async failed: " + transaction.create_state.error);
+                        }
+                        transaction.handle = static_cast<struct nfsfh*>(transaction.create_state.data);
+                        if (transaction.handle == nullptr) {
+                            throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
+                        }
+                        if (transaction.data.empty()) {
+                            queue_close(transaction);
+                        } else {
+                            queue_write(transaction);
+                        }
+                    }
+                    if (transaction.phase == FileTransaction::Phase::writing && transaction.write_state.done) {
+                        if (transaction.write_state.status < 0) {
+                            throw std::runtime_error("nfs_pwrite_async failed: " + transaction.write_state.error);
+                        }
+                        if (transaction.write_state.status != static_cast<int>(transaction.data.size())) {
+                            throw std::runtime_error("nfs_pwrite_async short write");
+                        }
+                        if (fleet_.options_.fsync_on_finish) {
+                            queue_sync(transaction);
+                        } else {
+                            queue_close(transaction);
+                        }
+                    }
+                    if (transaction.phase == FileTransaction::Phase::syncing && transaction.sync_state.done) {
+                        if (transaction.sync_state.status < 0) {
+                            throw std::runtime_error("nfs_fsync_async failed: " + transaction.sync_state.error);
+                        }
+                        queue_close(transaction);
+                    }
+                    if (transaction.phase == FileTransaction::Phase::closing && transaction.close_state.done) {
+                        if (transaction.close_state.status < 0) {
+                            throw std::runtime_error("nfs_close_async failed: " + transaction.close_state.error);
+                        }
+                        transaction.handle = nullptr;
+                        transaction.phase = FileTransaction::Phase::done;
+                        complete_transaction(*it, {});
+                        it = active_.erase(it);
+                        continue;
+                    }
+                } catch (const std::exception& error) {
+                    if (transaction.handle != nullptr) {
+                        nfs_close(session_.context(), transaction.handle);
+                        transaction.handle = nullptr;
+                    }
+                    complete_transaction(*it, error.what());
+                    it = active_.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+        }
+
+        void complete_transaction(const std::shared_ptr<FileTransaction>& transaction, std::string error) {
+            std::shared_ptr<BatchCompletion> completion = transaction->completion;
+            if (!completion) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(completion->mutex);
+                if (!error.empty() && completion->first_error.empty()) {
+                    completion->first_error = std::move(error);
+                }
+            }
+            if (completion->remaining.fetch_sub(1U, std::memory_order_acq_rel) == 1U) {
+                completion->cv.notify_all();
+            }
+        }
+
+        void fail_all(std::string_view error) {
+            drain_inbound();
+            while (!backlog_.empty()) {
+                complete_transaction(backlog_.front(), std::string(error));
+                backlog_.pop_front();
+            }
+            for (const auto& transaction : active_) {
+                if (transaction->handle != nullptr) {
+                    nfs_close(session_.context(), transaction->handle);
+                    transaction->handle = nullptr;
+                }
+                complete_transaction(transaction, std::string(error));
+            }
+            active_.clear();
+        }
+
+        NfsTargetWriteReactorFleet& fleet_;
+        std::size_t index_;
+        LibNfsSession session_;
+        std::atomic<QueueNode*> inbound_ {nullptr};
+        std::deque<std::shared_ptr<FileTransaction>> backlog_;
+        std::vector<std::shared_ptr<FileTransaction>> active_;
+        std::atomic<bool> stop_requested_ {false};
+        std::thread thread_;
+    };
+
+    Reactor& select_reactor(std::string_view rel_path) {
+        const std::uint64_t key = hash64(rel_path);
+        return *reactors_[static_cast<std::size_t>(key % reactors_.size())];
+    }
+
+    void stop() {
+        for (auto& reactor : reactors_) {
+            reactor->stop();
+        }
+    }
+
+    std::string root_url_;
+    TargetWriterBackend::Options options_;
+    std::vector<std::unique_ptr<Reactor>> reactors_;
+};
+
+std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
+    const std::string& root_url,
+    const TargetWriterBackend::Options& options) {
+    struct FleetKey {
+        std::string root_url;
+        bool preserve_metadata = true;
+        bool fsync_on_finish = true;
+        bool ensure_parent_directories = true;
+        std::size_t max_concurrent_file_transactions = 64;
+
+        [[nodiscard]] std::string string() const {
+            std::ostringstream out;
+            out << root_url << "|pm=" << preserve_metadata << "|fs=" << fsync_on_finish
+                << "|ep=" << ensure_parent_directories << "|fw=" << max_concurrent_file_transactions;
+            return out.str();
+        }
+    };
+
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::weak_ptr<NfsTargetWriteReactorFleet>> fleets;
+
+    FleetKey key;
+    key.root_url = root_url;
+    key.preserve_metadata = options.preserve_metadata;
+    key.fsync_on_finish = options.fsync_on_finish;
+    key.ensure_parent_directories = options.ensure_parent_directories;
+    key.max_concurrent_file_transactions = options.max_concurrent_file_transactions;
+    const std::string key_text = key.string();
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = fleets.find(key_text);
+    if (it != fleets.end()) {
+        if (auto existing = it->second.lock()) {
+            return existing;
+        }
+        fleets.erase(it);
+    }
+
+    auto created = std::make_shared<NfsTargetWriteReactorFleet>(root_url, options);
+    fleets.emplace(key_text, created);
+    return created;
+}
+
 class LibNfsTargetWriterBackend final : public TargetWriterBackend {
 public:
     explicit LibNfsTargetWriterBackend(std::string root_url, std::size_t endpoint_index, Options options)
-        : root_url_(std::move(root_url)), session_(root_url_, endpoint_index), options_(options) {
+        : root_url_(std::move(root_url)),
+          endpoint_index_(endpoint_index),
+          options_(options),
+          reactor_fleet_(shared_target_write_reactor_fleet(root_url_, options_)) {
         known_directories_.insert("");
     }
 
     ~LibNfsTargetWriterBackend() override {
         for (auto& [_, handle] : open_handles_) {
             if (handle != nullptr) {
-                nfs_close(session_.context(), handle);
+                nfs_close(legacy_session().context(), handle);
             }
         }
     }
@@ -5175,9 +5566,9 @@ public:
         std::size_t written_total = 0;
         while (written_total < data.size()) {
             const AsyncCommandState write_state = run_async_command(
-                session_.context(),
+                legacy_session().context(),
                 [&](AsyncCommandState* state) {
-                    return nfs_pwrite_async(session_.context(),
+                    return nfs_pwrite_async(legacy_session().context(),
                                             handle,
                                             offset + written_total,
                                             data.size() - written_total,
@@ -5221,7 +5612,7 @@ public:
             PendingWrite& write = pending.back();
             write.chunk = &chunk;
             write.state.queued_at = std::chrono::steady_clock::now();
-            const int queue_result = nfs_pwrite_async(session_.context(),
+            const int queue_result = nfs_pwrite_async(legacy_session().context(),
                                                       handle,
                                                       chunk.offset,
                                                       chunk.data.size(),
@@ -5230,7 +5621,7 @@ public:
                                                       &write.state);
             if (queue_result != 0) {
                 throw std::runtime_error("nfs_pwrite_async queue failed: " +
-                                         std::string(nfs_get_error(session_.context())));
+                                         std::string(nfs_get_error(legacy_session().context())));
             }
             if (chunk.last_chunk) {
                 finish_after_write.push_back(&chunk);
@@ -5239,7 +5630,7 @@ public:
 
         std::size_t completed = 0;
         while (completed < pending.size()) {
-            service_nfs_context(session_.context(), 100);
+            service_nfs_context(legacy_session().context(), 100);
             completed = 0;
             for (const PendingWrite& write : pending) {
                 if (write.state.done) {
@@ -5263,140 +5654,7 @@ public:
     }
 
     void write_files(const std::vector<WriteChunk>& files) override {
-        struct PendingFile {
-            AsyncCommandState create_state;
-            AsyncCommandState write_state;
-            AsyncCommandState close_state;
-            const WriteChunk* file = nullptr;
-            std::string remote_path;
-            struct nfsfh* handle = nullptr;
-            enum class Phase { waiting, creating, writing, closing, done } phase = Phase::waiting;
-        };
-
-        std::vector<PendingFile> pending;
-        pending.reserve(files.size());
-        for (const WriteChunk& file : files) {
-            const std::string rel_path = normalize_path(file.spec.rel_path);
-            if (options_.ensure_parent_directories) {
-                ensure_directory_chain(parent_path(rel_path));
-            }
-            pending.push_back(PendingFile {});
-            PendingFile& state = pending.back();
-            state.file = &file;
-            state.remote_path = "/" + rel_path;
-        }
-
-        const std::size_t max_active =
-            std::max<std::size_t>(1U, options_.max_concurrent_file_transactions);
-        std::size_t next_to_queue = 0;
-        std::size_t active = 0;
-
-        auto queue_create = [&](PendingFile& state) {
-            state.phase = PendingFile::Phase::creating;
-            state.create_state.queued_at = std::chrono::steady_clock::now();
-            const int queue_result = nfs_create_async(session_.context(),
-                                                      state.remote_path.c_str(),
-                                                      O_TRUNC,
-                                                      static_cast<int>(state.file->spec.mode),
-                                                      generic_nfs_callback,
-                                                      &state.create_state);
-            if (queue_result != 0) {
-                throw std::runtime_error("nfs_create_async queue failed: " +
-                                         std::string(nfs_get_error(session_.context())));
-            }
-        };
-
-        while (next_to_queue < pending.size() && active < max_active) {
-            queue_create(pending[next_to_queue++]);
-            ++active;
-        }
-
-        std::size_t completed = 0;
-        while (completed < pending.size()) {
-            service_nfs_context(session_.context(), active == 0U ? 0 : 100);
-            for (PendingFile& state : pending) {
-                if (state.phase == PendingFile::Phase::creating && state.create_state.done) {
-                    if (state.create_state.status < 0) {
-                        throw std::runtime_error("nfs_create_async failed: " + state.create_state.error);
-                    }
-                    state.handle = static_cast<struct nfsfh*>(state.create_state.data);
-                    if (state.handle == nullptr) {
-                        throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
-                    }
-                    if (state.file->data.empty()) {
-                        state.phase = PendingFile::Phase::closing;
-                        state.close_state.queued_at = std::chrono::steady_clock::now();
-                        const int queue_result = nfs_close_async(session_.context(),
-                                                                 state.handle,
-                                                                 generic_nfs_callback,
-                                                                 &state.close_state);
-                        if (queue_result != 0) {
-                            throw std::runtime_error("nfs_close_async queue failed: " +
-                                                     std::string(nfs_get_error(session_.context())));
-                        }
-                    } else {
-                        state.phase = PendingFile::Phase::writing;
-                        state.write_state.queued_at = std::chrono::steady_clock::now();
-                        const int queue_result = nfs_pwrite_async(session_.context(),
-                                                                  state.handle,
-                                                                  state.file->offset,
-                                                                  state.file->data.size(),
-                                                                  state.file->data.data(),
-                                                                  generic_nfs_callback,
-                                                                  &state.write_state);
-                        if (queue_result != 0) {
-                            throw std::runtime_error("nfs_pwrite_async queue failed: " +
-                                                     std::string(nfs_get_error(session_.context())));
-                        }
-                    }
-                }
-                if (state.phase == PendingFile::Phase::writing && state.write_state.done) {
-                    if (state.write_state.status < 0) {
-                        throw std::runtime_error("nfs_pwrite_async failed: " + state.write_state.error);
-                    }
-                    if (state.write_state.status != static_cast<int>(state.file->data.size())) {
-                        throw std::runtime_error("nfs_pwrite_async short write");
-                    }
-                    if (options_.fsync_on_finish) {
-                        run_async_command(
-                            session_.context(),
-                            [&](AsyncCommandState* command_state) {
-                                return nfs_fsync_async(session_.context(),
-                                                       state.handle,
-                                                       generic_nfs_callback,
-                                                       command_state);
-                            },
-                            "nfs_fsync_async");
-                    }
-                    state.phase = PendingFile::Phase::closing;
-                    state.close_state.queued_at = std::chrono::steady_clock::now();
-                    const int queue_result = nfs_close_async(session_.context(),
-                                                             state.handle,
-                                                             generic_nfs_callback,
-                                                             &state.close_state);
-                    if (queue_result != 0) {
-                        throw std::runtime_error("nfs_close_async queue failed: " +
-                                                 std::string(nfs_get_error(session_.context())));
-                    }
-                }
-                if (state.phase == PendingFile::Phase::closing && state.close_state.done) {
-                    if (state.close_state.status < 0) {
-                        throw std::runtime_error("nfs_close_async failed: " + state.close_state.error);
-                    }
-                    state.handle = nullptr;
-                    if (options_.preserve_metadata) {
-                        apply_remote_metadata("/" + normalize_path(state.file->spec.rel_path), state.file->spec);
-                    }
-                    state.phase = PendingFile::Phase::done;
-                    ++completed;
-                    --active;
-                    while (next_to_queue < pending.size() && active < max_active) {
-                        queue_create(pending[next_to_queue++]);
-                        ++active;
-                    }
-                }
-            }
-        }
+        reactor_fleet_->write_files(files);
     }
 
     void finish_file(const FileSpec& spec) override {
@@ -5410,16 +5668,16 @@ public:
         struct nfsfh* handle = it->second;
         if (options_.fsync_on_finish) {
             run_async_command(
-                session_.context(),
+                legacy_session().context(),
                 [&](AsyncCommandState* state) {
-                    return nfs_fsync_async(session_.context(), handle, generic_nfs_callback, state);
+                    return nfs_fsync_async(legacy_session().context(), handle, generic_nfs_callback, state);
                 },
                 "nfs_fsync_async");
         }
         run_async_command(
-            session_.context(),
+            legacy_session().context(),
             [&](AsyncCommandState* state) {
-                return nfs_close_async(session_.context(), handle, generic_nfs_callback, state);
+                return nfs_close_async(legacy_session().context(), handle, generic_nfs_callback, state);
             },
             "nfs_close_async");
         open_handles_.erase(it);
@@ -5435,12 +5693,12 @@ public:
             return;
         }
         if (it->second != nullptr) {
-            nfs_close(session_.context(), it->second);
+            nfs_close(legacy_session().context(), it->second);
         }
         open_handles_.erase(it);
         try {
             const std::string remote_path = "/" + normalized;
-            nfs_unlink(session_.context(), remote_path.c_str());
+            nfs_unlink(legacy_session().context(), remote_path.c_str());
         } catch (...) {}
     }
 
@@ -5449,7 +5707,7 @@ public:
         if (normalized_path.empty()) {
             throw std::runtime_error("relative path must not be empty");
         }
-        return nfs_stream_hash(session_.context(), "/" + normalized_path);
+        return nfs_stream_hash(legacy_session().context(), "/" + normalized_path);
     }
 
     [[nodiscard]] bool uses_async_api() const override {
@@ -5457,8 +5715,15 @@ public:
     }
 
 private:
+    LibNfsSession& legacy_session() const {
+        if (!legacy_session_) {
+            legacy_session_ = std::make_unique<LibNfsSession>(root_url_, endpoint_index_);
+        }
+        return *legacy_session_;
+    }
+
     void apply_remote_metadata(const std::string& remote_path, const FileSpec& spec) {
-        const auto stat = try_stat64(session_.context(), remote_path);
+        const auto stat = try_stat64(legacy_session().context(), remote_path);
         if (!stat.has_value()) {
             throw std::runtime_error("remote path missing while applying metadata: " + remote_path);
         }
@@ -5466,9 +5731,9 @@ private:
         if (static_cast<std::uint32_t>(stat->nfs_uid) != spec.uid ||
             static_cast<std::uint32_t>(stat->nfs_gid) != spec.gid) {
             run_async_command(
-                session_.context(),
+                legacy_session().context(),
                 [&](AsyncCommandState* state) {
-                    return nfs_chown_async(session_.context(),
+                    return nfs_chown_async(legacy_session().context(),
                                            remote_path.c_str(),
                                            static_cast<int>(spec.uid),
                                            static_cast<int>(spec.gid),
@@ -5480,9 +5745,9 @@ private:
 
         if ((stat->nfs_mode & 0777U) != spec.mode) {
             run_async_command(
-                session_.context(),
+                legacy_session().context(),
                 [&](AsyncCommandState* state) {
-                    return nfs_chmod_async(session_.context(),
+                    return nfs_chmod_async(legacy_session().context(),
                                            remote_path.c_str(),
                                            static_cast<int>(spec.mode),
                                            generic_nfs_callback,
@@ -5498,9 +5763,9 @@ private:
             times[0].tv_usec = static_cast<suseconds_t>((spec.mtime % 1'000'000'000ULL) / 1000ULL);
             times[1] = times[0];
             run_async_command(
-                session_.context(),
+                legacy_session().context(),
                 [&](AsyncCommandState* state) {
-                    return nfs_utimes_async(session_.context(), remote_path.c_str(), times, generic_nfs_callback, state);
+                    return nfs_utimes_async(legacy_session().context(), remote_path.c_str(), times, generic_nfs_callback, state);
                 },
                 "nfs_utimes_async");
         }
@@ -5543,20 +5808,20 @@ private:
         }
 
         const std::string remote_path = "/" + rel_path;
-        const auto stat = try_stat64(session_.context(), remote_path);
+        const auto stat = try_stat64(legacy_session().context(), remote_path);
         if (!stat.has_value()) {
             AsyncCommandState mkdir_state;
             mkdir_state.queued_at = std::chrono::steady_clock::now();
-            const int queue_result = nfs_mkdir2_async(session_.context(),
+            const int queue_result = nfs_mkdir2_async(legacy_session().context(),
                                                       remote_path.c_str(),
                                                       0755,
                                                       generic_nfs_callback,
                                                       &mkdir_state);
             if (queue_result != 0) {
                 throw std::runtime_error("nfs_mkdir2_async queue failed: " +
-                                         std::string(nfs_get_error(session_.context())));
+                                         std::string(nfs_get_error(legacy_session().context())));
             }
-            pump_nfs_until_done(session_.context(), mkdir_state);
+            pump_nfs_until_done(legacy_session().context(), mkdir_state);
             if (mkdir_state.status < 0 && mkdir_state.status != -EEXIST) {
                 throw std::runtime_error("nfs_mkdir2_async failed: " + mkdir_state.error);
             }
@@ -5574,9 +5839,9 @@ private:
 
         const std::string remote_path = "/" + rel_path;
         const AsyncCommandState open_state = run_async_command(
-            session_.context(),
+            legacy_session().context(),
             [&](AsyncCommandState* state) {
-                return nfs_create_async(session_.context(),
+                return nfs_create_async(legacy_session().context(),
                                         remote_path.c_str(),
                                         O_TRUNC,
                                         static_cast<int>(mode),
@@ -5590,8 +5855,10 @@ private:
     }
 
     std::string root_url_;
-    LibNfsSession session_;
+    std::size_t endpoint_index_;
     Options options_;
+    std::shared_ptr<NfsTargetWriteReactorFleet> reactor_fleet_;
+    mutable std::unique_ptr<LibNfsSession> legacy_session_;
     std::unordered_map<std::string, struct nfsfh*> open_handles_;
     std::unordered_set<std::string> known_directories_;
 };
