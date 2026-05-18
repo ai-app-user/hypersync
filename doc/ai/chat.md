@@ -500,3 +500,11 @@ buffer-native data read and data hash pipelines, e.g. `MetaReader-SYN` and
 because the buffer-native `DataReader` still delegates backend read operations
 through it; it should be renamed/flattened in a later cleanup without changing
 the pipeline contract.
+
+**Codex:** Tested profile-backed `DataReader-SYN` on transfer1 with
+`MetaReader-SYN-8`, `DataReader-SYN-64`, async depth `256`, data outstanding
+requests `2`, and the archived full-source profile. The no-copy run sustained
+`1,036 Gbit/s` and `53.7K files/s`; the copy run sustained `1,071 Gbit/s` and
+`55.0K files/s`. Copy and no-copy were similar, so the current synthetic data
+limit is mostly reader scheduling/buffer/discard pressure rather than payload
+initialization.

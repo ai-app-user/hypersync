@@ -2474,3 +2474,44 @@ Interpretation: profile-backed metadata generation scales nearly linearly from
 hot and the run regresses below the 32-thread result. For SyntheticMetaReader
 metadata-only tuning, `32` readers is the best current point for this sink; use
 wider downstream sharding before testing reader counts above that.
+
+## Profile-Backed DataReader-SYN, 2026-05-18
+
+Host: transfer1  
+Commit: `0cb2a11`  
+Profile:
+`/mnt/local-nvme/wsync-codex/nfs-profile-whole-100mphase-data-sampled-fastpath-20260517T200342Z/profile.txt`
+
+Pipeline:
+
+```text
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(FileQueue)->[DataReader-SYN-64]->(DataBufQueue)->[BufferDiscarder-1]
+```
+
+Command shape:
+
+```text
+benchmark-data --source synthetic-profile://<profile>
+  --meta-reader-threads 8
+  --metadata-async-depth 256
+  --data-reader-threads 64
+  --data-outstanding-requests 2
+  --max-files-queued 5000000
+  --data-buffer-slots 8192
+  --data-queue-depth 4096
+  --max-duration-seconds 10
+  --stats-interval-seconds 2
+```
+
+Results:
+
+```text
+mode     files_found  files_read  bytes_read        Gbit/s    files/s
+no-copy  5,603,328    585,297     1,412,084,554,445 1,036.3   53.69K
+copy       557,056    550,077     1,339,470,444,524 1,070.6   54.96K
+```
+
+Interpretation: `DataReader-SYN-64` sustains about `1.0-1.1 Tbit/s` logical
+synthetic throughput on the profiled file-size distribution. Copy and no-copy
+are similar here, so the measured limit is dominated by DataReader scheduling,
+buffer churn, and discard pressure rather than payload memory initialization.
