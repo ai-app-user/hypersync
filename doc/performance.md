@@ -2661,6 +2661,32 @@ Interpretation: this is the intended DB writer test shape. The metadata queue
 did not fill, so `MetaReader-SYN-8` was not the bottleneck for this run. Current
 writer throughput is about `3.16M records/s` to 32 Parquet partition processes.
 
+Update after `b2a3309`: the initial result above was limited by route shard
+imbalance. Routed flat-folder buffers used only `folder_path` as the partition
+key, so the synthetic profile fed only 8 of 32 writer processes. The route key
+now includes `folder_path`, flat-folder buffer `sequence`, `metadata_hash`, and
+`child_record_count`.
+
+Retest:
+
+```text
+pipeline
+[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataRouteQueue-32x1024 balanced-key)->[BufferSender-1x32]->(UnixSocket)->[MetadataRecordWriter-1x32]
+
+files_written                 508,932,096
+folders_found                 124,252
+elapsed_s                     50.980
+records_per_second            9.98M
+metadata_queue_shards         32
+metadata_queue_capacity       32,768
+metadata_queue_high_watermark 285
+metadata_queue_full           false
+```
+
+All 32 output parts were active after the fix. Part sizes were tightly balanced:
+roughly `76.6M-81.0M` bytes per partition. This raises DB writer throughput from
+`3.16M` to `9.98M records/s`.
+
 ### Writer-Replaced-By-Discarder Isolation
 
 Same host/profile/settings, replacing `MetadataRecordWriter-32` with discarders:

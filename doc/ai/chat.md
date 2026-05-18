@@ -581,3 +581,17 @@ watermark `171 / 32,768`. The no-socket route-discard path
 processed `455,806,976` records in `35.61s`, `15.20M records/s`, high watermark
 `4 / 4,096`. Conclusion: socket transport costs around `11%`, but the real
 drop from `13.54M` to `3.16M records/s` is the Parquet/DB writer side.
+
+**User:** Identified the 32-writer imbalance as a queue/routing bug and asked to
+use a hashed key to define route shards, then retest to ensure all shards are
+active.
+
+**Codex:** Changed routed flat-folder buffer partitioning from `hash(folder_path)`
+to a buffer-level key that mixes `folder_path`, buffer `sequence`,
+`metadata_hash`, and `child_record_count` (`b2a3309`). This keeps deterministic
+hash routing but prevents all split buffers for one hot folder from pinning to
+one writer. Retested the 32-writer synthetic metadata DB pipeline:
+`[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataRouteQueue-32x1024 balanced-key)->[BufferSender-1x32]->(UnixSocket)->[MetadataRecordWriter-1x32]`.
+The run wrote `508,932,096` file records in `50.98s`, `9.98M records/s`, queue
+high watermark `285 / 32,768`, `metadata_queue_full=false`. All 32 Parquet part
+files were active and balanced, roughly `76.6M-81.0M` bytes each.
