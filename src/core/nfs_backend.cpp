@@ -38,6 +38,11 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #if defined(__APPLE__)
 extern "C" off_t lseek(int, off_t, int);
 extern "C" ssize_t write(int, const void*, size_t);
@@ -188,6 +193,17 @@ std::uint64_t steady_latency_ns(std::chrono::steady_clock::time_point start,
     }
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+[[maybe_unused]] void pin_current_thread_to_cpu(std::size_t cpu_index) noexcept {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(static_cast<int>(cpu_index), &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)cpu_index;
+#endif
 }
 
 [[maybe_unused]] void record_async_read_queued(std::size_t requested) {
@@ -5178,7 +5194,7 @@ public:
             transaction->spec.rel_path = normalize_path(transaction->spec.rel_path);
             transaction->remote_path = "/" + transaction->spec.rel_path;
             transaction->offset = file.offset;
-            transaction->data.assign(file.data.data(), file.data.size());
+            transaction->data = file.data;
             select_reactor(transaction->spec.rel_path).enqueue(std::move(transaction));
         }
 
@@ -5208,7 +5224,7 @@ private:
 
         FileSpec spec;
         std::string remote_path;
-        std::string data;
+        std::string_view data;
         std::uint64_t offset = 0;
         struct nfsfh* handle = nullptr;
         AsyncCommandState create_state;
@@ -5264,6 +5280,7 @@ private:
 
     private:
         void run() {
+            pin_current_thread_to_cpu(index_);
             try {
                 while (!stop_requested_.load(std::memory_order_acquire) || inbound_.load(std::memory_order_acquire) != nullptr ||
                        !backlog_.empty() || !active_.empty()) {
@@ -5300,9 +5317,11 @@ private:
         }
 
         void fill_window() {
+            constexpr std::size_t kMaxQueueBatch = 32U;
             const std::size_t max_active =
                 std::max<std::size_t>(1U, fleet_.options_.max_concurrent_file_transactions);
-            while (!backlog_.empty() && active_.size() < max_active) {
+            std::size_t queued_this_pass = 0;
+            while (!backlog_.empty() && active_.size() < max_active && queued_this_pass < kMaxQueueBatch) {
                 std::shared_ptr<FileTransaction> transaction = std::move(backlog_.front());
                 backlog_.pop_front();
                 if (fleet_.options_.ensure_parent_directories) {
@@ -5310,6 +5329,7 @@ private:
                 }
                 queue_create(*transaction);
                 active_.push_back(std::move(transaction));
+                ++queued_this_pass;
             }
         }
 
