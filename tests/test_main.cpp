@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -1047,28 +1048,35 @@ void test_synthetic_profile_backend_streams_metadata_and_data() {
     auto backend = hypersync::make_nfs_backend(url);
 
     std::vector<FileSpec> files;
+    std::deque<FileSpec> folders;
+    folders.push_back(FileSpec {});
     std::uint64_t folders_seen = 0;
-    bool root_consumed = false;
-    backend->scan_flat_folders(
-        1,
-        [&](bool) -> std::optional<FileSpec> {
-            if (root_consumed) {
-                return std::nullopt;
-            }
-            root_consumed = true;
-            return FileSpec {};
-        },
-        [] {
-            return false;
-        },
-        [&](hypersync::FlatFolderScanBatch batch) {
-            ++folders_seen;
-            for (auto& file : batch.files) {
-                files.push_back(std::move(file));
-            }
-        });
+    while (!folders.empty()) {
+        backend->scan_flat_folders(
+            4,
+            [&](bool) -> std::optional<FileSpec> {
+                if (folders.empty()) {
+                    return std::nullopt;
+                }
+                FileSpec folder = std::move(folders.front());
+                folders.pop_front();
+                return folder;
+            },
+            [] {
+                return false;
+            },
+            [&](hypersync::FlatFolderScanBatch batch) {
+                ++folders_seen;
+                for (auto& child : batch.directories) {
+                    folders.push_back(std::move(child));
+                }
+                for (auto& file : batch.files) {
+                    files.push_back(std::move(file));
+                }
+            });
+    }
 
-    EXPECT_EQ(folders_seen, 1U);
+    EXPECT_EQ(folders_seen, 2U);
     EXPECT_EQ(files.size(), 4U);
     EXPECT_TRUE(!files.front().rel_path.empty());
     EXPECT_TRUE(!files.front().nfs_handle.empty());
@@ -1096,6 +1104,51 @@ void test_synthetic_profile_backend_streams_metadata_and_data() {
     EXPECT_EQ(bytes_read, files.front().declared_size);
 }
 
+void test_synthetic_profile_backend_feeds_batch_folders_recursively() {
+    TempDir root("synthetic_profile_backend_recursive_batches");
+    const fs::path profile_path = root.path / "profile.txt";
+    write_file(profile_path,
+               "synthetic_profile_benchmark files_observed=5000 phases=1 elapsed_s=0 files_per_second=0 "
+               "logical_size_bytes=20480000 small_files=5000 large_files=0\n"
+               "phase index=0 name=phase_0 files=5000 folders=2 small=5000 large=0 "
+               "logical_size_bytes=20480000 "
+               "size_buckets=<=0:0/0,<=4096:5000/20480000,<=16384:0/0,<=65536:0/0,"
+               "<=131072:0/0,<=1048576:0/0,<=16777216:0/0,"
+               "<=134217728:0/0,<=1073741824:0/0,<=inf:0/0\n");
+
+    auto backend = hypersync::make_nfs_backend("synthetic-profile://" + profile_path.string());
+
+    std::deque<FileSpec> folders;
+    folders.push_back(FileSpec {});
+    std::uint64_t files_seen = 0;
+    std::uint64_t folders_seen = 0;
+    while (!folders.empty()) {
+        backend->scan_flat_folders(
+            4,
+            [&](bool) -> std::optional<FileSpec> {
+                if (folders.empty()) {
+                    return std::nullopt;
+                }
+                FileSpec folder = std::move(folders.front());
+                folders.pop_front();
+                return folder;
+            },
+            [] {
+                return false;
+            },
+            [&](hypersync::FlatFolderScanBatch batch) {
+                ++folders_seen;
+                files_seen += batch.files.size();
+                for (auto& child : batch.directories) {
+                    folders.push_back(std::move(child));
+                }
+            });
+    }
+
+    EXPECT_EQ(folders_seen, 3U);
+    EXPECT_EQ(files_seen, 5000U);
+}
+
 void test_synthetic_profile_backend_can_emulate_profile_latency() {
     TempDir root("synthetic_profile_backend_latency");
     const fs::path profile_path = root.path / "profile.txt";
@@ -1116,23 +1169,32 @@ void test_synthetic_profile_backend_can_emulate_profile_latency() {
     auto backend = hypersync::make_nfs_backend(url);
 
     std::vector<FileSpec> files;
-    bool root_consumed = false;
+    std::deque<FileSpec> folders;
+    folders.push_back(FileSpec {});
     const auto scan_started = std::chrono::steady_clock::now();
-    backend->scan_flat_folders(
-        1,
-        [&](bool) -> std::optional<FileSpec> {
-            if (root_consumed) {
-                return std::nullopt;
-            }
-            root_consumed = true;
-            return FileSpec {};
-        },
-        [] {
-            return false;
-        },
-        [&](hypersync::FlatFolderScanBatch batch) {
-            files = std::move(batch.files);
-        });
+    while (!folders.empty()) {
+        backend->scan_flat_folders(
+            1,
+            [&](bool) -> std::optional<FileSpec> {
+                if (folders.empty()) {
+                    return std::nullopt;
+                }
+                FileSpec folder = std::move(folders.front());
+                folders.pop_front();
+                return folder;
+            },
+            [] {
+                return false;
+            },
+            [&](hypersync::FlatFolderScanBatch batch) {
+                for (auto& child : batch.directories) {
+                    folders.push_back(std::move(child));
+                }
+                for (auto& file : batch.files) {
+                    files.push_back(std::move(file));
+                }
+            });
+    }
     const double scan_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - scan_started).count();
     EXPECT_TRUE(scan_seconds >= 0.003);
@@ -4889,6 +4951,9 @@ int main(int argc, char** argv) {
         {"synthetic_profile_backend_streams_metadata_and_data",
          TestSuite::unit,
          test_synthetic_profile_backend_streams_metadata_and_data},
+        {"synthetic_profile_backend_feeds_batch_folders_recursively",
+         TestSuite::unit,
+         test_synthetic_profile_backend_feeds_batch_folders_recursively},
         {"synthetic_profile_backend_can_emulate_profile_latency",
          TestSuite::unit,
          test_synthetic_profile_backend_can_emulate_profile_latency},

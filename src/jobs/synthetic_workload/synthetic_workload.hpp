@@ -188,6 +188,7 @@ public:
     explicit SyntheticReplayCursor(SyntheticReplayConfig config);
 
     [[nodiscard]] bool next_file(SyntheticFileView& out) noexcept;
+    void seek_file(std::uint64_t file_id) noexcept;
     [[nodiscard]] std::uint64_t files_emitted() const noexcept;
     [[nodiscard]] std::uint64_t bytes_emitted() const noexcept;
 

@@ -357,6 +357,25 @@ bool SyntheticReplayCursor::next_file(SyntheticFileView& out) noexcept {
     return true;
 }
 
+void SyntheticReplayCursor::seek_file(std::uint64_t file_id) noexcept {
+    phase_index_ = 0;
+    phase_file_offset_ = 0;
+    files_emitted_ = file_id;
+    bytes_emitted_ = 0;
+
+    std::uint64_t remaining = file_id;
+    while (phase_index_ < config_.profile.phases.size()) {
+        const std::uint64_t phase_files = scaled_phase_files(config_.profile.phases[phase_index_]);
+        if (remaining < phase_files) {
+            phase_file_offset_ = remaining;
+            return;
+        }
+        remaining -= phase_files;
+        ++phase_index_;
+    }
+    phase_file_offset_ = 0;
+}
+
 std::uint64_t SyntheticReplayCursor::files_emitted() const noexcept {
     return files_emitted_;
 }

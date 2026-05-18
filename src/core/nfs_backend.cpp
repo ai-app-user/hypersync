@@ -1185,6 +1185,22 @@ std::optional<std::uint64_t> synthetic_file_index_from_path(std::string_view pat
     return static_cast<std::uint64_t>(std::stoull(std::string(digits)));
 }
 
+std::uint64_t synthetic_profile_file_count(const SyntheticWorkloadProfile& profile) noexcept {
+    std::uint64_t total = 0;
+    for (const SyntheticPhaseProfile& phase : profile.phases) {
+        total += phase.file_count;
+    }
+    return total;
+}
+
+FileSpec synthetic_batch_folder_spec(std::uint64_t batch_index, bool recursive) {
+    FileSpec spec;
+    spec.rel_path = "synthetic/batch_" + std::to_string(batch_index);
+    spec.mode = 0755;
+    spec.recursive = recursive;
+    return spec;
+}
+
 const SyntheticPhaseProfile& synthetic_phase_for_file_index(const SyntheticWorkloadProfile& profile,
                                                             std::uint64_t file_index) {
     std::uint64_t cursor = 0;
@@ -1282,38 +1298,70 @@ public:
         const std::function<bool()>& should_stop,
         const std::function<void(FlatFolderScanBatch)>& folder_visitor) const override {
         (void)outstanding_folders;
-        std::optional<FileSpec> requested_root;
-        if (folder_provider) {
-            requested_root = folder_provider(true);
-        }
-        if (folder_provider && !requested_root.has_value()) {
+        constexpr std::uint64_t kFilesPerSyntheticBatch = 4096;
+        const std::uint64_t total_files = synthetic_profile_file_count(profile_);
+        if (total_files == 0U) {
             return;
         }
-        constexpr std::uint64_t kFilesPerSyntheticBatch = 4096;
-        SyntheticReplayConfig config;
-        config.profile = profile_;
-        SyntheticReplayCursor cursor(std::move(config));
-        SyntheticFileView view;
-        std::uint64_t batch_index = 0;
-        std::uint64_t emitted_files = 0;
-        const std::optional<std::uint64_t> requested_batch =
-            requested_root.has_value() ? synthetic_batch_index_from_path(requested_root->rel_path) : std::nullopt;
-        if (requested_batch.has_value()) {
-            const std::uint64_t files_to_skip = *requested_batch * kFilesPerSyntheticBatch;
-            while (emitted_files < files_to_skip && cursor.next_file(view)) {
-                ++emitted_files;
-            }
-            batch_index = *requested_batch;
-        }
+        const std::uint64_t total_batches =
+            (total_files + kFilesPerSyntheticBatch - 1U) / kFilesPerSyntheticBatch;
+        const std::uint64_t lane_count = std::max<std::uint64_t>(1U, outstanding_folders);
+
+        std::uint64_t internal_batch_index = 0;
         while (!(should_stop && should_stop())) {
-            const std::uint64_t batch_first_file = emitted_files;
+            std::optional<FileSpec> requested_root;
+            if (folder_provider) {
+                requested_root = folder_provider(true);
+                if (!requested_root.has_value()) {
+                    return;
+                }
+            } else {
+                requested_root = synthetic_batch_folder_spec(internal_batch_index++, true);
+            }
+
+            const std::optional<std::uint64_t> requested_batch =
+                synthetic_batch_index_from_path(requested_root->rel_path);
+            if (!requested_batch.has_value() && folder_provider) {
+                FlatFolderScanBatch root_batch;
+                root_batch.folder.rel_path = "synthetic";
+                root_batch.folder.mode = 0755;
+                root_batch.folder.recursive = requested_root->recursive;
+                root_batch.scan_started_unix_ns = current_unix_time_nanoseconds();
+                if (requested_root->recursive) {
+                    const std::uint64_t seeded_lanes = std::min<std::uint64_t>(lane_count, total_batches);
+                    root_batch.directories.reserve(static_cast<std::size_t>(seeded_lanes));
+                    for (std::uint64_t lane = 0; lane < seeded_lanes; ++lane) {
+                        root_batch.directories.push_back(synthetic_batch_folder_spec(lane, true));
+                    }
+                }
+                root_batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
+                if (!root_batch.directories.empty() && !(should_stop && should_stop())) {
+                    folder_visitor(std::move(root_batch));
+                }
+                continue;
+            }
+            const std::uint64_t batch_index = requested_batch.value_or(0U);
+            const std::uint64_t batch_first_file = batch_index * kFilesPerSyntheticBatch;
+            if (batch_first_file >= total_files) {
+                return;
+            }
+
+            SyntheticReplayConfig config;
+            config.profile = profile_;
+            SyntheticReplayCursor cursor(std::move(config));
+            cursor.seek_file(batch_first_file);
+            SyntheticFileView view;
+
+            const bool recursive = requested_root->recursive;
             FlatFolderScanBatch batch;
-            batch.folder.rel_path = "synthetic/batch_" + std::to_string(batch_index++);
-            batch.folder.mode = 0755;
+            batch.folder = synthetic_batch_folder_spec(batch_index, recursive);
             batch.scan_started_unix_ns = current_unix_time_nanoseconds();
-            batch.files.reserve(static_cast<std::size_t>(kFilesPerSyntheticBatch));
+            batch.files.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(
+                kFilesPerSyntheticBatch,
+                total_files - batch_first_file)));
+            std::uint64_t emitted_files = batch_first_file;
             for (std::uint64_t index = 0;
-                 index < kFilesPerSyntheticBatch && !(should_stop && should_stop());
+                 index < kFilesPerSyntheticBatch && emitted_files < total_files && !(should_stop && should_stop());
                  ++index) {
                 if (!cursor.next_file(view)) {
                     break;
@@ -1323,8 +1371,12 @@ public:
                 batch.files.push_back(std::move(file));
                 ++emitted_files;
             }
-            if (batch.files.empty()) {
+            if (batch.files.empty() && batch.directories.empty()) {
                 return;
+            }
+            const std::uint64_t next_batch_index = batch_index + lane_count;
+            if (recursive && folder_provider && next_batch_index < total_batches) {
+                batch.directories.push_back(synthetic_batch_folder_spec(next_batch_index, recursive));
             }
             if (synthetic_latency_includes_metadata(options_.latency_mode)) {
                 const SyntheticPhaseProfile& phase =
@@ -1335,8 +1387,11 @@ public:
                 sleep_synthetic_latency(page_latency_us, options_.metadata_latency_scale);
             }
             batch.scan_finished_unix_ns = current_unix_time_nanoseconds();
-            folder_visitor(std::move(batch));
-            if (requested_batch.has_value()) {
+            if (!(should_stop && should_stop())) {
+                folder_visitor(std::move(batch));
+            }
+
+            if (!folder_provider && emitted_files >= total_files) {
                 return;
             }
         }
