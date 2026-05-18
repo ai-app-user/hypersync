@@ -4374,12 +4374,13 @@ std::string child_path_for_flat_folder(std::string_view folder_path, std::string
 
 class FlatFolderMetadataConsumerJob final : public BufferConsumerJob {
 public:
-    FlatFolderMetadataConsumerJob(BufQueue& input,
+    FlatFolderMetadataConsumerJob(std::size_t worker_count,
+                                  BufQueue& input,
                                   const BufferPoolRegistry& registry,
                                   MetadataStatsDiscarder* stats_discarder,
                                   MetadataRecordWriter* record_writer,
                                   PartitionedMetadataWriter* partitioned_writer)
-        : BufferConsumerJob(1U, input, registry),
+        : BufferConsumerJob(std::max<std::size_t>(1U, worker_count), input, registry),
           stats_discarder_(stats_discarder),
           record_writer_(record_writer),
           partitioned_writer_(partitioned_writer) {}
@@ -10196,7 +10197,11 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                        metadata_pool,
                                        metadata_queue,
                                        max_duration_seconds);
-        FlatFolderMetadataConsumerJob metadata_consumer(metadata_queue,
+        const std::size_t metadata_consumer_threads =
+            partitioned_writer != nullptr ? std::min(report.meta_reader_threads, report.metadata_output_partitions)
+                                          : 1U;
+        FlatFolderMetadataConsumerJob metadata_consumer(metadata_consumer_threads,
+                                                        metadata_queue,
                                                         registry,
                                                         &stats_discarder,
                                                         record_writer.has_value() ? &*record_writer : nullptr,
