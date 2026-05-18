@@ -21,6 +21,7 @@ namespace hypersync {
 constexpr std::size_t kNfsEndpointAny = std::numeric_limits<std::size_t>::max();
 
 bool is_nfs_url(std::string_view path);
+bool is_null_url(std::string_view path);
 bool libnfs_support_enabled();
 [[nodiscard]] std::vector<std::string> expand_nfs_url_server_candidates(std::string_view root_url);
 

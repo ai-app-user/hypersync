@@ -18,6 +18,9 @@ namespace {
     if (is_nfs_url(root)) {
         return "NFS";
     }
+    if (is_null_url(root)) {
+        return "NULL";
+    }
     if (root.rfind("synthetic-profile://", 0) == 0) {
         return "SYN";
     }

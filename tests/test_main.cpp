@@ -3416,6 +3416,40 @@ void test_local_target_backend_restores_directory_and_file_metadata() {
     EXPECT_EQ(dir_stat.mtime, dir_mtime);
 }
 
+void test_null_target_backend_discards_regular_and_batch_writes() {
+    EXPECT_TRUE(hypersync::is_null_url("null"));
+    EXPECT_TRUE(hypersync::is_null_url("null:"));
+    EXPECT_TRUE(hypersync::is_null_url("null://"));
+    EXPECT_FALSE(hypersync::is_null_url("nfs://example/export"));
+
+    auto writer = hypersync::make_target_writer_backend("null://");
+
+    FileSpec directory;
+    directory.rel_path = "nested";
+    writer->ensure_directory(directory);
+    writer->apply_directory_metadata(directory);
+
+    FileSpec file;
+    file.rel_path = "nested/file.txt";
+    file.declared_size = 3;
+    file.mode = 0644;
+    writer->write_chunk(file, "abc", 0);
+    writer->finish_file(file);
+
+    std::vector<hypersync::TargetWriterBackend::WriteChunk> files;
+    hypersync::TargetWriterBackend::WriteChunk chunk;
+    chunk.spec = file;
+    chunk.data = "abc";
+    chunk.last_chunk = true;
+    files.push_back(chunk);
+    writer->write_chunks(files);
+    writer->write_files(files);
+    writer->abort_file("nested/file.txt");
+
+    EXPECT_FALSE(writer->uses_async_api());
+    EXPECT_EQ(writer->file_hash("nested/file.txt"), hypersync::hash64("nested/file.txt"));
+}
+
 void test_real_libnfs_backend_directory_and_target_writer_paths() {
     if (!hypersync::libnfs_support_enabled()) {
         return;
@@ -5200,6 +5234,9 @@ int main(int argc, char** argv) {
         {"local_target_backend_restores_directory_and_file_metadata",
          TestSuite::unit,
          test_local_target_backend_restores_directory_and_file_metadata},
+        {"null_target_backend_discards_regular_and_batch_writes",
+         TestSuite::unit,
+         test_null_target_backend_discards_regular_and_batch_writes},
         {"real_libnfs_backend_directory_and_target_writer_paths",
          TestSuite::integration,
          test_real_libnfs_backend_directory_and_target_writer_paths},

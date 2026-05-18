@@ -1774,6 +1774,55 @@ private:
     std::unordered_map<std::string, ScopedFd> open_handles_;
 };
 
+class NullTargetWriterBackend final : public TargetWriterBackend {
+public:
+    explicit NullTargetWriterBackend(Options options)
+        : options_(options) {}
+
+    ~NullTargetWriterBackend() override = default;
+
+    void ensure_directory(const FileSpec& spec) override {
+        (void)spec;
+    }
+
+    void apply_directory_metadata(const FileSpec& spec) override {
+        (void)spec;
+    }
+
+    void write_chunk(const FileSpec& spec, std::string_view data, std::uint64_t offset) override {
+        (void)spec;
+        (void)data;
+        (void)offset;
+    }
+
+    void write_chunks(const std::vector<WriteChunk>& chunks) override {
+        (void)chunks;
+    }
+
+    void write_files(const std::vector<WriteChunk>& files) override {
+        (void)files;
+    }
+
+    void finish_file(const FileSpec& spec) override {
+        (void)spec;
+    }
+
+    void abort_file(std::string_view rel_path) noexcept override {
+        (void)rel_path;
+    }
+
+    [[nodiscard]] std::uint64_t file_hash(std::string_view rel_path) const override {
+        return hash64(rel_path);
+    }
+
+    [[nodiscard]] bool uses_async_api() const override {
+        return false;
+    }
+
+private:
+    Options options_;
+};
+
 #if HYPERSYNC_HAS_LIBNFS
 
 struct AsyncCommandState {
@@ -5555,6 +5604,10 @@ bool is_nfs_url(std::string_view path) {
     return path.rfind("nfs://", 0) == 0;
 }
 
+bool is_null_url(std::string_view path) {
+    return path == "null" || path == "null:" || path == "null://";
+}
+
 std::vector<std::string> expand_nfs_url_server_candidates(std::string_view root_url) {
     constexpr std::string_view kPrefix = "nfs://";
     if (root_url.rfind(kPrefix, 0) != 0) {
@@ -6023,6 +6076,10 @@ std::unique_ptr<NfsBackend> make_nfs_backend(std::string root,
 std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root,
                                                                 std::size_t endpoint_index,
                                                                 TargetWriterBackend::Options options) {
+    if (is_null_url(root)) {
+        (void)endpoint_index;
+        return std::make_unique<NullTargetWriterBackend>(options);
+    }
     if (is_nfs_url(root)) {
 #if HYPERSYNC_HAS_LIBNFS
         return std::make_unique<LibNfsTargetWriterBackend>(std::move(root), endpoint_index, options);
