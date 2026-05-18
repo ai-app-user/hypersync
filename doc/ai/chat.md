@@ -692,3 +692,9 @@ path is still the next architecture step for writes.
 **User:** Pointed out that the preflight table did not visibly include current and max RPC slots.
 
 **Codex:** Updated `network-preflight` output to expose explicit `rpc_slots_current` and `rpc_slots_max` settings, both expected at `65536`, while still printing the raw kernel paths (`sunrpc.tcp_slot_table_entries` and `sunrpc.tcp_max_slot_table_entries`) as info lines. Local build and unit suite passed (`73/73`).
+
+**User:** Asked to compare the old transfer1/nopo network-settings table against the app preflight checks and make sure nothing important was missing.
+
+**Codex:** Compared the table in `doc/performance.md` / `doc/design.md` with `network-preflight`. The first version covered the major sysctls and NIC tuning, but missed several table rows. Extended preflight to also verify/report: NIC driver (`mlx5_core`), RX/TX queue counts, all RX RPS masks and RPS flow counts rather than only rx-0, all TX XPS masks rather than only tx-0, `irqbalance=inactive`, NIC NUMA node info, PMTU 9000 probe to the NFS peer, exact NFS mount options (`nconnect=32`, `rsize/wsize=1048576`, `noatime`, `nodiratime`, `spread_reads`, `spread_writes` for rw mounts), and NFS BDI read-ahead (`16384 KiB`). `--apply` now also sets BDI read-ahead for mounted NFS filesystems. Local build and unit suite passed (`73/73`).
+
+**Codex:** Deployed the expanded preflight to agnopo. The expanded report initially caught one additional drift item that the first app version missed: NFS BDI read-ahead was `128 KiB` instead of `16384 KiB`. Ran `sudo hypersync network-preflight --iface ens3 --peer 172.27.255.2 --apply`; final expanded preflight reported `mismatches=0`, including PMTU 9000 to `172.27.255.2`, all queue masks, all NFS mount options, and BDI read-ahead.

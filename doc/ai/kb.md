@@ -1351,3 +1351,14 @@ logical size: 335.99 TB
   raw kernel file names as informational traceability lines, but user-facing
   reports should not rely only on the raw `sunrpc.tcp_*_slot_table_entries`
   names.
+
+- `network-preflight` coverage must match the old transfer1/nopo high-throughput
+  table, not just sysctls. It now checks/reports NIC driver, RX/TX queue counts,
+  all queue RPS/RFS/XPS masks, irqbalance status, NIC NUMA node, PMTU probe,
+  exact NFS mount options, and NFS BDI read-ahead. `--apply` also sets NFS BDI
+  `read_ahead_kb=16384` for mounted NFS filesystems.
+
+- agnopo expanded preflight result after `15303ab`: first expanded run found only
+  `nfs_mount_0_bdi_read_ahead_kb current=128 expected=16384`. Applying
+  `sudo hypersync network-preflight --iface ens3 --peer 172.27.255.2 --apply`
+  corrected it; final expanded preflight returned `mismatches=0`.
