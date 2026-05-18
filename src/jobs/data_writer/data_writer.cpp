@@ -318,9 +318,8 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     while (!stop_requested() && pop_input(worker_index, handle)) {
         std::vector<BufferHandle> batch;
         try {
-            if (config_.async_window > 1U &&
-                sharded_input_ != nullptr &&
-                !is_packed_small_file_buffer(data_buffer(data_pool_, handle))) {
+            const bool first_is_packed = is_packed_small_file_buffer(data_buffer(data_pool_, handle));
+            if (config_.async_window > 1U && sharded_input_ != nullptr) {
                 batch.push_back(handle);
                 const std::size_t shard =
                     sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
@@ -329,13 +328,18 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
                     if (!sharded_input_->try_pop(shard, next)) {
                         break;
                     }
-                    if (is_packed_small_file_buffer(data_buffer(data_pool_, next))) {
+                    const bool next_is_packed = is_packed_small_file_buffer(data_buffer(data_pool_, next));
+                    if (next_is_packed != first_is_packed) {
                         sharded_input_->push_wait(shard, next);
                         break;
                     }
                     batch.push_back(next);
                 }
-                process_regular_batch(*backend, batch);
+                if (first_is_packed) {
+                    process_packed_small_file_batch(*backend, batch);
+                } else {
+                    process_regular_batch(*backend, batch);
+                }
             } else {
                 process_buffer(*backend, handle);
             }
@@ -425,6 +429,54 @@ void TargetDataWriterJob::process_regular_batch(TargetWriterBackend& backend,
             record_file_written();
         }
     }
+}
+
+void TargetDataWriterJob::process_packed_small_file_batch(TargetWriterBackend& backend,
+                                                          const std::vector<BufferHandle>& handles) {
+    std::vector<TargetWriterBackend::WriteChunk> files;
+    std::uint64_t payload_bytes = 0;
+    std::size_t malformed_buffers = 0;
+    std::size_t buffers_processed = 0;
+
+    for (const BufferHandle& handle : handles) {
+        const DataBuffer& buffer = data_buffer(data_pool_, handle);
+        if (!is_packed_small_file_buffer(buffer)) {
+            throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
+                                     " cannot mix regular and packed-small-file buffers");
+        }
+        files.reserve(files.size() + packed_small_file_count(buffer));
+        const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
+            FileSpec file;
+            file.rel_path = std::string(view.rel_path);
+            file.declared_size = view.file_size;
+            file.mtime = view.mtime;
+            file.mode = view.mode != 0U ? view.mode : 0644U;
+            file.uid = view.uid;
+            file.gid = view.gid;
+            TargetWriterBackend::WriteChunk chunk;
+            chunk.spec = std::move(file);
+            chunk.data = view.data;
+            chunk.offset = 0;
+            chunk.last_chunk = true;
+            files.push_back(std::move(chunk));
+            payload_bytes += view.data.size();
+        });
+        if (!ok) {
+            ++malformed_buffers;
+        }
+        ++buffers_processed;
+    }
+
+    if (malformed_buffers != 0U) {
+        record_file_failed();
+        throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
+                                 " received malformed packed-small-file buffer");
+    }
+
+    backend.write_files(files);
+    files_written_.fetch_add(files.size(), std::memory_order_relaxed);
+    bytes_written_.fetch_add(payload_bytes, std::memory_order_relaxed);
+    buffers_processed_.fetch_add(buffers_processed, std::memory_order_relaxed);
 }
 
 void TargetDataWriterJob::write_regular_buffer(TargetWriterBackend& backend, const DataBuffer& buffer) {
