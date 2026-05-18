@@ -8096,8 +8096,9 @@ void record_hash_metadata_batch(bool recursive,
                                 FlatMetadataWorkQueue& folder_queue,
                                 DataReadFileQueue& file_queue,
                                 HashInventoryStats& stats,
-    MetadataRecordWriter* record_writer,
-    FlatFolderScanBatch batch) {
+                                MetadataRecordWriter* record_writer,
+                                std::mutex* record_writer_mutex,
+                                FlatFolderScanBatch batch) {
     if (batch.failed) {
         std::cerr << "metadata scan skipped folder '"
                   << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
@@ -8134,6 +8135,10 @@ void record_hash_metadata_batch(bool recursive,
         folder_record.spec = std::move(batch.folder);
         folder_record.flat_file_count = batch.files.size();
         folder_record.flat_logical_size_bytes = logical_size_bytes;
+        std::unique_lock<std::mutex> writer_lock;
+        if (record_writer_mutex != nullptr) {
+            writer_lock = std::unique_lock<std::mutex>(*record_writer_mutex);
+        }
         record_writer->write_batch({}, std::vector<MetadataFolderRecord>{std::move(folder_record)});
     }
     if (!enqueue_data_read_files(file_queue, std::move(batch.files))) {
@@ -8150,7 +8155,8 @@ void scan_hash_metadata_worker(const std::string& source_root,
                                FlatMetadataWorkQueue& folder_queue,
                                DataReadFileQueue& file_queue,
                                HashInventoryStats& stats,
-                               MetadataRecordWriter* record_writer) {
+                               MetadataRecordWriter* record_writer,
+                               std::mutex* record_writer_mutex) {
     auto backend = make_nfs_backend(source_root);
     try {
         backend->scan_flat_folders(
@@ -8161,12 +8167,13 @@ void scan_hash_metadata_worker(const std::string& source_root,
             [&folder_queue, &file_queue] {
                 return flat_metadata_scan_should_stop(folder_queue) || data_read_timer_expired(file_queue);
             },
-            [recursive, &folder_queue, &file_queue, &stats, record_writer](FlatFolderScanBatch batch) {
+            [recursive, &folder_queue, &file_queue, &stats, record_writer, record_writer_mutex](FlatFolderScanBatch batch) {
                 record_hash_metadata_batch(recursive,
                                            folder_queue,
                                            file_queue,
                                            stats,
                                            record_writer,
+                                           record_writer_mutex,
                                            std::move(batch));
             });
     } catch (...) {
@@ -8535,6 +8542,7 @@ void hash_stage_worker(ContentHashAlgorithm algorithm,
                        FlatMetadataWorkQueue& folder_queue,
                        HashInventoryStats& stats,
                        MetadataRecordWriter* record_writer,
+                       std::mutex* record_writer_mutex,
                        HashMode hash_mode,
                        std::uint64_t hash_block_size) {
     const std::string algorithm_name = to_string(algorithm);
@@ -8613,6 +8621,10 @@ void hash_stage_worker(ContentHashAlgorithm algorithm,
                     active.file.content_hash = active_hash_hex(algorithm, active);
                 }
                 if (record_writer != nullptr) {
+                    std::unique_lock<std::mutex> writer_lock;
+                    if (record_writer_mutex != nullptr) {
+                        writer_lock = std::unique_lock<std::mutex>(*record_writer_mutex);
+                    }
                     record_writer->write_batch(std::vector<FileSpec>{std::move(active.file)}, {});
                 }
                 stats.files_hashed.fetch_add(1, std::memory_order_relaxed);
@@ -8666,6 +8678,7 @@ HashInventorySnapshot run_parallel_hash_inventory_scan(const NfsMetaReaderConfig
     const std::size_t hash_data_pool_slots =
         reader_in_flight_slots + queued_hash_slots + hash_threads + 1U;
     DataSlotPool hash_data_pool(0, hash_data_pool_slots);
+    std::mutex record_writer_mutex;
     std::vector<std::unique_ptr<HashChunkShardQueue>> hash_queues;
     std::vector<std::thread> hash_workers;
     const std::size_t per_hash_queue_entries =
@@ -8689,6 +8702,7 @@ HashInventorySnapshot run_parallel_hash_inventory_scan(const NfsMetaReaderConfig
                                   std::ref(folder_queue),
                                   std::ref(stats),
                                   record_writer,
+                                  &record_writer_mutex,
                                   hash_mode,
                                   hash_block_size);
     }
@@ -8718,7 +8732,8 @@ HashInventorySnapshot run_parallel_hash_inventory_scan(const NfsMetaReaderConfig
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
                                       std::ref(stats),
-                                      record_writer);
+                                      record_writer,
+                                      &record_writer_mutex);
     }
 
     for (auto& worker : metadata_workers) {
