@@ -110,11 +110,15 @@ TargetDataWriterConfig::TargetDataWriterConfig()
 TargetDataWriterConfig::TargetDataWriterConfig(std::size_t worker_count,
                                                std::string target_root,
                                                bool verify_hash,
-                                               std::size_t async_window)
+                                               std::size_t async_window,
+                                               bool preserve_metadata,
+                                               bool fsync_on_finish)
     : worker_count(std::max<std::size_t>(1U, worker_count)),
       target_root(std::move(target_root)),
       verify_hash(verify_hash),
-      async_window(std::max<std::size_t>(1U, async_window)) {}
+      async_window(std::max<std::size_t>(1U, async_window)),
+      preserve_metadata(preserve_metadata),
+      fsync_on_finish(fsync_on_finish) {}
 
 TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("target_meta_writer"));
@@ -127,7 +131,9 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
     return TargetDataWriterConfig(config_size_t_or(values, "worker_count", 1U),
                                   config_string_or(values, "target_root", "."),
                                   config_bool_or(values, "verify_hash", false),
-                                  config_size_t_or(values, "async_window", 1U));
+                                  config_size_t_or(values, "async_window", 1U),
+                                  config_bool_or(values, "preserve_metadata", true),
+                                  config_bool_or(values, "fsync_on_finish", true));
 }
 
 TargetMetaWriterJob::TargetMetaWriterJob(TargetMetaWriterConfig config,
@@ -304,7 +310,10 @@ TargetWriterStats TargetDataWriterJob::stats() const {
 }
 
 void TargetDataWriterJob::run_worker(std::size_t worker_index) {
-    auto backend = make_target_writer_backend(config_.target_root, worker_index);
+    TargetWriterBackend::Options options;
+    options.preserve_metadata = config_.preserve_metadata;
+    options.fsync_on_finish = config_.fsync_on_finish;
+    auto backend = make_target_writer_backend(config_.target_root, worker_index, options);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
         std::vector<BufferHandle> batch;
@@ -436,6 +445,8 @@ void TargetDataWriterJob::write_regular_buffer(TargetWriterBackend& backend, con
 
 void TargetDataWriterJob::write_packed_small_files(TargetWriterBackend& backend, const DataBuffer& buffer) {
     std::uint64_t payload_bytes = 0;
+    std::vector<TargetWriterBackend::WriteChunk> files;
+    files.reserve(packed_small_file_count(buffer));
     const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
         FileSpec file;
         file.rel_path = std::string(view.rel_path);
@@ -444,15 +455,22 @@ void TargetDataWriterJob::write_packed_small_files(TargetWriterBackend& backend,
         file.mode = view.mode != 0U ? view.mode : 0644U;
         file.uid = view.uid;
         file.gid = view.gid;
-        backend.write_chunk(file, view.data, 0);
-        backend.finish_file(file);
+        TargetWriterBackend::WriteChunk chunk;
+        chunk.spec = std::move(file);
+        chunk.data = view.data;
+        chunk.offset = 0;
+        chunk.last_chunk = true;
+        files.push_back(std::move(chunk));
         payload_bytes += view.data.size();
-        record_file_written();
     });
     if (!ok) {
         record_file_failed();
         throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
                                  " received malformed packed-small-file buffer");
+    }
+    backend.write_files(files);
+    for (std::size_t index = 0; index < files.size(); ++index) {
+        record_file_written();
     }
     bytes_written_.fetch_add(payload_bytes, std::memory_order_relaxed);
 }

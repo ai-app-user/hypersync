@@ -213,6 +213,11 @@ public:
 
 class TargetWriterBackend {
 public:
+    struct Options {
+        bool preserve_metadata = true;
+        bool fsync_on_finish = true;
+    };
+
     virtual ~TargetWriterBackend() = default;
 
     virtual void ensure_directory(const FileSpec& spec) = 0;
@@ -225,6 +230,7 @@ public:
         bool last_chunk = false;
     };
     virtual void write_chunks(const std::vector<WriteChunk>& chunks);
+    virtual void write_files(const std::vector<WriteChunk>& files);
     virtual void finish_file(const FileSpec& spec) = 0;
     virtual void abort_file(std::string_view rel_path) noexcept = 0;
     [[nodiscard]] virtual std::uint64_t file_hash(std::string_view rel_path) const = 0;
@@ -237,7 +243,8 @@ public:
     std::size_t readdirplus_page_bytes = 0);
 [[nodiscard]] std::unique_ptr<TargetWriterBackend> make_target_writer_backend(
     std::string root,
-    std::size_t endpoint_index = kNfsEndpointAny);
+    std::size_t endpoint_index = kNfsEndpointAny,
+    TargetWriterBackend::Options options = {});
 
 }  // namespace hypersync
 

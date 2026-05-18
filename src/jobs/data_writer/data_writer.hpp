@@ -64,12 +64,16 @@ struct TargetDataWriterConfig {
     std::string target_root;
     bool verify_hash = false;
     std::size_t async_window = 1;
+    bool preserve_metadata = true;
+    bool fsync_on_finish = true;
 
     TargetDataWriterConfig();
     TargetDataWriterConfig(std::size_t worker_count,
                            std::string target_root,
                            bool verify_hash = false,
-                           std::size_t async_window = 1);
+                           std::size_t async_window = 1,
+                           bool preserve_metadata = true,
+                           bool fsync_on_finish = true);
 };
 
 [[nodiscard]] TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config);

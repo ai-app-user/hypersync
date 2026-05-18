@@ -1680,7 +1680,8 @@ private:
 
 class LocalTargetWriterBackend final : public TargetWriterBackend {
 public:
-    explicit LocalTargetWriterBackend(std::string root) : root_(std::move(root)) {}
+    explicit LocalTargetWriterBackend(std::string root, Options options)
+        : root_(std::move(root)), options_(options) {}
 
     ~LocalTargetWriterBackend() override = default;
 
@@ -1699,6 +1700,9 @@ public:
         }
         const std::filesystem::path absolute_path = std::filesystem::path(root_) / rel_path;
         std::filesystem::create_directories(absolute_path);
+        if (!options_.preserve_metadata) {
+            return;
+        }
         FileSpec metadata = spec;
         metadata.rel_path = rel_path;
         hypersync::apply_directory_metadata(absolute_path, metadata);
@@ -1728,9 +1732,11 @@ public:
             open_handles_.erase(it);
         }
 
-        FileSpec metadata = spec;
-        metadata.rel_path = rel_path;
-        apply_file_metadata(std::filesystem::path(root_) / rel_path, metadata);
+        if (options_.preserve_metadata) {
+            FileSpec metadata = spec;
+            metadata.rel_path = rel_path;
+            apply_file_metadata(std::filesystem::path(root_) / rel_path, metadata);
+        }
     }
 
     void abort_file(std::string_view rel_path) noexcept override {
@@ -1751,6 +1757,7 @@ public:
 
 private:
     std::filesystem::path root_;
+    Options options_;
     std::unordered_map<std::string, ScopedFd> open_handles_;
 };
 
@@ -5067,8 +5074,8 @@ private:
 
 class LibNfsTargetWriterBackend final : public TargetWriterBackend {
 public:
-    explicit LibNfsTargetWriterBackend(std::string root_url, std::size_t endpoint_index)
-        : root_url_(std::move(root_url)), session_(root_url_, endpoint_index) {
+    explicit LibNfsTargetWriterBackend(std::string root_url, std::size_t endpoint_index, Options options)
+        : root_url_(std::move(root_url)), session_(root_url_, endpoint_index), options_(options) {
         known_directories_.insert("");
     }
 
@@ -5090,6 +5097,9 @@ public:
             return;
         }
         ensure_directory_chain(rel_path);
+        if (!options_.preserve_metadata) {
+            return;
+        }
         apply_remote_metadata("/" + rel_path, spec);
     }
 
@@ -5186,6 +5196,121 @@ public:
         }
     }
 
+    void write_files(const std::vector<WriteChunk>& files) override {
+        struct PendingFile {
+            AsyncCommandState create_state;
+            AsyncCommandState write_state;
+            AsyncCommandState close_state;
+            const WriteChunk* file = nullptr;
+            struct nfsfh* handle = nullptr;
+            enum class Phase { creating, writing, closing, done } phase = Phase::creating;
+        };
+
+        std::vector<PendingFile> pending;
+        pending.reserve(files.size());
+        for (const WriteChunk& file : files) {
+            const std::string rel_path = normalize_path(file.spec.rel_path);
+            ensure_directory_chain(parent_path(rel_path));
+            pending.push_back(PendingFile {});
+            PendingFile& state = pending.back();
+            state.file = &file;
+            state.create_state.queued_at = std::chrono::steady_clock::now();
+            const std::string remote_path = "/" + rel_path;
+            const int queue_result = nfs_create_async(session_.context(),
+                                                      remote_path.c_str(),
+                                                      O_TRUNC,
+                                                      static_cast<int>(file.spec.mode),
+                                                      generic_nfs_callback,
+                                                      &state.create_state);
+            if (queue_result != 0) {
+                throw std::runtime_error("nfs_create_async queue failed: " +
+                                         std::string(nfs_get_error(session_.context())));
+            }
+        }
+
+        std::size_t completed = 0;
+        while (completed < pending.size()) {
+            service_nfs_context(session_.context(), 100);
+            completed = 0;
+            for (PendingFile& state : pending) {
+                if (state.phase == PendingFile::Phase::creating && state.create_state.done) {
+                    if (state.create_state.status < 0) {
+                        throw std::runtime_error("nfs_create_async failed: " + state.create_state.error);
+                    }
+                    state.handle = static_cast<struct nfsfh*>(state.create_state.data);
+                    if (state.file->data.empty()) {
+                        state.phase = PendingFile::Phase::closing;
+                        state.close_state.queued_at = std::chrono::steady_clock::now();
+                        const int queue_result = nfs_close_async(session_.context(),
+                                                                 state.handle,
+                                                                 generic_nfs_callback,
+                                                                 &state.close_state);
+                        if (queue_result != 0) {
+                            throw std::runtime_error("nfs_close_async queue failed: " +
+                                                     std::string(nfs_get_error(session_.context())));
+                        }
+                    } else {
+                        state.phase = PendingFile::Phase::writing;
+                        state.write_state.queued_at = std::chrono::steady_clock::now();
+                        const int queue_result = nfs_pwrite_async(session_.context(),
+                                                                  state.handle,
+                                                                  state.file->offset,
+                                                                  state.file->data.size(),
+                                                                  state.file->data.data(),
+                                                                  generic_nfs_callback,
+                                                                  &state.write_state);
+                        if (queue_result != 0) {
+                            throw std::runtime_error("nfs_pwrite_async queue failed: " +
+                                                     std::string(nfs_get_error(session_.context())));
+                        }
+                    }
+                }
+                if (state.phase == PendingFile::Phase::writing && state.write_state.done) {
+                    if (state.write_state.status < 0) {
+                        throw std::runtime_error("nfs_pwrite_async failed: " + state.write_state.error);
+                    }
+                    if (state.write_state.status != static_cast<int>(state.file->data.size())) {
+                        throw std::runtime_error("nfs_pwrite_async short write");
+                    }
+                    if (options_.fsync_on_finish) {
+                        run_async_command(
+                            session_.context(),
+                            [&](AsyncCommandState* command_state) {
+                                return nfs_fsync_async(session_.context(),
+                                                       state.handle,
+                                                       generic_nfs_callback,
+                                                       command_state);
+                            },
+                            "nfs_fsync_async");
+                    }
+                    state.phase = PendingFile::Phase::closing;
+                    state.close_state.queued_at = std::chrono::steady_clock::now();
+                    const int queue_result = nfs_close_async(session_.context(),
+                                                             state.handle,
+                                                             generic_nfs_callback,
+                                                             &state.close_state);
+                    if (queue_result != 0) {
+                        throw std::runtime_error("nfs_close_async queue failed: " +
+                                                 std::string(nfs_get_error(session_.context())));
+                    }
+                }
+                if (state.phase == PendingFile::Phase::closing && state.close_state.done) {
+                    if (state.close_state.status < 0) {
+                        throw std::runtime_error("nfs_close_async failed: " + state.close_state.error);
+                    }
+                    state.handle = nullptr;
+                    if (options_.preserve_metadata) {
+                        apply_remote_metadata("/" + normalize_path(state.file->spec.rel_path), state.file->spec);
+                    }
+                    state.phase = PendingFile::Phase::done;
+                }
+                if (state.phase == PendingFile::Phase::done) {
+                    ++completed;
+                }
+            }
+        }
+    }
+
     void finish_file(const FileSpec& spec) override {
         const std::string rel_path = normalize_path(spec.rel_path);
         const std::string remote_path = "/" + rel_path;
@@ -5195,12 +5320,14 @@ public:
         }
 
         struct nfsfh* handle = it->second;
-        run_async_command(
-            session_.context(),
-            [&](AsyncCommandState* state) {
-                return nfs_fsync_async(session_.context(), handle, generic_nfs_callback, state);
-            },
-            "nfs_fsync_async");
+        if (options_.fsync_on_finish) {
+            run_async_command(
+                session_.context(),
+                [&](AsyncCommandState* state) {
+                    return nfs_fsync_async(session_.context(), handle, generic_nfs_callback, state);
+                },
+                "nfs_fsync_async");
+        }
         run_async_command(
             session_.context(),
             [&](AsyncCommandState* state) {
@@ -5208,7 +5335,9 @@ public:
             },
             "nfs_close_async");
         open_handles_.erase(it);
-        apply_remote_metadata(remote_path, spec);
+        if (options_.preserve_metadata) {
+            apply_remote_metadata(remote_path, spec);
+        }
     }
 
     void abort_file(std::string_view rel_path) noexcept override {
@@ -5374,6 +5503,7 @@ private:
 
     std::string root_url_;
     LibNfsSession session_;
+    Options options_;
     std::unordered_map<std::string, struct nfsfh*> open_handles_;
     std::unordered_set<std::string> known_directories_;
 };
@@ -5433,6 +5563,10 @@ void TargetWriterBackend::write_chunks(const std::vector<WriteChunk>& chunks) {
             finish_file(chunk.spec);
         }
     }
+}
+
+void TargetWriterBackend::write_files(const std::vector<WriteChunk>& files) {
+    write_chunks(files);
 }
 
 void NfsBackend::visit_files(bool recursive, const std::function<void(FileSpec)>& visitor) const {
@@ -5847,17 +5981,20 @@ std::unique_ptr<NfsBackend> make_nfs_backend(std::string root,
     return std::make_unique<LocalFilesystemBackend>(std::move(root));
 }
 
-std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root, std::size_t endpoint_index) {
+std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root,
+                                                                std::size_t endpoint_index,
+                                                                TargetWriterBackend::Options options) {
     if (is_nfs_url(root)) {
 #if HYPERSYNC_HAS_LIBNFS
-        return std::make_unique<LibNfsTargetWriterBackend>(std::move(root), endpoint_index);
+        return std::make_unique<LibNfsTargetWriterBackend>(std::move(root), endpoint_index, options);
 #else
         (void)endpoint_index;
+        (void)options;
         throw std::runtime_error("libnfs support is not available in this build; install libnfs and rebuild");
 #endif
     }
     (void)endpoint_index;
-    return std::make_unique<LocalTargetWriterBackend>(std::move(root));
+    return std::make_unique<LocalTargetWriterBackend>(std::move(root), options);
 }
 
 }  // namespace hypersync

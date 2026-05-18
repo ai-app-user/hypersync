@@ -11291,7 +11291,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool pack_small_files,
                                                                       double max_duration_seconds,
                                                                       std::uint32_t stats_interval_seconds,
-                                                                      bool verify_hash) const {
+                                                                      bool verify_hash,
+                                                                      bool preserve_target_metadata,
+                                                                      bool target_fsync) const {
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
@@ -11325,6 +11327,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     TargetDataWriterConfig writer_config = load_target_data_writer_config(config_store_);
     writer_config.target_root = target_root;
     writer_config.verify_hash = verify_hash;
+    writer_config.preserve_metadata = preserve_target_metadata;
+    writer_config.fsync_on_finish = target_fsync;
     if (data_writer_threads != 0U) {
         writer_config.worker_count = data_writer_threads;
     }
