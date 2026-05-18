@@ -811,6 +811,40 @@ public:
         return folders_written_;
     }
 
+    [[nodiscard]] std::vector<BufQueue*> route_queues() const {
+        std::vector<BufQueue*> queues;
+        queues.reserve(route_states_.size());
+        for (const auto& state : route_states_) {
+            queues.push_back(&state->queue);
+        }
+        return queues;
+    }
+
+    [[nodiscard]] std::size_t route_queue_capacity() const {
+        std::size_t capacity = 0;
+        for (const auto& state : route_states_) {
+            capacity += state->queue.capacity();
+        }
+        return capacity;
+    }
+
+    [[nodiscard]] std::size_t route_queue_high_watermark() const {
+        std::size_t high_watermark = 0;
+        for (const auto& state : route_states_) {
+            high_watermark += state->queue.high_watermark();
+        }
+        return high_watermark;
+    }
+
+    [[nodiscard]] bool route_queue_full() const {
+        for (const auto& state : route_states_) {
+            if (state->queue.high_watermark() >= state->queue.capacity()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
     struct PartitionSendState {
         RawBufferPool pool;
@@ -4354,6 +4388,33 @@ public:
           sharded_output_(&output),
           max_duration_seconds_(max_duration_seconds) {}
 
+    NfsMetaReaderBufferJob(std::string root,
+                           std::string compare_mode,
+                           std::size_t worker_count,
+                           std::size_t async_depth,
+                           RawBufferPool& folder_pool,
+                           RawBufferPool& feedback_pool,
+                           BufQueue& folder_input,
+                           BufQueue& folder_feedback,
+                           RawBufferPool& output_pool,
+                           std::vector<BufQueue*> output_queues,
+                           double max_duration_seconds)
+        : ThreadedJob(worker_count),
+          root_(std::move(root)),
+          compare_mode_(std::move(compare_mode)),
+          async_depth_(std::max<std::size_t>(1U, async_depth)),
+          folder_pool_(folder_pool),
+          feedback_pool_(feedback_pool),
+          folder_input_(folder_input),
+          folder_feedback_(folder_feedback),
+          output_pool_(output_pool),
+          output_queues_(std::move(output_queues)),
+          max_duration_seconds_(max_duration_seconds) {
+        if (output_queues_.empty()) {
+            throw std::invalid_argument("flat folder scanner requires at least one output queue");
+        }
+    }
+
     [[nodiscard]] DistributedDiffRunReport stats() const {
         DistributedDiffRunReport report;
         report.folders_sent = folders_sent_.load(std::memory_order_acquire);
@@ -4428,9 +4489,15 @@ protected:
                         throw std::runtime_error("flat folder scanner stopped while waiting for output buffer");
                     },
                     [this, worker_index](const BufferHandle& handle) {
-                        const bool pushed = sharded_output_ != nullptr
-                                                ? wait_for_output(worker_index, *sharded_output_, handle)
-                                                : wait_for_output(worker_index, *output_, handle);
+                        bool pushed = false;
+                        if (!output_queues_.empty()) {
+                            BufQueue& queue = *output_queues_[worker_index % output_queues_.size()];
+                            pushed = wait_for_output(worker_index, queue, handle);
+                        } else {
+                            pushed = sharded_output_ != nullptr
+                                         ? wait_for_output(worker_index, *sharded_output_, handle)
+                                         : wait_for_output(worker_index, *output_, handle);
+                        }
                         if (!pushed) {
                             output_pool_.release(handle);
                             throw std::runtime_error("flat folder scanner output queue closed");
@@ -4472,6 +4539,12 @@ private:
     }
 
     void close_output() {
+        if (!output_queues_.empty()) {
+            for (BufQueue* queue : output_queues_) {
+                queue->close();
+            }
+            return;
+        }
         if (sharded_output_ != nullptr) {
             sharded_output_->close();
             return;
@@ -4491,6 +4564,7 @@ private:
     RawBufferPool& output_pool_;
     BufQueue* output_ = nullptr;
     ShardedBufQueue* sharded_output_ = nullptr;
+    std::vector<BufQueue*> output_queues_;
     double max_duration_seconds_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> stop_at_;
     std::atomic<std::uint64_t> folders_sent_ {0};
@@ -10420,17 +10494,33 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
                                       folder_feedback_pool,
                                       folder_queue,
                                       folder_feedback_queue);
-        NfsMetaReaderBufferJob scanner(source_root.string(),
-                                       "size",
-                                       report.meta_reader_threads,
-                                       report.metadata_async_depth,
-                                       folder_pool,
-                                       folder_feedback_pool,
-                                       folder_queue,
-                                       folder_feedback_queue,
-                                       metadata_pool,
-                                       metadata_queue,
-                                       max_duration_seconds);
+        const bool direct_partition_transport = partitioned_writer != nullptr && !route_discard;
+        std::unique_ptr<NfsMetaReaderBufferJob> scanner;
+        if (direct_partition_transport) {
+            scanner = std::make_unique<NfsMetaReaderBufferJob>(source_root.string(),
+                                                               "size",
+                                                               report.meta_reader_threads,
+                                                               report.metadata_async_depth,
+                                                               folder_pool,
+                                                               folder_feedback_pool,
+                                                               folder_queue,
+                                                               folder_feedback_queue,
+                                                               metadata_pool,
+                                                               partitioned_writer->route_queues(),
+                                                               max_duration_seconds);
+        } else {
+            scanner = std::make_unique<NfsMetaReaderBufferJob>(source_root.string(),
+                                                               "size",
+                                                               report.meta_reader_threads,
+                                                               report.metadata_async_depth,
+                                                               folder_pool,
+                                                               folder_feedback_pool,
+                                                               folder_queue,
+                                                               folder_feedback_queue,
+                                                               metadata_pool,
+                                                               metadata_queue,
+                                                               max_duration_seconds);
+        }
         const std::size_t metadata_consumer_threads =
             (partitioned_writer != nullptr || route_discard)
                 ? std::min(report.meta_reader_threads, report.metadata_output_partitions)
@@ -10438,7 +10528,9 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         std::vector<std::unique_ptr<BufQueue>> route_discard_queues;
         std::vector<std::unique_ptr<BufferDiscarderJob>> route_discarders;
         std::unique_ptr<ThreadedJob> metadata_consumer;
-        if (route_discard) {
+        if (direct_partition_transport) {
+            // Scanner output goes directly to the partition sender queues.
+        } else if (route_discard) {
             route_discard_queues.reserve(report.metadata_output_partitions);
             route_discarders.reserve(report.metadata_output_partitions);
             for (std::size_t index = 0; index < report.metadata_output_partitions; ++index) {
@@ -10477,18 +10569,29 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         for (auto& discarder : route_discarders) {
             discarder->start();
         }
-        metadata_consumer->start();
-        scanner.start();
-        scanner.wait();
+        if (metadata_consumer) {
+            metadata_consumer->start();
+        }
+        scanner->start();
+        scanner->wait();
         folder_seeder.wait();
         if (auto error = folder_seeder.error()) {
             std::rethrow_exception(error);
         }
-        metadata_consumer->wait();
-        report.metadata_queue_shards = 1U;
-        report.metadata_queue_capacity = metadata_queue.capacity();
-        report.metadata_queue_high_watermark = metadata_queue.high_watermark();
-        report.metadata_queue_full = metadata_queue.high_watermark() >= metadata_queue.capacity();
+        if (metadata_consumer) {
+            metadata_consumer->wait();
+        }
+        if (direct_partition_transport && partitioned_writer) {
+            report.metadata_queue_shards = report.metadata_output_partitions;
+            report.metadata_queue_capacity = partitioned_writer->route_queue_capacity();
+            report.metadata_queue_high_watermark = partitioned_writer->route_queue_high_watermark();
+            report.metadata_queue_full = partitioned_writer->route_queue_full();
+        } else {
+            report.metadata_queue_shards = 1U;
+            report.metadata_queue_capacity = metadata_queue.capacity();
+            report.metadata_queue_high_watermark = metadata_queue.high_watermark();
+            report.metadata_queue_full = metadata_queue.high_watermark() >= metadata_queue.capacity();
+        }
         for (auto& queue : route_discard_queues) {
             queue->close();
         }
@@ -10497,12 +10600,20 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
         }
         report.learned_meta_reader_threads = report.meta_reader_threads;
         stats_discarder.stop();
-        const MetadataStatsSnapshot stats = stats_discarder.snapshot();
-        report.files_seen = stats.files_found;
-        report.checker_discarded = stats.records_discarded;
-        report.folders_found = stats.folders_found;
-        report.logical_size_bytes = stats.logical_size_bytes;
-        report.records_per_second = stats.records_per_second;
+        if (direct_partition_transport) {
+            const DistributedDiffRunReport scanner_stats = scanner->stats();
+            report.files_seen = static_cast<std::size_t>(scanner_stats.files_compared);
+            report.checker_discarded = report.files_seen;
+            report.folders_found = static_cast<std::size_t>(scanner_stats.folders_sent);
+            report.logical_size_bytes = scanner_stats.source_logical_size_bytes;
+        } else {
+            const MetadataStatsSnapshot stats = stats_discarder.snapshot();
+            report.files_seen = stats.files_found;
+            report.checker_discarded = stats.records_discarded;
+            report.folders_found = stats.folders_found;
+            report.logical_size_bytes = stats.logical_size_bytes;
+            report.records_per_second = stats.records_per_second;
+        }
         if (record_writer.has_value()) {
             record_writer->close();
             report.metadata_files_written = record_writer->files_written();
@@ -10606,7 +10717,7 @@ MetadataBenchmarkReport TransferEngine::benchmark_metadata_pipeline(const std::f
 
     report.elapsed_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    if (!stats_config.enabled && report.elapsed_seconds > 0.0) {
+    if (report.records_per_second == 0.0 && report.elapsed_seconds > 0.0) {
         report.records_per_second = static_cast<double>(report.files_seen) / report.elapsed_seconds;
     }
     return report;
