@@ -1524,3 +1524,7 @@ logical size: 335.99 TB
   - Purpose: validate the target-directory acknowledgement boundary before reconnecting the real file writer. Files do not enter `ReadyFileQueue` until the folder creation worker has called `TargetWriterBackend::ensure_directories()` for the folder batch.
   - This mode reports file discard as `files_written` / `bytes_written`, and reports directory acknowledgements as `folders_written`.
   - Local verification: release build passed, unit suite passed, CLI integration smoke passed, and a local 2,000-file smoke completed with all 2,000 files discarded after folder creation and no payload files created.
+  - agnopo verification, all 16 target IPs, synthetic profile, `files-per-batch=1024`, `MetaReader-SYN-96`, `max-file-size=128KiB`, `window=256`:
+    - `FolderCreation-NFS-32`, `DataWriter-NULL-32`, 30s: `8,692,447` files discarded, `78,431` folders created, zero failures, `287,150 files/s`, `143.873 Gbit/s`, `2,590 folders/s`.
+    - `FolderCreation-NFS-8`, `DataWriter-NULL-32`, 20s: `5,429,402` files discarded, `49,069` folders created, zero failures, `268,245 files/s`, `134.387 Gbit/s`, `2,424 folders/s`.
+  - Conclusion: the folder-ready acknowledgement boundary has enough headroom for the `50K files/s` small-file target when folder batches contain about 1K files. Next reconnect the real file writer behind `ReadyFileQueue` and keep parent-directory fallback out of the hot path.

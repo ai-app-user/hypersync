@@ -906,3 +906,15 @@ Verification on local macOS build:
 - `make -j8 unit-test` passed: `74/74`.
 - Targeted integration test passed: `main_cli_benchmark_data_write_folder_ready_discard_smoke`.
 - Manual local smoke with 2,000 files produced `files_found=2000`, `files_read=2000`, `files_written=2000`, `folders_written=4`, no failures.
+
+Agnopo verification after deploying commit `e1683cd` from `dev`:
+- 30s run, all 16 target IPs, synthetic profile, `files-per-batch=1024`, `MetaReader-SYN-96`, `FolderCreation-NFS-32`, `DataWriter-NULL-32`, `max-file-size=128KiB`, `window=256`:
+  - Pipeline: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-32]->(ReadyFileQueue-500000)->[DataWriter-NULL-32]`
+  - Final: `9,628,429 files_found`, `8,692,447 files_discarded`, `78,431 folders_written`, zero failures.
+  - Average: `287,150 files/s`, `143.873 Gbit/s`, `2,590 folders/s`.
+  - Progress stabilized around `289K files/s`; folder batch queue stayed full, so folder creation is the limiter, but the gated handoff has far more than the required `50K files/s` headroom.
+- 20s smaller-thread run with `FolderCreation-NFS-8` and same file discard stage:
+  - Final: `6,362,949 files_found`, `5,429,402 files_discarded`, `49,069 folders_written`, zero failures.
+  - Average: `268,245 files/s`, `134.387 Gbit/s`, `2,424 folders/s`.
+
+Conclusion: the folder-ready acknowledgement boundary is fast enough in discard mode. Even `8` folder creation contexts released files at roughly `268K files/s` for the 1K-files-per-folder synthetic layout; the next step can replace `DataWriter-NULL` with the real file writer using this ready-file queue, without parent-directory fallback in the file hot path.
