@@ -1048,3 +1048,22 @@ Iteration results:
 - Raised large lane from `112/112` to `160/160`: final run reached `181.6 Gbit/s` total with hot-window small rate `48-57K files/s`, zero failures.
 
 Conclusion: the integrated fork now preserves small-file priority and correctness, but it does not yet reach the `206 Gbit/s` separate-lane proof. The gap is because the integrated large lane correctly includes every file `>128KiB`, including medium files, whereas the large-only proof filtered to `>=1MiB`. Next tuning should split or tune the `>128KiB` lane further, probably with a medium-file path or adaptive large-lane concurrency/window settings.
+
+**User:** Suggested trying a classifier split at `<1MiB` vs `>=1MiB`; if that did not work, create a separate medium stream.
+
+**Codex:** First tested two lanes with the mixed classifier threshold set to `1048575` bytes:
+`[ReadyClassifier <=1MiB]->(SmallReadyFileQueue)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (LargeReadyFileQueue)->[DataReader-SYN-160]->[DataWriter-NFS-160]`.
+
+Result: `191.8 Gbit/s` total, but only `13.1K files/s` on the small/medium lane. Bandwidth improved, but it failed the small-file priority goal because medium files consumed the small reactor lane.
+
+Then implemented a three-lane classifier:
+`small <=128KiB`, `medium >128KiB && <=1MiB`, `large >1MiB`.
+
+Pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-5000000)->[DataReader-SYN-96]->(DataQueue-96x512)->[DataWriter-NFS-96] + (LargeReadyFileQueue-5000000)->[DataReader-SYN-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+
+Results:
+- With medium queue `1M`, the queue filled and blocked the classifier: `189.8 Gbit/s`, true small only `~11.8K files/s`.
+- With medium queue `5M`, classifier starvation was fixed: hot-window total `189.7 Gbit/s`, true small `47.4K files/s`, medium `41.0 Gbit/s`, large `125.0 Gbit/s`, zero failures.
+
+Conclusion: three lanes are functionally correct and preserve true-small priority better than the `<1MiB` two-lane split, but current fixed knobs do not beat the simpler integrated two-lane `<=128KiB / >128KiB` result (`~181.6 Gbit/s`, hot small `48-57K files/s`) enough to justify the extra complexity yet. The remaining gap to the separate-lane `206 Gbit/s` proof appears to be tuning/backpressure on medium/large, not the small lane itself.

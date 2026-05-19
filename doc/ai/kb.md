@@ -1590,3 +1590,18 @@ logical size: 335.99 TB
     - `LargeReadyFileQueue=5M`, large lane `112/112`: hot small `~57K files/s`, total `~170-173 Gbit/s`.
     - `LargeReadyFileQueue=5M`, large lane `160/160`: final `181.6 Gbit/s` total, hot small `48-57K files/s`, final small `45.96K files/s`, large `157.0 Gbit/s`.
   - Interpretation: integrated small priority is now structurally working, but total bandwidth remains below the `206 Gbit/s` separate-lane proof because the integrated large bucket includes all files `>128KiB`, including medium files. The separate proof used `>=1MiB` for the large bandwidth lane. Next step is to tune/split the medium/large side without disturbing the `<=128KiB` small priority lane.
+
+- 2026-05-19 PDT mixed write threshold and three-lane test:
+  - Two-lane threshold test using `<1MiB` as the small side and `>=1MiB` as the large side:
+    - Result: `191.8 Gbit/s` total, but only `13.1K files/s` on the small/medium lane.
+    - Interpretation: putting medium files onto the small reactor lane improves total bandwidth but violates the small-file priority goal.
+  - Added three-way classification inside `folder-ready-mixed-write`:
+    - small: `size <= 128KiB`
+    - medium: `128KiB < size <= configured threshold`, default/tested threshold `1MiB - 1`
+    - large: `size > configured threshold`
+  - Three-lane pipeline tested:
+    `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-5000000)->[DataReader-SYN-96]->(DataQueue-96x512)->[DataWriter-NFS-96] + (LargeReadyFileQueue-5000000)->[DataReader-SYN-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+  - Results:
+    - Medium queue `1M`: `189.8 Gbit/s`, true small `~11.8K files/s`; medium queue filled and blocked classifier progress.
+    - Medium queue `5M`: `189.7 Gbit/s`, true small hot `47.4K files/s`, medium `41.0 Gbit/s`, large `125.0 Gbit/s`, zero failures.
+  - Interpretation: three lanes fix the correctness/priority model better than the `<1MiB` two-lane split, but current fixed medium/large knobs still do not reach the separate-lane `206 Gbit/s` proof. Avoid using `<1MiB` as the small lane; keep true small at `<=128KiB`.
