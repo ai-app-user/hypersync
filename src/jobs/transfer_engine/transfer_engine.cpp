@@ -7032,7 +7032,7 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     std::unique_ptr<BufQueue> target_metadata_queue;
     std::unique_ptr<TargetMetaWriterJob> target_meta_writer;
     if (create_target_directories) {
-        const std::size_t metadata_slots = std::max<std::size_t>(4096U, max_files_queued);
+        const std::size_t metadata_slots = 4096U;
         target_metadata_pool = std::make_unique<RawBufferPool>(kMetadataBatchBufferPoolId,
                                                                metadata_slots,
                                                                sizeof(MetadataBatchBuffer),
