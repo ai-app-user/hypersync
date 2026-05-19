@@ -833,3 +833,22 @@ Conclusion: direct-submit is a major architectural win. It nearly doubled the pr
 - Final nudge `DataReader-SYN-640`, `window=1024`: `1,535,390` files in `30.20s`, `50,841 files/s`, `25.46 Gbit/s`, zero failures.
 
 Conclusion: producer-side reactor publication batching fixed the old 256-producer regression and allowed higher producer counts to scale. Current agnopo packed-small-file NFS write recommendation is `--data-writer-direct-submit --data-reader-threads 640 --data-writer-reactors 16 --data-writer-file-window 1024`, stable writes off, cork off, with target directories precreated or handled outside the payload hot path. This finally crosses the `50K files/s` small-file write goal.
+
+**User:** Asked to isolate directory creation performance because the `50.8K files/s` small-file writer result used `--assume-target-directories`; requested a directory-only execution mode shaped as `[FolderSeeder]->(FolderQueue)->[MetaWriter-NFS]`.
+
+**Codex:** Added `benchmark-data-write --mode mkdir-only` in commit `1178d41`. In this mode the benchmark truncates after the metadata/folder layer: it scans folders into flat-folder metadata buffers and feeds `TargetMetaWriterJob` only, with no `DataReader` and no `DataWriter`. The report now includes `mode=mkdir-only`, `folders_written`, and `folders_per_second`. Mkdir-only forces target metadata restore off so the result measures `MKDIR` rate rather than chown/chmod/utime. Local release build and unit suite passed (`74/74`), and a local synthetic smoke produced a valid mkdir-only report.
+
+**Codex:** Deployed `1178d41` to agnopo and swept NFS directory creation against the 16-IP target with synthetic metadata, `files-per-batch=16`, `MetaReader-SYN-96`, metadata async depth `256`, metadata queue depth `4096`, fresh target prefixes, and no data read/write stage:
+- `MetaWriter-NFS-16`: `29,879` dirs in `11.57s`, `2,582 dirs/s`; queue high watermark full.
+- `MetaWriter-NFS-32`: `98,824` dirs in `31.33s`, `3,155 dirs/s`; CPU idle `97.74%`.
+- `MetaWriter-NFS-64`: `107,845` dirs in `31.22s`, `3,454 dirs/s`; CPU idle `97.61%`.
+- `MetaWriter-NFS-96`: `123,601` dirs in `31.05s`, `3,981 dirs/s`; CPU idle `97.43%`.
+- `MetaWriter-NFS-128`: `132,632` dirs in `30.98s`, `4,282 dirs/s`; CPU idle `97.30%`.
+- `MetaWriter-NFS-192`: `145,150` dirs in `30.88s`, `4,701 dirs/s`; CPU idle `97.24%`.
+- `MetaWriter-NFS-256`: `157,034` dirs in `30.82s`, `5,096 dirs/s`; CPU idle `97.37%`.
+- `MetaWriter-NFS-384`: `175,390` dirs in `30.73s`, `5,707 dirs/s`; CPU idle `96.97%`.
+- `MetaWriter-NFS-512`: `193,594` dirs in `30.73s`, `6,300 dirs/s`; CPU idle `96.94%`.
+- `MetaWriter-NFS-768`: `230,804` dirs in `30.52s`, `7,562 dirs/s`; CPU idle `96.64%`.
+- `MetaWriter-NFS-1024`: failed immediately with `all healthy NFS endpoints failed; unhealthy endpoints are cooling down`.
+
+Conclusion: directory creation is a separate storage-side metadata bottleneck. It scales with extreme concurrency up to at least `768` sessions but remains far below the `50K files/s` payload write rate, while agnopo CPU stays mostly idle. Current stable measured ceiling is about `7.6K dirs/s`; `1024` writer sessions overloads endpoint health.

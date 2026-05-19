@@ -1477,3 +1477,22 @@ logical size: 335.99 TB
     - `512` readers, `window=1024`: `49,144 files/s`, `24.61 Gbit/s`, zero failures.
     - `640` readers, `window=1024`: `50,841 files/s`, `25.46 Gbit/s`, zero failures.
   - Current recommendation for agnopo packed small-file NFS writes: use `--data-writer-direct-submit --data-reader-threads 640 --data-writer-reactors 16 --data-writer-file-window 1024`, stable writes off, cork off, with target directories precreated or handled outside the payload hot path. This crosses the `50K files/s` small-file write goal.
+
+- 2026-05-19 PDT directory-only target writer benchmark:
+  - New mode: `benchmark-data-write --mode mkdir-only`. Pipeline shape is `[FolderSeeder]->(FolderQueue)->[MetaReader]->(MetadataQueue)->[MetaWriter]`; no `DataReader` or payload `DataWriter` is started.
+  - Output now includes `mode=mkdir-only`, `folders_written`, and `folders_per_second`.
+  - Mkdir-only forces target metadata restore off so it measures directory creation (`MKDIR`) rather than chown/chmod/utime.
+  - agnopo mkdir-only sweep against the 16-IP NFS target, synthetic metadata, `files-per-batch=16`, `MetaReader-SYN-96`, metadata async depth `256`, metadata queue depth `4096`, fresh target prefixes:
+    - 16 target meta writer threads: `2,582 dirs/s`.
+    - 32 threads: `3,155 dirs/s`.
+    - 64 threads: `3,454 dirs/s`.
+    - 96 threads: `3,981 dirs/s`.
+    - 128 threads: `4,282 dirs/s`.
+    - 192 threads: `4,701 dirs/s`.
+    - 256 threads: `5,096 dirs/s`.
+    - 384 threads: `5,707 dirs/s`.
+    - 512 threads: `6,300 dirs/s`.
+    - 768 threads: `7,562 dirs/s`.
+    - 1024 threads: failed immediately with `all healthy NFS endpoints failed; unhealthy endpoints are cooling down`.
+  - CPU stayed mostly idle (`~96.6-97.7%` idle in the useful runs), and the metadata queue was full throughout, so the measured ceiling is storage/backend metadata transaction latency, not client CPU.
+  - Current stable measured directory creation ceiling on agnopo is about `7.6K dirs/s`; do not assume the `50K files/s` payload write path will hold when every file requires unique target directory creation.
