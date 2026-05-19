@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -5926,11 +5927,10 @@ public:
                 }
             }
 
-            std::vector<PendingMkdir> active;
+            std::list<PendingMkdir> active;
             while (!pending_paths.empty() || !active.empty()) {
                 while (!pending_paths.empty() && active.size() < window) {
-                    active.push_back(PendingMkdir {});
-                    PendingMkdir& mkdir = active.back();
+                    PendingMkdir& mkdir = active.emplace_back();
                     mkdir.rel_path = std::move(pending_paths.front());
                     pending_paths.pop_front();
                     const std::string remote_path = "/" + mkdir.rel_path;
