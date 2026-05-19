@@ -87,6 +87,28 @@ namespace {
 inline constexpr std::size_t kMetadataPartitionTransportPoolSlots = 1024U;
 inline constexpr std::size_t kMetadataDiscardDefaultBufferSlots = 128U;
 
+std::string nfs_url_with_server_expression(std::string_view root_url, std::string_view server_expression) {
+    if (server_expression.empty()) {
+        return std::string(root_url);
+    }
+    constexpr std::string_view kPrefix = "nfs://";
+    if (root_url.rfind(kPrefix, 0) != 0) {
+        throw std::runtime_error("VIP target partitioning requires an nfs:// target URL");
+    }
+    const std::size_t server_begin = kPrefix.size();
+    const std::size_t server_end = root_url.find('/', server_begin);
+    if (server_end == std::string_view::npos || server_end == server_begin) {
+        throw std::runtime_error("invalid nfs:// target URL for VIP target partitioning");
+    }
+
+    std::string url;
+    url.reserve(kPrefix.size() + server_expression.size() + (root_url.size() - server_end));
+    url.append(kPrefix);
+    url.append(server_expression);
+    url.append(root_url.substr(server_end));
+    return url;
+}
+
 enum class PriorityMessageType : std::uint32_t {
     session_start = 1,
     file_record = 2,
@@ -8441,7 +8463,9 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                                                                      std::uint32_t stats_interval_seconds,
                                                                      TargetWriterStats& writer_stats,
                                                                      std::size_t& queue_capacity,
-                                                                     std::size_t& queue_high_watermark) {
+                                                                     std::size_t& queue_high_watermark,
+                                                                     const std::string& small_file_target_ips,
+                                                                     const std::string& large_file_target_ips) {
     FlatMetadataWorkQueue scan_folder_queue;
     scan_folder_queue.folders.push_back(FileSpec{});
     FolderReadyBatchQueue folder_batch_queue;
@@ -8467,6 +8491,8 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     std::atomic<std::uint64_t> folders_created {0};
 
     TargetDataWriterConfig small_writer_config = writer_config;
+    small_writer_config.target_root =
+        nfs_url_with_server_expression(writer_config.target_root, small_file_target_ips);
     small_writer_config.ensure_parent_directories = false;
     small_writer_config.direct_reactor_submit = true;
     small_writer_config.direct_reactor_writes = true;
@@ -8476,6 +8502,8 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                                                                    : small_writer_config.max_concurrent_file_transactions;
 
     TargetDataWriterConfig large_writer_config = writer_config;
+    large_writer_config.target_root =
+        nfs_url_with_server_expression(writer_config.target_root, large_file_target_ips);
     large_writer_config.ensure_parent_directories = false;
     large_writer_config.direct_reactor_submit = false;
     large_writer_config.direct_reactor_writes = false;
@@ -8483,6 +8511,8 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     large_writer_config.async_window = 2U;
 
     TargetDataWriterConfig medium_writer_config = writer_config;
+    medium_writer_config.target_root =
+        nfs_url_with_server_expression(writer_config.target_root, large_file_target_ips);
     medium_writer_config.ensure_parent_directories = false;
     medium_writer_config.direct_reactor_submit = false;
     medium_writer_config.direct_reactor_writes = false;
@@ -13298,7 +13328,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool mkdir_only,
                                                                       bool folder_ready_discard,
                                                                       bool folder_ready_write,
-                                                                      bool folder_ready_mixed_write) const {
+                                                                      bool folder_ready_mixed_write,
+                                                                      std::string small_file_target_ips,
+                                                                      std::string large_file_target_ips) const {
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
@@ -13436,7 +13468,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                               stats_interval_seconds,
                                                               writer_stats,
                                                               queue_capacity,
-                                                              queue_high_watermark);
+                                                              queue_high_watermark,
+                                                              small_file_target_ips,
+                                                              large_file_target_ips);
     } else if (folder_ready_write) {
         snapshot = run_parallel_folder_ready_write_scan(meta_config,
                                                         data_config,

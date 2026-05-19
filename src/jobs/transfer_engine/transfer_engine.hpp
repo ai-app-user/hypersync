@@ -524,7 +524,9 @@ public:
                                                                         bool mkdir_only = false,
                                                                         bool folder_ready_discard = false,
                                                                         bool folder_ready_write = false,
-                                                                        bool folder_ready_mixed_write = false) const;
+                                                                        bool folder_ready_mixed_write = false,
+                                                                        std::string small_file_target_ips = {},
+                                                                        std::string large_file_target_ips = {}) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
                                                                       bool recursive = true,
                                                                       std::size_t meta_reader_threads = 0,
