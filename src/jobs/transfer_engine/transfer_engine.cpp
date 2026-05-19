@@ -8323,7 +8323,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     large_writer_config.ensure_parent_directories = false;
     large_writer_config.direct_reactor_submit = false;
     large_writer_config.direct_reactor_writes = false;
-    large_writer_config.worker_count = 112U;
+    large_writer_config.worker_count = 160U;
     large_writer_config.async_window = 2U;
 
     NfsDataReaderConfig small_data_config = data_config;
@@ -8331,7 +8331,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     small_data_config.small_file_threshold = ready_queues.small_file_threshold;
     NfsDataReaderConfig large_data_config = data_config;
     large_data_config.pack_small_files = false;
-    large_data_config.data_reader_worker_count = 112U;
+    large_data_config.data_reader_worker_count = 160U;
     large_data_config.outstanding_requests = 2U;
     large_data_config.small_file_async_window = 2U;
     large_data_config.small_file_threshold = 0U;
