@@ -1442,3 +1442,13 @@ logical size: 335.99 TB
   - `window=256`, raw `FILE_SYNC`: `564,729` files, `18,620.3 files/s`, `9.32 Gbit/s`, CPU avg user `17.31%`, system `53.04%`, idle `28.47%`.
   - `window=512`, existing write path: `501,988` files, `16,523.7 files/s`, `8.27 Gbit/s`, CPU avg user `17.23%`, system `53.24%`, idle `28.36%`.
   Recommendation for current agnopo small-file NFS write tuning: use `--data-writer-file-window 256`; leave `--data-writer-stable-small-writes` off because it is neutral/slightly slower on this target.
+
+- 2026-05-18 PDT direct-drive NFS writer experiment:
+  - Added `TargetDataWriterConfig::direct_reactor_writes` and CLI flag `benchmark-data-write --data-writer-direct-reactors`.
+  - When enabled for packed NFS writes, `DataWriter-NFS` effective worker count is capped at 16, queue shards are 16, each writer lane pins to CPU `0..15`, owns its own `LibNfsSession`, and runs an inline bounded `CREATE -> WRITE -> optional FSYNC -> CLOSE` state machine without the shared `NfsTargetWriteReactorFleet` MPSC hop.
+  - Important implementation detail: inline async transaction objects must have stable addresses for libnfs callbacks. Store active transactions as `std::unique_ptr<InlineFileTransaction>` (or another stable-address container); do not queue callbacks against a stack object and then move it into a vector.
+  - Direct-inline was tested and is not the default because performance regressed badly on agnopo. Results:
+    - 16-lane queue + shared reactor fleet: `18,119 files/s`, CPU system `53.12%`.
+    - True direct-inline reactors: `2,815 files/s`, CPU system `51.98%`.
+    - Default reactor-fleet control after gating direct mode off: `16,924 files/s`, CPU system `53.09%`.
+  - Conclusion: the 96 producer relay was not the dominant CPU source. The reactor fleet's file-level hash redistribution is beneficial. Keep default small-file NFS writes on the shared reactor fleet with `--data-writer-file-window 256`; use `--data-writer-direct-reactors` only for explicit experiments.
