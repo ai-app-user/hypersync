@@ -1554,3 +1554,10 @@ logical size: 335.99 TB
     - `window=512`: `64,248.6 files/s`, `32.174 Gbit/s`.
     - `window=1024`: `37,328.9 files/s`, `18.6819 Gbit/s`.
   - New top observed small-file NFS write result is `64 reactors / window 32` at `72.3K files/s`, zero failures. For many-session mode, shallow per-reactor windows are better than deep windows.
+  - 64-reactor shallow-window zoom, same folder-ready-write pipeline, `FolderCreation-NFS-8`, `DataReader-SYN-768/direct-submit`:
+    - `window=8`: `64,418.8 files/s`, `32.259 Gbit/s`.
+    - `window=16`: `72,856 files/s`, `36.4876 Gbit/s`.
+    - `window=32`: `79,802.6 files/s`, `39.9659 Gbit/s`.
+    - `window=64`: `83,904.8 files/s`, `42.0269 Gbit/s`.
+    - `window=96`: `45,735 files/s`, `22.9006 Gbit/s`.
+  - Current top observed small-file NFS write result is `64 reactors / window 64` at `83.9K files/s`, zero failures. There is a sharp regression by `window=96`, so use `64` as the current candidate, not deeper windows.

@@ -974,3 +974,17 @@ Results:
 - `window=1024`: `37,328.9 files/s`, `18.6819 Gbit/s`, zero failures.
 
 Conclusion: with 64 reactors, shallow per-reactor windows are much better. `window=32` is the new top observed small-file NFS write result at `72.3K files/s`, and deep windows (`1024`) hurt badly. This fits the create/write metadata lifecycle better: many independent sessions with small in-flight queues beat fewer/deeper per-session queues.
+
+**User:** Asked to zoom in on 64-reactor shallow windows: `8,16,32,64,96`.
+
+**Codex:** Ran agnopo sweep with constant pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=Y]`.
+
+Results:
+- `window=8`: `64,418.8 files/s`, `32.259 Gbit/s`, zero failures.
+- `window=16`: `72,856 files/s`, `36.4876 Gbit/s`, zero failures.
+- `window=32`: `79,802.6 files/s`, `39.9659 Gbit/s`, zero failures.
+- `window=64`: `83,904.8 files/s`, `42.0269 Gbit/s`, zero failures.
+- `window=96`: `45,735 files/s`, `22.9006 Gbit/s`, zero failures.
+
+Conclusion: current top observed small-file NFS write result is `64 reactors / window 64` at `83.9K files/s`, zero failures. The cliff at `window=96` suggests the optimum is near 64 in this session-count regime; do not extrapolate to larger windows.
