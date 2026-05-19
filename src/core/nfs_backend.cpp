@@ -5260,6 +5260,7 @@ public:
 
         auto completion = std::make_shared<BatchCompletion>();
         completion->remaining.store(files.size(), std::memory_order_release);
+        std::vector<std::vector<std::shared_ptr<FileTransaction>>> by_reactor(reactors_.size());
         for (const TargetWriterBackend::WriteChunk& file : files) {
             auto transaction = std::make_shared<FileTransaction>();
             transaction->completion = completion;
@@ -5268,7 +5269,13 @@ public:
             transaction->remote_path = "/" + transaction->spec.rel_path;
             transaction->offset = file.offset;
             transaction->data = file.data;
-            select_reactor(transaction->spec.rel_path).enqueue(std::move(transaction));
+            by_reactor[reactor_index(transaction->spec.rel_path)].push_back(std::move(transaction));
+        }
+
+        for (std::size_t index = 0; index < by_reactor.size(); ++index) {
+            if (!by_reactor[index].empty()) {
+                reactors_[index]->enqueue_many(std::move(by_reactor[index]));
+            }
         }
 
         std::unique_lock<std::mutex> lock(completion->mutex);
@@ -5348,6 +5355,31 @@ private:
                 node->next = head;
             } while (!inbound_.compare_exchange_weak(head,
                                                      node,
+                                                     std::memory_order_release,
+                                                     std::memory_order_acquire));
+        }
+
+        void enqueue_many(std::vector<std::shared_ptr<FileTransaction>> transactions) {
+            if (transactions.empty()) {
+                return;
+            }
+
+            QueueNode* list = nullptr;
+            QueueNode* tail = nullptr;
+            for (auto& transaction : transactions) {
+                auto* node = new QueueNode(std::move(transaction));
+                if (list == nullptr) {
+                    tail = node;
+                }
+                node->next = list;
+                list = node;
+            }
+
+            QueueNode* head = inbound_.load(std::memory_order_acquire);
+            do {
+                tail->next = head;
+            } while (!inbound_.compare_exchange_weak(head,
+                                                     list,
                                                      std::memory_order_release,
                                                      std::memory_order_acquire));
         }
@@ -5730,9 +5762,13 @@ private:
         std::thread thread_;
     };
 
-    Reactor& select_reactor(std::string_view rel_path) {
+    [[nodiscard]] std::size_t reactor_index(std::string_view rel_path) const {
         const std::uint64_t key = hash64(rel_path);
-        return *reactors_[static_cast<std::size_t>(key % reactors_.size())];
+        return static_cast<std::size_t>(key % reactors_.size());
+    }
+
+    Reactor& select_reactor(std::string_view rel_path) {
+        return *reactors_[reactor_index(rel_path)];
     }
 
     void stop() {
