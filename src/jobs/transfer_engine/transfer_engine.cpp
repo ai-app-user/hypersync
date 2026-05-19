@@ -8765,7 +8765,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     std::thread governor([&]() {
         constexpr double kTargetSmallIops = 75'000.0;
         constexpr std::uint32_t kInitialDelayUs = 5U;
-        constexpr std::uint32_t kMaxDelayUs = 10'000U;
+        constexpr std::uint32_t kMaxDelayUs = 2'000U;
         constexpr std::chrono::milliseconds kSampleInterval(200);
         std::uint64_t previous_files = small_direct_writer_stats.files_written.load(std::memory_order_acquire);
         double smoothed_iops = 0.0;
