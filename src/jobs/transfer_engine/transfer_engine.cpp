@@ -6199,7 +6199,15 @@ void record_data_read_metadata_batch(bool recursive,
     }
 
     record_data_read_metadata(stats, files_to_read.size(), batch.directories.size(), logical_size_bytes);
-    if (target_metadata_pool != nullptr && target_metadata_queue != nullptr && !batch.directories.empty()) {
+    if (target_metadata_pool != nullptr &&
+        target_metadata_queue != nullptr &&
+        (!batch.folder.rel_path.empty() || !batch.directories.empty())) {
+        std::vector<FileSpec> target_directories;
+        target_directories.reserve(batch.directories.size() + (batch.folder.rel_path.empty() ? 0U : 1U));
+        if (!batch.folder.rel_path.empty()) {
+            target_directories.push_back(batch.folder);
+        }
+        target_directories.insert(target_directories.end(), batch.directories.begin(), batch.directories.end());
         std::uint32_t sequence = 0;
         std::optional<BufferHandle> handle;
         const auto flush_current = [&]() {
@@ -6221,14 +6229,14 @@ void record_data_read_metadata_batch(bool recursive,
                                      false,
                                      {},
                                      0,
-                                     batch.directories.size(),
+                                     target_directories.size(),
                                      0,
                                      0,
                                      0,
                                      0);
         };
         start_buffer();
-        for (const FileSpec& directory : batch.directories) {
+        for (const FileSpec& directory : target_directories) {
             MetadataBatchBuffer& buffer = metadata_batch_buffer(*target_metadata_pool, *handle);
             if (append_flat_folder_folder(buffer, directory, "size")) {
                 continue;
