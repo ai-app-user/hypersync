@@ -6073,6 +6073,8 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
                                           DataReadFileQueue& large_queue,
                                           ReadyFileSpillway& medium_spillway,
                                           ReadyFileSpillway& large_spillway,
+                                          const std::atomic<std::uint64_t>& current_small_iops_x100,
+                                          const std::atomic<std::uint32_t>& bulk_pacing_us,
                                           const DirectTargetWriterStats& small_writer,
                                           const TargetDataWriterJob& medium_writer,
                                           const TargetDataWriterJob& large_writer) {
@@ -6140,6 +6142,9 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
               << " queued_large_files=" << queued_data_read_files(large_queue)
               << " spill_medium_files=" << queued_ready_file_spillway(medium_spillway)
               << " spill_large_files=" << queued_ready_file_spillway(large_spillway)
+              << " current_small_iops="
+              << (static_cast<double>(current_small_iops_x100.load(std::memory_order_relaxed)) / 100.0)
+              << " bulk_pacing_us=" << bulk_pacing_us.load(std::memory_order_relaxed)
               << " elapsed_seconds=" << elapsed << '\n';
 }
 
@@ -6149,6 +6154,8 @@ void run_mixed_folder_ready_write_stats_printer(DataReadBenchmarkStats& stats,
                                                 DataReadFileQueue& large_queue,
                                                 ReadyFileSpillway& medium_spillway,
                                                 ReadyFileSpillway& large_spillway,
+                                                const std::atomic<std::uint64_t>& current_small_iops_x100,
+                                                const std::atomic<std::uint32_t>& bulk_pacing_us,
                                                 const DirectTargetWriterStats& small_writer,
                                                 const TargetDataWriterJob& medium_writer,
                                                 const TargetDataWriterJob& large_writer) {
@@ -6168,6 +6175,8 @@ void run_mixed_folder_ready_write_stats_printer(DataReadBenchmarkStats& stats,
                                              large_queue,
                                              medium_spillway,
                                              large_spillway,
+                                             current_small_iops_x100,
+                                             bulk_pacing_us,
                                              small_writer,
                                              medium_writer,
                                              large_writer);
@@ -8507,7 +8516,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     large_writer_config.ensure_parent_directories = false;
     large_writer_config.direct_reactor_submit = false;
     large_writer_config.direct_reactor_writes = false;
-    large_writer_config.worker_count = 160U;
+    large_writer_config.worker_count = 112U;
     large_writer_config.async_window = 2U;
 
     TargetDataWriterConfig medium_writer_config = writer_config;
@@ -8516,7 +8525,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     medium_writer_config.ensure_parent_directories = false;
     medium_writer_config.direct_reactor_submit = false;
     medium_writer_config.direct_reactor_writes = false;
-    medium_writer_config.worker_count = 96U;
+    medium_writer_config.worker_count = 64U;
     medium_writer_config.async_window = 2U;
 
     NfsDataReaderConfig small_data_config = data_config;
@@ -8524,13 +8533,13 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     small_data_config.small_file_threshold = ready_queues.small_file_threshold;
     NfsDataReaderConfig large_data_config = data_config;
     large_data_config.pack_small_files = false;
-    large_data_config.data_reader_worker_count = 160U;
+    large_data_config.data_reader_worker_count = 112U;
     large_data_config.outstanding_requests = 2U;
     large_data_config.small_file_async_window = 2U;
     large_data_config.small_file_threshold = 0U;
     NfsDataReaderConfig medium_data_config = data_config;
     medium_data_config.pack_small_files = false;
-    medium_data_config.data_reader_worker_count = 96U;
+    medium_data_config.data_reader_worker_count = 64U;
     medium_data_config.outstanding_requests = 2U;
     medium_data_config.small_file_async_window = 2U;
     medium_data_config.small_file_threshold = 0U;
@@ -8571,6 +8580,9 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     std::unique_ptr<TargetWriterBackend> small_direct_backend =
         make_target_writer_backend(small_writer_config.target_root, 0U, small_direct_options);
     DirectTargetWriterStats small_direct_writer_stats;
+    std::atomic<std::uint64_t> current_small_iops_x100 {0};
+    std::atomic<std::uint32_t> bulk_pacing_us {0};
+    std::atomic<bool> governor_done {false};
 
     const auto small_direct_consume_buffer = [&](std::size_t, const BufferHandle& handle) {
         std::uint64_t payload_bytes = 0;
@@ -8615,8 +8627,17 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         }
     };
 
-    auto make_file_provider = [](DataReadFileQueue& queue, SplitDataReadRoute route, std::size_t batch_size) {
-        return [&queue, route, batch_size]() {
+    auto make_file_provider = [](DataReadFileQueue& queue,
+                                 SplitDataReadRoute route,
+                                 std::size_t batch_size,
+                                 const std::atomic<std::uint32_t>* pacing_us = nullptr) {
+        return [&queue, route, batch_size, pacing_us]() {
+            if (pacing_us != nullptr) {
+                const std::uint32_t delay_us = pacing_us->load(std::memory_order_relaxed);
+                if (delay_us != 0U) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+                }
+            }
             thread_local std::deque<FileSpec> worker_file_batch;
             if (worker_file_batch.empty()) {
                 std::vector<FileSpec> next_batch = take_data_file_work_batch(queue, batch_size);
@@ -8656,7 +8677,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         large_data_config,
         data_pool,
         large_reader_to_writer,
-        make_file_provider(ready_queues.large, SplitDataReadRoute::Large, 128U),
+        make_file_provider(ready_queues.large, SplitDataReadRoute::Large, 128U, &bulk_pacing_us),
         [&ready_queues]() {
             return data_read_timer_expired(ready_queues.large);
         });
@@ -8674,7 +8695,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         medium_data_config,
         data_pool,
         medium_reader_to_writer,
-        make_file_provider(medium_ready_queue, SplitDataReadRoute::Large, 128U),
+        make_file_provider(medium_ready_queue, SplitDataReadRoute::Large, 128U, &bulk_pacing_us),
         [&medium_ready_queue]() {
             return data_read_timer_expired(medium_ready_queue);
         });
@@ -8735,9 +8756,48 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                               std::ref(ready_queues.large),
                               std::ref(medium_spillway),
                               std::ref(large_spillway),
+                              std::cref(current_small_iops_x100),
+                              std::cref(bulk_pacing_us),
                               std::cref(small_direct_writer_stats),
                               std::cref(medium_writer_job),
                               std::cref(large_writer_job));
+
+    std::thread governor([&]() {
+        constexpr double kTargetSmallIops = 75'000.0;
+        constexpr std::uint32_t kInitialDelayUs = 5U;
+        constexpr std::uint32_t kMaxDelayUs = 250U;
+        constexpr std::chrono::milliseconds kSampleInterval(200);
+        std::uint64_t previous_files = small_direct_writer_stats.files_written.load(std::memory_order_acquire);
+        double smoothed_iops = 0.0;
+        while (!governor_done.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(kSampleInterval);
+            const std::uint64_t current_files =
+                small_direct_writer_stats.files_written.load(std::memory_order_acquire);
+            const std::uint64_t delta_files = current_files - previous_files;
+            previous_files = current_files;
+            const double instant_iops =
+                static_cast<double>(delta_files) * 1000.0 /
+                static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(kSampleInterval).count());
+            smoothed_iops = smoothed_iops == 0.0 ? instant_iops : (smoothed_iops * 0.65 + instant_iops * 0.35);
+            current_small_iops_x100.store(static_cast<std::uint64_t>(std::max(0.0, smoothed_iops) * 100.0),
+                                          std::memory_order_relaxed);
+
+            const std::uint64_t small_found = stats.small_files_found.load(std::memory_order_acquire);
+            const std::uint64_t small_written = current_files;
+            const std::size_t queued_small = queued_data_read_files(ready_queues.small);
+            const bool small_backlogged =
+                queued_small != 0U ||
+                small_found > small_written + std::max<std::uint64_t>(1024U, small_data_threads);
+
+            std::uint32_t delay_us = bulk_pacing_us.load(std::memory_order_relaxed);
+            if (small_backlogged && smoothed_iops < kTargetSmallIops) {
+                delay_us = delay_us == 0U ? kInitialDelayUs : std::min<std::uint32_t>(kMaxDelayUs, delay_us * 2U);
+            } else if (delay_us != 0U) {
+                delay_us = delay_us <= kInitialDelayUs ? 0U : delay_us / 2U;
+            }
+            bulk_pacing_us.store(delay_us, std::memory_order_relaxed);
+        }
+    });
 
     std::vector<std::thread> spillway_drainers;
     spillway_drainers.emplace_back([&]() {
@@ -8910,6 +8970,11 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         try {
             large_writer_job.stop();
         } catch (...) {}
+    }
+
+    governor_done.store(true, std::memory_order_release);
+    if (governor.joinable()) {
+        governor.join();
     }
 
     stats.printer_done.store(true, std::memory_order_relaxed);
