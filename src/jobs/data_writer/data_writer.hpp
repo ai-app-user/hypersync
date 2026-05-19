@@ -125,7 +125,9 @@ protected:
 
 private:
     [[nodiscard]] bool pop_input(std::size_t worker_index, BufferHandle& handle);
+    [[nodiscard]] bool try_pop_input(std::size_t worker_index, BufferHandle& handle);
     void process_buffer(TargetWriterBackend& backend, const BufferHandle& handle);
+    void process_buffers(TargetWriterBackend& backend, const std::vector<BufferHandle>& handles);
     void record_folder_written();
 
     TargetMetaWriterConfig config_;

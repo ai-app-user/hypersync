@@ -239,13 +239,24 @@ void TargetMetaWriterJob::run_worker(std::size_t worker_index) {
     auto backend = make_target_writer_backend(config_.target_root, worker_index, options);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
+        std::vector<BufferHandle> handles;
+        handles.reserve(std::max<std::size_t>(1U, config_.async_window));
+        handles.push_back(handle);
+        while (handles.size() < std::max<std::size_t>(1U, config_.async_window) &&
+               try_pop_input(worker_index, handle)) {
+            handles.push_back(handle);
+        }
         try {
-            process_buffer(*backend, handle);
+            process_buffers(*backend, handles);
         } catch (...) {
-            metadata_pool_.release(handle);
+            for (const BufferHandle& pending : handles) {
+                metadata_pool_.release(pending);
+            }
             throw;
         }
-        metadata_pool_.release(handle);
+        for (const BufferHandle& processed : handles) {
+            metadata_pool_.release(processed);
+        }
     }
 }
 
@@ -271,6 +282,71 @@ bool TargetMetaWriterJob::pop_input(std::size_t worker_index, BufferHandle& hand
     }
     auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_input_empty);
     return sharded_input_->shard(shard).pop_wait(handle);
+}
+
+bool TargetMetaWriterJob::try_pop_input(std::size_t worker_index, BufferHandle& handle) {
+    if (input_ != nullptr) {
+        return input_->try_pop(handle);
+    }
+    if (sharded_input_ == nullptr) {
+        return false;
+    }
+    const std::size_t shard = sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
+    return sharded_input_->shard(shard).try_pop(handle);
+}
+
+void TargetMetaWriterJob::process_buffers(TargetWriterBackend& backend,
+                                          const std::vector<BufferHandle>& handles) {
+    std::vector<FileSpec> folders;
+    std::vector<FileSpec> final_folders;
+    std::uint64_t processed = 0;
+
+    for (const BufferHandle& handle : handles) {
+        const MetadataBatchBuffer& buffer = metadata_batch_buffer(metadata_pool_, handle);
+        if (!is_flat_folder_buffer(buffer)) {
+            throw std::runtime_error("MetaWriter-" + backend_job_suffix(config_.target_root) +
+                                     " received non-flat-folder metadata buffer");
+        }
+        const FlatFolderBufferInfo info = flat_folder_buffer_info(buffer);
+        ++processed;
+        if (info.failed) {
+            continue;
+        }
+
+        folders.reserve(folders.size() + static_cast<std::size_t>(info.total_folder_count));
+        visit_flat_folder_children(buffer, [&](FlatFolderChildView child) {
+            if (child.is_file) {
+                return;
+            }
+            FileSpec folder;
+            folder.rel_path = child_path(info.folder_path, child.name);
+            folder.mtime = child.mtime;
+            folder.mode = child.mode != 0U ? child.mode : 0755U;
+            folder.uid = child.uid;
+            folder.gid = child.gid;
+            folders.push_back(std::move(folder));
+        });
+
+        if (info.final_batch && config_.preserve_metadata) {
+            FileSpec folder;
+            folder.rel_path = std::string(info.folder_path);
+            folder.mtime = info.folder_mtime;
+            folder.mode = info.folder_mode != 0U ? info.folder_mode : 0755U;
+            folder.uid = info.folder_uid;
+            folder.gid = info.folder_gid;
+            final_folders.push_back(std::move(folder));
+        }
+    }
+
+    backend.ensure_directories(folders);
+    if (!folders.empty()) {
+        folders_written_.fetch_add(folders.size(), std::memory_order_relaxed);
+    }
+    for (const FileSpec& folder : final_folders) {
+        backend.apply_directory_metadata(folder);
+        record_folder_written();
+    }
+    buffers_processed_.fetch_add(processed, std::memory_order_relaxed);
 }
 
 void TargetMetaWriterJob::process_buffer(TargetWriterBackend& backend, const BufferHandle& handle) {
