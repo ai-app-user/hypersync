@@ -296,6 +296,18 @@ struct FolderReadyBatchQueue {
     std::exception_ptr error;
 };
 
+struct ReadyFileSpillway {
+    std::mutex mutex;
+    std::condition_variable cv_not_empty;
+    std::deque<FileSpec> files;
+    bool input_done = false;
+    bool stop = false;
+    std::exception_ptr error;
+    std::size_t high_watermark = 0;
+};
+
+std::size_t queued_ready_file_spillway(ReadyFileSpillway& spillway);
+
 struct ScannerCapacityControl {
     std::atomic<std::size_t> active_workers {1};
     std::mutex mutex;
@@ -6037,6 +6049,8 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
                                           DataReadFileQueue& small_queue,
                                           DataReadFileQueue& medium_queue,
                                           DataReadFileQueue& large_queue,
+                                          ReadyFileSpillway& medium_spillway,
+                                          ReadyFileSpillway& large_spillway,
                                           const DirectTargetWriterStats& small_writer,
                                           const TargetDataWriterJob& medium_writer,
                                           const TargetDataWriterJob& large_writer) {
@@ -6102,6 +6116,8 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
               << " queued_small_files=" << queued_data_read_files(small_queue)
               << " queued_medium_files=" << queued_data_read_files(medium_queue)
               << " queued_large_files=" << queued_data_read_files(large_queue)
+              << " spill_medium_files=" << queued_ready_file_spillway(medium_spillway)
+              << " spill_large_files=" << queued_ready_file_spillway(large_spillway)
               << " elapsed_seconds=" << elapsed << '\n';
 }
 
@@ -6109,6 +6125,8 @@ void run_mixed_folder_ready_write_stats_printer(DataReadBenchmarkStats& stats,
                                                 DataReadFileQueue& small_queue,
                                                 DataReadFileQueue& medium_queue,
                                                 DataReadFileQueue& large_queue,
+                                                ReadyFileSpillway& medium_spillway,
+                                                ReadyFileSpillway& large_spillway,
                                                 const DirectTargetWriterStats& small_writer,
                                                 const TargetDataWriterJob& medium_writer,
                                                 const TargetDataWriterJob& large_writer) {
@@ -6126,6 +6144,8 @@ void run_mixed_folder_ready_write_stats_printer(DataReadBenchmarkStats& stats,
                                              small_queue,
                                              medium_queue,
                                              large_queue,
+                                             medium_spillway,
+                                             large_spillway,
                                              small_writer,
                                              medium_writer,
                                              large_writer);
@@ -6341,21 +6361,116 @@ bool enqueue_data_read_files(DataReadFileQueue& queue, std::vector<FileSpec>&& f
     return true;
 }
 
-bool enqueue_three_way_ready_files(DataReadFileQueue& small_queue,
-                                   DataReadFileQueue& medium_queue,
-                                   DataReadFileQueue& large_queue,
-                                   std::uint64_t small_threshold,
-                                   std::uint64_t medium_threshold,
-                                   std::vector<FileSpec>&& files,
-                                   std::size_t& small_count,
-                                   std::size_t& medium_count,
-                                   std::size_t& large_count,
-                                   std::uint64_t& small_bytes,
-                                   std::uint64_t& medium_bytes,
-                                   std::uint64_t& large_bytes) {
-    std::vector<FileSpec> small_files;
-    std::vector<FileSpec> medium_files;
-    std::vector<FileSpec> large_files;
+void fail_ready_file_spillway(ReadyFileSpillway& spillway, std::exception_ptr error = std::current_exception()) {
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        spillway.error = error;
+        spillway.stop = true;
+        spillway.files.clear();
+    }
+    spillway.cv_not_empty.notify_all();
+}
+
+void request_ready_file_spillway_stop(ReadyFileSpillway& spillway) {
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        spillway.stop = true;
+        spillway.files.clear();
+    }
+    spillway.cv_not_empty.notify_all();
+}
+
+void mark_ready_file_spillway_input_done(ReadyFileSpillway& spillway) {
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        spillway.input_done = true;
+    }
+    spillway.cv_not_empty.notify_all();
+}
+
+std::size_t queued_ready_file_spillway(ReadyFileSpillway& spillway) {
+    std::lock_guard<std::mutex> lock(spillway.mutex);
+    return spillway.files.size();
+}
+
+bool spill_ready_files(ReadyFileSpillway& spillway, std::vector<FileSpec>&& files) {
+    if (files.empty()) {
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        if (spillway.stop || spillway.error) {
+            return false;
+        }
+        for (auto& file : files) {
+            spillway.files.push_back(std::move(file));
+        }
+        spillway.high_watermark = std::max(spillway.high_watermark, spillway.files.size());
+    }
+    spillway.cv_not_empty.notify_one();
+    return true;
+}
+
+std::vector<FileSpec> take_ready_file_spill_batch(ReadyFileSpillway& spillway, std::size_t max_files) {
+    std::vector<FileSpec> batch;
+    if (max_files == 0U) {
+        return batch;
+    }
+    std::unique_lock<std::mutex> lock(spillway.mutex);
+    spillway.cv_not_empty.wait(lock, [&spillway]() {
+        return spillway.stop || spillway.error || !spillway.files.empty() || spillway.input_done;
+    });
+    if (spillway.stop || spillway.error || spillway.files.empty()) {
+        return batch;
+    }
+    const std::size_t count = std::min(max_files, spillway.files.size());
+    batch.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        batch.push_back(std::move(spillway.files.front()));
+        spillway.files.pop_front();
+    }
+    return batch;
+}
+
+bool try_enqueue_data_read_files_or_spill(DataReadFileQueue& queue,
+                                          ReadyFileSpillway& spillway,
+                                          std::vector<FileSpec>&& files) {
+    if (files.empty()) {
+        return true;
+    }
+    std::vector<FileSpec> overflow;
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        if (data_read_timer_expired(queue)) {
+            queue.stop = true;
+            queue.files.clear();
+        }
+        if (queue.stop || queue.error) {
+            queue.cv_not_empty.notify_all();
+            queue.cv_not_full.notify_all();
+            return false;
+        }
+        for (auto& file : files) {
+            if (queue.files.size() < queue.max_entries) {
+                queue.files.push_back(std::move(file));
+            } else {
+                overflow.push_back(std::move(file));
+            }
+        }
+    }
+    queue.cv_not_empty.notify_all();
+    return spill_ready_files(spillway, std::move(overflow));
+}
+
+void classify_ready_files(std::uint64_t small_threshold,
+                          std::uint64_t medium_threshold,
+                          std::vector<FileSpec>&& files,
+                          std::vector<FileSpec>& small_files,
+                          std::vector<FileSpec>& medium_files,
+                          std::vector<FileSpec>& large_files,
+                          std::uint64_t& small_bytes,
+                          std::uint64_t& medium_bytes,
+                          std::uint64_t& large_bytes) {
     small_files.reserve(files.size());
     medium_files.reserve(files.size());
     large_files.reserve(files.size());
@@ -6372,12 +6487,6 @@ bool enqueue_three_way_ready_files(DataReadFileQueue& small_queue,
             large_files.push_back(std::move(file));
         }
     }
-    small_count += small_files.size();
-    medium_count += medium_files.size();
-    large_count += large_files.size();
-    return enqueue_data_read_files(small_queue, std::move(small_files)) &&
-           enqueue_data_read_files(medium_queue, std::move(medium_files)) &&
-           enqueue_data_read_files(large_queue, std::move(large_files));
 }
 
 std::optional<FileSpec> take_data_file_work(DataReadFileQueue& queue) {
@@ -8345,9 +8454,11 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     SplitDataReadFileQueues ready_queues;
     ready_queues.small_file_threshold = true_small_threshold;
     ready_queues.small.max_entries = std::max<std::size_t>(1U, max_files_queued);
-    ready_queues.large.max_entries = std::max<std::size_t>(5'000'000U, max_files_queued);
+    ready_queues.large.max_entries = std::max<std::size_t>(1U, max_files_queued);
     DataReadFileQueue medium_ready_queue;
-    medium_ready_queue.max_entries = std::max<std::size_t>(5'000'000U, max_files_queued);
+    medium_ready_queue.max_entries = std::max<std::size_t>(1U, max_files_queued);
+    ReadyFileSpillway medium_spillway;
+    ReadyFileSpillway large_spillway;
 
     DataReadBenchmarkStats stats;
     stats.print_interval_seconds = std::max<std::uint32_t>(1U, stats_interval_seconds);
@@ -8581,6 +8692,8 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                 request_data_file_stop(ready_queues.small);
                 request_data_file_stop(medium_ready_queue);
                 request_data_file_stop(ready_queues.large);
+                request_ready_file_spillway_stop(medium_spillway);
+                request_ready_file_spillway_stop(large_spillway);
             }
         });
     }
@@ -8590,9 +8703,47 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                               std::ref(ready_queues.small),
                               std::ref(medium_ready_queue),
                               std::ref(ready_queues.large),
+                              std::ref(medium_spillway),
+                              std::ref(large_spillway),
                               std::cref(small_direct_writer_stats),
                               std::cref(medium_writer_job),
                               std::cref(large_writer_job));
+
+    std::vector<std::thread> spillway_drainers;
+    spillway_drainers.emplace_back([&]() {
+        try {
+            while (true) {
+                std::vector<FileSpec> files = take_ready_file_spill_batch(medium_spillway, 4096U);
+                if (files.empty()) {
+                    break;
+                }
+                if (!enqueue_data_read_files(medium_ready_queue, std::move(files))) {
+                    break;
+                }
+            }
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            fail_ready_file_spillway(medium_spillway, error);
+            fail_data_file_work(medium_ready_queue, error);
+        }
+    });
+    spillway_drainers.emplace_back([&]() {
+        try {
+            while (true) {
+                std::vector<FileSpec> files = take_ready_file_spill_batch(large_spillway, 4096U);
+                if (files.empty()) {
+                    break;
+                }
+                if (!enqueue_data_read_files(ready_queues.large, std::move(files))) {
+                    break;
+                }
+            }
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            fail_ready_file_spillway(large_spillway, error);
+            fail_data_file_work(ready_queues.large, error);
+        }
+    });
 
     const std::size_t folder_create_threads = target_data_writer_effective_worker_count(writer_config);
     std::vector<std::thread> folder_workers;
@@ -8617,24 +8768,34 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                         folders_created.fetch_add(batch->directories.size(), std::memory_order_relaxed);
                     }
                     if (!batch->files.empty()) {
+                        std::vector<FileSpec> small_files;
+                        std::vector<FileSpec> medium_files;
+                        std::vector<FileSpec> large_files;
                         std::size_t small_count = 0;
                         std::size_t medium_count = 0;
                         std::size_t large_count = 0;
                         std::uint64_t small_bytes = 0;
                         std::uint64_t medium_bytes = 0;
                         std::uint64_t large_bytes = 0;
-                        if (!enqueue_three_way_ready_files(ready_queues.small,
-                                                           medium_ready_queue,
-                                                           ready_queues.large,
-                                                           true_small_threshold,
-                                                           medium_threshold,
-                                                           std::move(batch->files),
-                                                           small_count,
-                                                           medium_count,
-                                                           large_count,
-                                                           small_bytes,
-                                                           medium_bytes,
-                                                           large_bytes)) {
+                        classify_ready_files(true_small_threshold,
+                                             medium_threshold,
+                                             std::move(batch->files),
+                                             small_files,
+                                             medium_files,
+                                             large_files,
+                                             small_bytes,
+                                             medium_bytes,
+                                             large_bytes);
+                        small_count = small_files.size();
+                        medium_count = medium_files.size();
+                        large_count = large_files.size();
+                        if (!enqueue_data_read_files(ready_queues.small, std::move(small_files)) ||
+                            !try_enqueue_data_read_files_or_spill(medium_ready_queue,
+                                                                  medium_spillway,
+                                                                  std::move(medium_files)) ||
+                            !try_enqueue_data_read_files_or_spill(ready_queues.large,
+                                                                  large_spillway,
+                                                                  std::move(large_files))) {
                             break;
                         }
                         stats.small_files_found.fetch_add(small_count, std::memory_order_relaxed);
@@ -8649,6 +8810,8 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                 fail_data_file_work(ready_queues.small, error);
                 fail_data_file_work(medium_ready_queue, error);
                 fail_data_file_work(ready_queues.large, error);
+                fail_ready_file_spillway(medium_spillway, error);
+                fail_ready_file_spillway(large_spillway, error);
             }
         });
     }
@@ -8684,6 +8847,11 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     mark_folder_ready_input_done(folder_batch_queue);
     for (auto& worker : folder_workers) {
         worker.join();
+    }
+    mark_ready_file_spillway_input_done(medium_spillway);
+    mark_ready_file_spillway_input_done(large_spillway);
+    for (auto& drainer : spillway_drainers) {
+        drainer.join();
     }
     mark_data_file_input_done(ready_queues.small);
     mark_data_file_input_done(medium_ready_queue);
@@ -8743,6 +8911,12 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     }
     if (ready_queues.large.error) {
         std::rethrow_exception(ready_queues.large.error);
+    }
+    if (medium_spillway.error) {
+        std::rethrow_exception(medium_spillway.error);
+    }
+    if (large_spillway.error) {
+        std::rethrow_exception(large_spillway.error);
     }
     if (pipeline_error) {
         std::rethrow_exception(pipeline_error);
