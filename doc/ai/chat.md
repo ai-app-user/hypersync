@@ -889,3 +889,20 @@ Agnopo combined small-file run, all 16 target IPs, synthetic profile, `files-per
 - With fallback restored: zero failures, `178,977` files written in `31.7s`, about `5,643 files/s`, `2.82 Gbit/s`, `7061` folder-create records processed.
 
 Conclusion: the combined architecture is functionally correct now, but it does not yet preserve the `50K files/s` precreated-directory rate. The bottleneck is the remaining directory readiness/fallback cost: file reactors still have to verify or create parent directories for folders that are not known-ready in their local caches. Next architectural step should be a real directory-ready acknowledgement path: `MetaWriter-NFS` should publish completed folder paths into a readiness map, and file providers/readers should only release files for folders whose target directory is ready. That would keep mkdir out of the file hot path without allowing ENOENT races.
+
+**User:** Requested a folder-gated pipeline: once filenames are generated, send them first to a folder creation job; after the folders are created, publish the batch of files for that folder into the next queue; test the final file creation stage as null/discard to verify the folder creation and handoff logic is fast enough.
+
+**Codex:** Added a new `benchmark-data-write --mode folder-ready-discard` path. The local test pipeline shape is:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-N]->(FolderReadyQueue-4096)->[FolderCreation-NFS/FS-N]->(ReadyFileQueue)->[DataWriter-NULL-N]`.
+
+Implementation notes:
+- The scanner now builds `FolderReadyFileBatch` records containing the current folder, child directories, filtered files, and logical bytes.
+- The folder creation workers consume `FolderReadyFileBatch`, call `TargetWriterBackend::ensure_directories()` for the current/child directories, and only then enqueue the files into the ready-file queue.
+- The final sink for this test is a discard writer that drains the ready-file queue and reports files/bytes as written, so the test isolates directory acknowledgement and queue handoff without payload writes.
+- Added a CLI integration smoke test proving local folder creation happens while files are discarded, not written.
+
+Verification on local macOS build:
+- `make -j8 release` passed.
+- `make -j8 unit-test` passed: `74/74`.
+- Targeted integration test passed: `main_cli_benchmark_data_write_folder_ready_discard_smoke`.
+- Manual local smoke with 2,000 files produced `files_found=2000`, `files_read=2000`, `files_written=2000`, `folders_written=4`, no failures.

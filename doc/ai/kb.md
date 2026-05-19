@@ -1517,3 +1517,10 @@ logical size: 335.99 TB
   - The background mkdir lane alone is not enough for correctness yet; file creates can race ahead of mkdir completion. Keep file-writer parent-directory fallback enabled until there is a proper directory-ready acknowledgement path.
   - agnopo combined run with fallback enabled, all 16 target IPs, `files-per-batch=1024`, `max-file-size=128KiB`, `MetaReader-SYN-96`, `DataReader-SYN-640/direct-submit`, `MetaWriter-NFS-32`, `DataWriter-NFS/reactors=16 window=1024`, deep file reservoir: zero failures, `178,977` files in `31.7s`, about `5,643 files/s`, `2.82 Gbit/s`, `7061` folder-create records.
   - This is functionally correct but far below the precreated-directory `50,841 files/s` result. Next required optimization is a directory readiness map/ack path: `MetaWriter-NFS` publishes completed folder paths, and file providers/readers release files only after their target parent directory is ready. This should remove per-file-reactor parent checks without reintroducing ENOENT races.
+
+- 2026-05-19 PDT folder-ready discard mode:
+  - New mode: `benchmark-data-write --mode folder-ready-discard`.
+  - Pipeline shape: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-N]->(FolderReadyQueue-4096)->[FolderCreation-NFS/FS-N]->(ReadyFileQueue)->[DataWriter-NULL-N]`.
+  - Purpose: validate the target-directory acknowledgement boundary before reconnecting the real file writer. Files do not enter `ReadyFileQueue` until the folder creation worker has called `TargetWriterBackend::ensure_directories()` for the folder batch.
+  - This mode reports file discard as `files_written` / `bytes_written`, and reports directory acknowledgements as `folders_written`.
+  - Local verification: release build passed, unit suite passed, CLI integration smoke passed, and a local 2,000-file smoke completed with all 2,000 files discarded after folder creation and no payload files created.

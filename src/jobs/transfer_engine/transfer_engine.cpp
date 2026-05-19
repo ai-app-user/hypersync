@@ -276,6 +276,26 @@ struct DataReadFileQueue {
     std::exception_ptr error;
 };
 
+struct FolderReadyFileBatch {
+    FileSpec folder;
+    std::vector<FileSpec> directories;
+    std::vector<FileSpec> files;
+    std::uint64_t logical_size_bytes = 0;
+};
+
+struct FolderReadyBatchQueue {
+    std::mutex mutex;
+    std::condition_variable cv_not_empty;
+    std::condition_variable cv_not_full;
+    std::deque<FolderReadyFileBatch> batches;
+    std::optional<std::chrono::steady_clock::time_point> stop_at;
+    std::size_t max_entries = 4096;
+    std::size_t high_watermark = 0;
+    bool input_done = false;
+    bool stop = false;
+    std::exception_ptr error;
+};
+
 struct ScannerCapacityControl {
     std::atomic<std::size_t> active_workers {1};
     std::mutex mutex;
@@ -5589,6 +5609,102 @@ bool data_file_input_done_and_empty(DataReadFileQueue& queue) {
     return queue.input_done && queue.files.empty();
 }
 
+std::size_t queued_folder_ready_batches(FolderReadyBatchQueue& queue) {
+    std::lock_guard<std::mutex> lock(queue.mutex);
+    return queue.batches.size();
+}
+
+bool folder_ready_timer_expired(const FolderReadyBatchQueue& queue) {
+    return queue.stop_at.has_value() && std::chrono::steady_clock::now() >= *queue.stop_at;
+}
+
+void fail_folder_ready_work(FolderReadyBatchQueue& queue, std::exception_ptr error = std::current_exception()) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.stop = true;
+        if (!queue.error && error != nullptr) {
+            queue.error = error;
+        }
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
+void request_folder_ready_stop(FolderReadyBatchQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.stop = true;
+        queue.batches.clear();
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
+bool enqueue_folder_ready_batch(FolderReadyBatchQueue& queue, FolderReadyFileBatch&& batch) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    const auto ready = [&queue]() {
+        return queue.stop || queue.error || folder_ready_timer_expired(queue) ||
+               queue.batches.size() < queue.max_entries;
+    };
+    if (queue.stop_at.has_value()) {
+        queue.cv_not_full.wait_until(lock, *queue.stop_at, ready);
+    } else {
+        queue.cv_not_full.wait(lock, ready);
+    }
+
+    if (folder_ready_timer_expired(queue)) {
+        queue.stop = true;
+        queue.batches.clear();
+    }
+    if (queue.stop || queue.error) {
+        queue.cv_not_empty.notify_all();
+        queue.cv_not_full.notify_all();
+        return false;
+    }
+
+    queue.batches.push_back(std::move(batch));
+    queue.high_watermark = std::max(queue.high_watermark, queue.batches.size());
+    lock.unlock();
+    queue.cv_not_empty.notify_one();
+    return true;
+}
+
+std::optional<FolderReadyFileBatch> take_folder_ready_batch(FolderReadyBatchQueue& queue) {
+    std::unique_lock<std::mutex> lock(queue.mutex);
+    const auto ready = [&queue]() {
+        return queue.stop || queue.error || !queue.batches.empty() || queue.input_done ||
+               folder_ready_timer_expired(queue);
+    };
+    if (queue.stop_at.has_value()) {
+        queue.cv_not_empty.wait_until(lock, *queue.stop_at, ready);
+    } else {
+        queue.cv_not_empty.wait(lock, ready);
+    }
+
+    if (folder_ready_timer_expired(queue)) {
+        queue.stop = true;
+        queue.batches.clear();
+    }
+    if (queue.stop || queue.error || queue.batches.empty()) {
+        return std::nullopt;
+    }
+
+    FolderReadyFileBatch batch = std::move(queue.batches.front());
+    queue.batches.pop_front();
+    lock.unlock();
+    queue.cv_not_full.notify_one();
+    return batch;
+}
+
+void mark_folder_ready_input_done(FolderReadyBatchQueue& queue) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mutex);
+        queue.input_done = true;
+    }
+    queue.cv_not_empty.notify_all();
+    queue.cv_not_full.notify_all();
+}
+
 bool wait_until_scanner_worker_active(std::size_t worker_index,
                                       ScannerCapacityControl* control,
                                       const std::function<bool()>& should_stop) {
@@ -5914,6 +6030,58 @@ void run_direct_data_buffer_write_stats_printer(DataReadBenchmarkStats& stats,
         std::lock_guard<std::mutex> print_lock(stats.print_mutex);
         stats.last_print_at = std::chrono::steady_clock::now();
         print_direct_data_buffer_write_stats(stats, file_queue, writer);
+    }
+}
+
+void print_folder_ready_discard_stats(const DataReadBenchmarkStats& stats,
+                                      FolderReadyBatchQueue& folder_batch_queue,
+                                      DataReadFileQueue& ready_file_queue,
+                                      const std::atomic<std::uint64_t>& folders_created,
+                                      const DirectTargetWriterStats& discard_stats) {
+    const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+    const TargetWriterStats sink = discard_stats.snapshot();
+    const double sink_files_per_second = snapshot.elapsed_seconds > 0.0
+                                             ? static_cast<double>(sink.files_written) / snapshot.elapsed_seconds
+                                             : 0.0;
+    const double sink_gbps = snapshot.elapsed_seconds > 0.0
+                                 ? static_cast<double>(sink.bytes_written) * 8.0 /
+                                       snapshot.elapsed_seconds / 1'000'000'000.0
+                                 : 0.0;
+    const std::size_t folder_batches = queued_folder_ready_batches(folder_batch_queue);
+    std::cerr << "folder_ready_discard_stats files_found=" << snapshot.files_found
+              << " folders_found=" << snapshot.folders_found
+              << " folders_created=" << folders_created.load(std::memory_order_relaxed)
+              << " files_released=" << snapshot.files_read
+              << " files_discarded=" << sink.files_written
+              << " files_per_second=" << sink_files_per_second
+              << " gigabits_per_second=" << sink_gbps
+              << " bytes_discarded=" << sink.bytes_written
+              << " logical_size_bytes=" << snapshot.logical_size_bytes
+              << " folder_batch_queue_depth=" << folder_batches
+              << " ready_file_queue_depth=" << queued_data_read_files(ready_file_queue)
+              << " elapsed_seconds=" << snapshot.elapsed_seconds << '\n';
+}
+
+void run_folder_ready_discard_stats_printer(DataReadBenchmarkStats& stats,
+                                            FolderReadyBatchQueue& folder_batch_queue,
+                                            DataReadFileQueue& ready_file_queue,
+                                            const std::atomic<std::uint64_t>& folders_created,
+                                            const DirectTargetWriterStats& discard_stats) {
+    const auto interval = std::chrono::seconds(stats.print_interval_seconds);
+    std::unique_lock<std::mutex> lock(stats.printer_mutex);
+    while (true) {
+        if (stats.printer_cv.wait_for(lock, interval, [&stats] {
+                return stats.printer_done.load(std::memory_order_relaxed);
+            })) {
+            break;
+        }
+        std::lock_guard<std::mutex> print_lock(stats.print_mutex);
+        stats.last_print_at = std::chrono::steady_clock::now();
+        print_folder_ready_discard_stats(stats,
+                                         folder_batch_queue,
+                                         ready_file_queue,
+                                         folders_created,
+                                         discard_stats);
     }
 }
 
@@ -6264,6 +6432,83 @@ void record_data_read_metadata_batch(bool recursive,
     }
 }
 
+void record_folder_ready_metadata_batch(bool recursive,
+                                        FlatMetadataWorkQueue& folder_queue,
+                                        FolderReadyBatchQueue& folder_batch_queue,
+                                        DataReadFileQueue& ready_file_queue,
+                                        DataReadBenchmarkStats& stats,
+                                        FlatFolderScanBatch batch,
+                                        std::uint64_t min_file_size_bytes,
+                                        std::uint64_t max_file_size_bytes) {
+    if (batch.failed) {
+        std::cerr << "metadata scan skipped folder '"
+                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+        if (batch.folder.rel_path.empty()) {
+            const std::string message =
+                batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
+            const auto error = std::make_exception_ptr(std::runtime_error(message));
+            fail_flat_folder_work(folder_queue, error);
+            fail_folder_ready_work(folder_batch_queue, error);
+            fail_data_file_work(ready_file_queue, error);
+            return;
+        }
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        return;
+    }
+
+    FolderReadyFileBatch folder_batch;
+    folder_batch.folder = batch.folder;
+    folder_batch.directories.reserve(batch.directories.size() + (batch.folder.rel_path.empty() ? 0U : 1U));
+    if (!batch.folder.rel_path.empty()) {
+        folder_batch.directories.push_back(batch.folder);
+    }
+    for (auto& directory : batch.directories) {
+        folder_batch.directories.push_back(directory);
+    }
+
+    folder_batch.files.reserve(batch.files.size());
+    for (auto& file : batch.files) {
+        const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
+        if (min_file_size_bytes != 0U && logical_size < min_file_size_bytes) {
+            continue;
+        }
+        if (max_file_size_bytes != 0U && logical_size > max_file_size_bytes) {
+            continue;
+        }
+        folder_batch.logical_size_bytes += logical_size;
+        folder_batch.files.push_back(std::move(file));
+    }
+
+    std::vector<FileSpec> child_work;
+    if (recursive && !flat_metadata_scan_should_stop(folder_queue)) {
+        child_work.reserve(batch.directories.size());
+        for (auto& directory : batch.directories) {
+            directory.rel_path = normalize_path(directory.rel_path);
+            child_work.push_back(directory);
+        }
+    }
+
+    record_data_read_metadata(stats,
+                              folder_batch.files.size(),
+                              batch.directories.size(),
+                              folder_batch.logical_size_bytes);
+    if (!folder_batch.files.empty() || !folder_batch.directories.empty()) {
+        if (!enqueue_folder_ready_batch(folder_batch_queue, std::move(folder_batch))) {
+            if (batch.complete) {
+                finish_flat_folder_work(folder_queue);
+            }
+            return;
+        }
+    }
+    enqueue_flat_folder_work(folder_queue, std::move(child_work));
+    if (batch.complete) {
+        finish_flat_folder_work(folder_queue);
+    }
+}
+
 void record_split_data_read_metadata_batch(bool recursive,
                                            FlatMetadataWorkQueue& folder_queue,
                                            SplitDataReadFileQueues& file_queues,
@@ -6515,6 +6760,52 @@ void scan_data_read_metadata_worker(const std::string& source_root,
         const std::exception_ptr error = std::current_exception();
         fail_flat_folder_work(folder_queue, error);
         fail_data_file_work(file_queue, error);
+    }
+}
+
+void scan_folder_ready_metadata_worker(const std::string& source_root,
+                                       bool recursive,
+                                       std::size_t async_directory_depth,
+                                       std::size_t readdirplus_page_bytes,
+                                       std::uint64_t min_file_size_bytes,
+                                       std::uint64_t max_file_size_bytes,
+                                       FlatMetadataWorkQueue& folder_queue,
+                                       FolderReadyBatchQueue& folder_batch_queue,
+                                       DataReadFileQueue& ready_file_queue,
+                                       DataReadBenchmarkStats& stats) {
+    auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
+    try {
+        backend->scan_flat_folders_streaming(
+            async_directory_depth,
+            [&folder_queue](bool wait_for_work) {
+                return take_flat_folder_work(folder_queue, wait_for_work);
+            },
+            [&folder_queue, &folder_batch_queue, &ready_file_queue] {
+                return flat_metadata_scan_should_stop(folder_queue) ||
+                       folder_ready_timer_expired(folder_batch_queue) ||
+                       data_read_timer_expired(ready_file_queue);
+            },
+            [recursive,
+             min_file_size_bytes,
+             max_file_size_bytes,
+             &folder_queue,
+             &folder_batch_queue,
+             &ready_file_queue,
+             &stats](FlatFolderScanBatch batch) {
+                record_folder_ready_metadata_batch(recursive,
+                                                   folder_queue,
+                                                   folder_batch_queue,
+                                                   ready_file_queue,
+                                                   stats,
+                                                   std::move(batch),
+                                                   min_file_size_bytes,
+                                                   max_file_size_bytes);
+            });
+    } catch (...) {
+        const std::exception_ptr error = std::current_exception();
+        fail_flat_folder_work(folder_queue, error);
+        fail_folder_ready_work(folder_batch_queue, error);
+        fail_data_file_work(ready_file_queue, error);
     }
 }
 
@@ -7334,6 +7625,204 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
     snapshot.data_buffer_slots = pool_slots;
     snapshot.data_queue_depth = total_queue_depth;
+    return snapshot;
+}
+
+DataReadBenchmarkSnapshot run_parallel_folder_ready_discard_scan(const NfsMetaReaderConfig& meta_config,
+                                                                 const TargetDataWriterConfig& writer_config,
+                                                                 std::size_t file_discard_threads,
+                                                                 std::uint64_t min_file_size_bytes,
+                                                                 std::uint64_t max_file_size_bytes,
+                                                                 std::size_t max_files_queued,
+                                                                 double max_duration_seconds,
+                                                                 std::uint32_t stats_interval_seconds,
+                                                                 TargetWriterStats& writer_stats,
+                                                                 std::size_t& queue_capacity,
+                                                                 std::size_t& queue_high_watermark) {
+    FlatMetadataWorkQueue scan_folder_queue;
+    scan_folder_queue.folders.push_back(FileSpec{});
+    FolderReadyBatchQueue folder_batch_queue;
+    folder_batch_queue.max_entries = 4096U;
+    DataReadFileQueue ready_file_queue;
+    ready_file_queue.max_entries = std::max<std::size_t>(1U, max_files_queued);
+
+    DataReadBenchmarkStats stats;
+    stats.print_interval_seconds = std::max<std::uint32_t>(1U, stats_interval_seconds);
+    stats.folders_found.store(1U, std::memory_order_relaxed);
+    DirectTargetWriterStats discard_stats;
+    std::atomic<std::uint64_t> folders_created {0};
+
+    const auto started = std::chrono::steady_clock::now();
+    stats.started_at = started;
+    stats.last_print_at = started;
+    if (max_duration_seconds > 0.0) {
+        const auto stop_at = started +
+                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                 std::chrono::duration<double>(max_duration_seconds));
+        scan_folder_queue.stop_at = stop_at;
+        folder_batch_queue.stop_at = stop_at;
+        ready_file_queue.stop_at = stop_at;
+    }
+
+    std::mutex stop_timer_mutex;
+    std::condition_variable stop_timer_cv;
+    bool cancel_stop_timer = false;
+    std::thread stop_timer;
+    if (scan_folder_queue.stop_at.has_value()) {
+        const auto stop_at = *scan_folder_queue.stop_at;
+        stop_timer = std::thread([&]() {
+            std::unique_lock<std::mutex> lock(stop_timer_mutex);
+            const bool cancelled = stop_timer_cv.wait_until(lock, stop_at, [&]() {
+                return cancel_stop_timer;
+            });
+            if (!cancelled) {
+                request_flat_folder_stop(scan_folder_queue);
+                request_folder_ready_stop(folder_batch_queue);
+                request_data_file_stop(ready_file_queue);
+            }
+        });
+    }
+
+    std::thread stats_printer(run_folder_ready_discard_stats_printer,
+                              std::ref(stats),
+                              std::ref(folder_batch_queue),
+                              std::ref(ready_file_queue),
+                              std::cref(folders_created),
+                              std::cref(discard_stats));
+
+    std::exception_ptr pipeline_error;
+    const std::size_t folder_create_threads = target_data_writer_effective_worker_count(writer_config);
+    std::vector<std::thread> folder_workers;
+    folder_workers.reserve(folder_create_threads);
+    for (std::size_t index = 0; index < folder_create_threads; ++index) {
+        folder_workers.emplace_back([&, index]() {
+            TargetWriterBackend::Options options;
+            options.preserve_metadata = false;
+            options.fsync_on_finish = false;
+            options.ensure_parent_directories = false;
+            options.max_concurrent_file_transactions =
+                std::max<std::size_t>(1U, writer_config.max_concurrent_file_transactions);
+            auto backend = make_target_writer_backend(writer_config.target_root, index, options);
+            try {
+                while (true) {
+                    std::optional<FolderReadyFileBatch> batch = take_folder_ready_batch(folder_batch_queue);
+                    if (!batch.has_value()) {
+                        break;
+                    }
+                    if (!batch->directories.empty()) {
+                        backend->ensure_directories(batch->directories);
+                        folders_created.fetch_add(batch->directories.size(), std::memory_order_relaxed);
+                    }
+                    if (!batch->files.empty() &&
+                        !enqueue_data_read_files(ready_file_queue, std::move(batch->files))) {
+                        break;
+                    }
+                }
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                fail_folder_ready_work(folder_batch_queue, error);
+                fail_data_file_work(ready_file_queue, error);
+            }
+        });
+    }
+
+    const std::size_t sink_threads = std::max<std::size_t>(1U, file_discard_threads);
+    std::vector<std::thread> discard_workers;
+    discard_workers.reserve(sink_threads);
+    for (std::size_t index = 0; index < sink_threads; ++index) {
+        (void) index;
+        discard_workers.emplace_back([&]() {
+            try {
+                while (true) {
+                    std::vector<FileSpec> files = take_data_file_work_batch(ready_file_queue, 256U);
+                    if (files.empty()) {
+                        break;
+                    }
+                    std::uint64_t bytes = 0;
+                    for (const FileSpec& file : files) {
+                        bytes += file.declared_size != 0U ? file.declared_size : file.content.size();
+                    }
+                    stats.files_read.fetch_add(files.size(), std::memory_order_relaxed);
+                    stats.bytes_read.fetch_add(bytes, std::memory_order_relaxed);
+                    discard_stats.files_written.fetch_add(files.size(), std::memory_order_relaxed);
+                    discard_stats.bytes_written.fetch_add(bytes, std::memory_order_relaxed);
+                }
+            } catch (...) {
+                const std::exception_ptr error = std::current_exception();
+                fail_data_file_work(ready_file_queue, error);
+            }
+        });
+    }
+
+    const std::size_t metadata_threads = std::max<std::size_t>(1U, meta_config.worker_count);
+    std::vector<std::thread> metadata_workers;
+    metadata_workers.reserve(metadata_threads);
+    for (std::size_t index = 0; index < metadata_threads; ++index) {
+        metadata_workers.emplace_back(scan_folder_ready_metadata_worker,
+                                      meta_config.source_root,
+                                      meta_config.recursive,
+                                      std::max<std::size_t>(1U, meta_config.async_directory_depth),
+                                      meta_config.readdirplus_page_bytes,
+                                      min_file_size_bytes,
+                                      max_file_size_bytes,
+                                      std::ref(scan_folder_queue),
+                                      std::ref(folder_batch_queue),
+                                      std::ref(ready_file_queue),
+                                      std::ref(stats));
+    }
+
+    for (auto& worker : metadata_workers) {
+        worker.join();
+    }
+    mark_folder_ready_input_done(folder_batch_queue);
+    for (auto& worker : folder_workers) {
+        worker.join();
+    }
+    mark_data_file_input_done(ready_file_queue);
+    for (auto& worker : discard_workers) {
+        worker.join();
+    }
+
+    stats.printer_done.store(true, std::memory_order_relaxed);
+    stats.printer_cv.notify_all();
+    if (stats_printer.joinable()) {
+        stats_printer.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(stop_timer_mutex);
+        cancel_stop_timer = true;
+    }
+    stop_timer_cv.notify_all();
+    if (stop_timer.joinable()) {
+        stop_timer.join();
+    }
+
+    if (scan_folder_queue.error) {
+        std::rethrow_exception(scan_folder_queue.error);
+    }
+    if (folder_batch_queue.error) {
+        std::rethrow_exception(folder_batch_queue.error);
+    }
+    if (ready_file_queue.error) {
+        std::rethrow_exception(ready_file_queue.error);
+    }
+    if (pipeline_error) {
+        std::rethrow_exception(pipeline_error);
+    }
+
+    writer_stats = discard_stats.snapshot();
+    writer_stats.worker_count = sink_threads;
+    writer_stats.folders_written = folders_created.load(std::memory_order_relaxed);
+    queue_capacity = folder_batch_queue.max_entries;
+    queue_high_watermark = folder_batch_queue.high_watermark;
+
+    DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+    snapshot.folders_written = static_cast<std::size_t>(writer_stats.folders_written);
+    snapshot.folders_per_second = snapshot.elapsed_seconds > 0.0
+                                      ? static_cast<double>(snapshot.folders_written) / snapshot.elapsed_seconds
+                                      : 0.0;
+    snapshot.data_queue_depth = ready_file_queue.max_entries;
     return snapshot;
 }
 
@@ -11683,7 +12172,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       std::size_t data_writer_reactors,
                                                                       std::size_t reactors_per_ip,
                                                                       std::size_t data_writer_file_window,
-                                                                      bool mkdir_only) const {
+                                                                      bool mkdir_only,
+                                                                      bool folder_ready_discard) const {
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
@@ -11741,11 +12231,13 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
 
     DataReadBenchmarkReport report;
     report.meta_reader_async = meta_reader.using_async_backend();
-    report.data_reader_async = mkdir_only ? false : data_reader.using_async_backend();
+    report.data_reader_async = (mkdir_only || folder_ready_discard) ? false : data_reader.using_async_backend();
     report.meta_reader_threads = std::max<std::size_t>(1, meta_config.worker_count);
     report.metadata_async_depth = std::max<std::size_t>(1, meta_config.async_directory_depth);
     report.readdirplus_page_bytes = meta_config.readdirplus_page_bytes;
-    report.data_reader_threads = mkdir_only ? 0U : std::max<std::size_t>(1, data_config.data_reader_worker_count);
+    report.data_reader_threads = (mkdir_only || folder_ready_discard)
+                                     ? 0U
+                                     : std::max<std::size_t>(1, data_config.data_reader_worker_count);
     report.data_writer_threads = writer_config.direct_reactor_submit ? 0U
                                                                       : target_data_writer_effective_worker_count(writer_config);
     report.data_outstanding_requests = std::max<std::size_t>(1, data_config.outstanding_requests);
@@ -11785,6 +12277,19 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                 writer_stats,
                                                 queue_capacity,
                                                 queue_high_watermark);
+    } else if (folder_ready_discard) {
+        snapshot = run_parallel_folder_ready_discard_scan(meta_config,
+                                                          writer_config,
+                                                          data_reader_threads == 0U ? data_config.data_reader_worker_count
+                                                                                   : data_reader_threads,
+                                                          min_file_size_bytes,
+                                                          max_file_size_bytes,
+                                                          report.max_files_queued,
+                                                          max_duration_seconds,
+                                                          stats_interval_seconds,
+                                                          writer_stats,
+                                                          queue_capacity,
+                                                          queue_high_watermark);
     } else {
         snapshot = run_parallel_data_write_scan(meta_config,
                                                 data_config,
@@ -11817,7 +12322,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.folders_written = static_cast<std::size_t>(writer_stats.folders_written);
     report.folders_per_second = snapshot.folders_per_second;
     report.bytes_written = writer_stats.bytes_written;
-    report.data_queue_shards = mkdir_only ? 1U : (writer_config.direct_reactor_submit ? 0U : report.data_writer_threads);
+    report.data_queue_shards = (mkdir_only || folder_ready_discard)
+                                   ? 1U
+                                   : (writer_config.direct_reactor_submit ? 0U : report.data_writer_threads);
     report.data_queue_capacity = queue_capacity;
     report.data_queue_high_watermark = queue_high_watermark;
 
