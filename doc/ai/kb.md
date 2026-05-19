@@ -1634,3 +1634,26 @@ logical size: 335.99 TB
     - Hot small reached `64,874.6 files/s`, but medium/large writers made no progress until shutdown; final average only `42.05 Gbit/s`.
     - This suggests cleaner small VIPs help IOPS, but the bulk lane/folder target arrangement needs a separate stall diagnosis before it is usable.
   - Current conclusion: endpoint partitioning is implemented and measurable, but strict `.2-.9` / `.10-.17` is not the 200G/80K answer. It trades too much bulk bandwidth for modest small-file improvement in the normal configuration.
+
+- 2026-05-19 PDT mixed writer low-level NIC telemetry:
+  - Added reusable runner: `deploy/run-mixed-write-telemetry.sh`.
+  - Runner behavior:
+    - Resolves NIC dynamically with `ip route get $STORAGE_PROBE_IP` (default `172.27.255.2`).
+    - Captures `sudo ethtool -S $NIC` before/after.
+    - Runs `sar -n DEV 1 $SAMPLE_SECONDS` and `mpstat -P ALL 1 $SAMPLE_SECONDS`.
+    - Prints deltas for ethtool counters containing `drop`, `fifo`, `miss`, `discard`, `overrun`, or `alloc_fail`.
+    - Runs the standard 30s non-partitioned `folder-ready-mixed-write` benchmark unless overridden by env vars.
+  - agnopo telemetry output directory: `/tmp/hypersync-telemetry-mixed-telemetry-20260519T230448`.
+  - Resolved NIC: `ens3`.
+  - Benchmark result:
+    - Final interval: `190.72 Gbit/s`, true-small `47,975.5 files/s`, medium `34.42 Gbit/s`, large `132.28 Gbit/s`.
+    - Final average: `185.08 Gbit/s`, true-small `44,061 files/s`, zero failures.
+  - NIC error/drop delta: none nonzero for matching `drop|fifo|miss|discard|overrun|alloc_fail` counters.
+  - `sar -n DEV`:
+    - 35s average including idle/setup/teardown: `95,739.91 rxpck/s`, `378,914.66 txpck/s`, `15,073.03 rxkB/s`, `3,179,392.25 txkB/s`, `%ifutil 13.02`.
+    - Hot samples hit near line rate: about `2.89M txpck/s`, `0.73-0.76M rxpck/s`, `24.3GB/s tx`, `%ifutil 99.6-99.7`.
+  - `mpstat -P ALL`:
+    - Average across 80 CPUs: `5.15% usr`, `8.40% sys`, `1.66% soft`, `84.79% idle`.
+    - Top average softirq cores were CPUs `0-10`, roughly `4.5-6.4% soft`.
+    - Hot samples showed concentrated softirq spikes: CPU `7` up to `51.52% soft`, CPU `4` up to `48.48% soft`, CPU `6` up to `48.00% soft`.
+  - Interpretation: no persistent hardware ring/drop counter issue was observed. The run does hit physical line rate in hot seconds with very high PPS and concentrated softirq bursts. The remaining mixed-workload limit is more consistent with hot-second link/PPS/softirq pressure than with NIC drops.

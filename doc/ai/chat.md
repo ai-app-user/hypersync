@@ -1124,3 +1124,29 @@ Validation run 2, canonical/folder creation target moved to bulk VIPs `.10-.17`,
 - Zero failures, but not a viable combined-write setting.
 
 Conclusion: VIP segregation is implemented and does affect the small lane in the expected direction. A strict 8/8 split does not hit the combined target: small improves modestly in the normal run but total bandwidth falls because bulk only has half the VIPs. Moving folder creation off small VIPs improves small rate significantly, but exposes a bulk-lane progress/stall issue that needs separate diagnosis before using that mode.
+
+**User:** Asked to collect low-level packet and interrupt telemetry for the standard 30s integrated mixed writer run: dynamic NIC detection, ethtool before/after error deltas, PPS via `sar`, and core-by-core software interrupt via `mpstat`.
+
+**Codex:** Ran the standard non-partitioned `folder-ready-mixed-write` telemetry sweep on agnopo and added a reusable runner script: `deploy/run-mixed-write-telemetry.sh`.
+
+Telemetry run:
+- Output directory: `/tmp/hypersync-telemetry-mixed-telemetry-20260519T230448`
+- Resolved storage NIC: `ens3` from `ip route get 172.27.255.2`
+- Pipeline:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN-96]->(DataQueue-96x512)->[DataWriter-NFS-96] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+
+Benchmark result:
+- Final interval: `190.72 Gbit/s` total, `47,975.5` true-small files/s, `34.42 Gbit/s` medium, `132.28 Gbit/s` large.
+- Final average: `185.08 Gbit/s`, `44,061` true-small files/s, zero failures.
+
+Hardware/kernel telemetry:
+- `ethtool -S ens3` before/after error counters matching `drop|fifo|miss|discard|overrun|alloc_fail`: `none_nonzero`.
+- `sar -n DEV` average over the 35s capture: `95,739.91 rxpck/s`, `378,914.66 txpck/s`, `15,073.03 rxkB/s`, `3,179,392.25 txkB/s`, `%ifutil 13.02`.
+- Hot peak samples hit line rate:
+  - `23:05:23 ens3 744,279 rxpck/s 2,897,933 txpck/s 119,319 rxkB/s 24,334,934 txkB/s %ifutil 99.68`
+  - Neighboring hot samples were also around `2.89M txpck/s` and `%ifutil 99.6-99.7`.
+- `mpstat -P ALL` average: `5.15% usr`, `8.40% sys`, `1.66% soft`, `84.79% idle` across 80 CPUs.
+- Top average softirq cores were CPUs `0-10`, each roughly `4.5-6.4% soft`.
+- Hot samples showed individual interrupt cores spiking high, e.g. CPU `7` at `51.52% soft`, CPU `4` at `48.48% soft`, CPU `6` at `48.00% soft`.
+
+Conclusion: there were no NIC ring/drop counter deltas, but the hot `sar` samples show the physical link is reaching near `100% ifutil` with almost `2.9M tx packets/s`. The mixed writer bottleneck is consistent with hot-second NIC/link saturation and softirq concentration during the peak, not persistent hardware drops.
