@@ -6035,14 +6035,19 @@ void run_direct_data_buffer_write_stats_printer(DataReadBenchmarkStats& stats,
 
 void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
                                           DataReadFileQueue& small_queue,
+                                          DataReadFileQueue& medium_queue,
                                           DataReadFileQueue& large_queue,
                                           const DirectTargetWriterStats& small_writer,
+                                          const TargetDataWriterJob& medium_writer,
                                           const TargetDataWriterJob& large_writer) {
     const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
     const TargetWriterStats small_stats = small_writer.snapshot();
+    const TargetWriterStats medium_stats = medium_writer.stats();
     const TargetWriterStats large_stats = large_writer.stats();
-    const std::uint64_t total_bytes_written = small_stats.bytes_written + large_stats.bytes_written;
-    const std::uint64_t total_files_written = small_stats.files_written + large_stats.files_written;
+    const std::uint64_t total_bytes_written =
+        small_stats.bytes_written + medium_stats.bytes_written + large_stats.bytes_written;
+    const std::uint64_t total_files_written =
+        small_stats.files_written + medium_stats.files_written + large_stats.files_written;
     const double elapsed = snapshot.elapsed_seconds;
     const double small_write_gbps = elapsed > 0.0
                                         ? static_cast<double>(small_stats.bytes_written) * 8.0 /
@@ -6052,6 +6057,10 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
                                         ? static_cast<double>(large_stats.bytes_written) * 8.0 /
                                               elapsed / 1'000'000'000.0
                                         : 0.0;
+    const double medium_write_gbps = elapsed > 0.0
+                                         ? static_cast<double>(medium_stats.bytes_written) * 8.0 /
+                                               elapsed / 1'000'000'000.0
+                                         : 0.0;
     const double total_write_gbps = elapsed > 0.0
                                         ? static_cast<double>(total_bytes_written) * 8.0 /
                                               elapsed / 1'000'000'000.0
@@ -6062,12 +6071,17 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
     const double large_write_files_per_second = elapsed > 0.0
                                                     ? static_cast<double>(large_stats.files_written) / elapsed
                                                     : 0.0;
+    const double medium_write_files_per_second = elapsed > 0.0
+                                                     ? static_cast<double>(medium_stats.files_written) / elapsed
+                                                     : 0.0;
     const double total_write_files_per_second = elapsed > 0.0
                                                     ? static_cast<double>(total_files_written) / elapsed
                                                     : 0.0;
     std::cerr << "mixed_data_write_stats total_write_gigabits_per_second=" << total_write_gbps
               << " small_write_files_per_second=" << small_write_files_per_second
               << " small_write_gigabits_per_second=" << small_write_gbps
+              << " medium_write_gigabits_per_second=" << medium_write_gbps
+              << " medium_write_files_per_second=" << medium_write_files_per_second
               << " large_write_gigabits_per_second=" << large_write_gbps
               << " large_write_files_per_second=" << large_write_files_per_second
               << " total_write_files_per_second=" << total_write_files_per_second
@@ -6076,21 +6090,27 @@ void print_mixed_folder_ready_write_stats(const DataReadBenchmarkStats& stats,
               << " small_files_read=" << snapshot.small_files_read
               << " large_files_read=" << snapshot.large_files_read
               << " small_files_written=" << small_stats.files_written
+              << " medium_files_written=" << medium_stats.files_written
               << " large_files_written=" << large_stats.files_written
               << " files_failed=" << snapshot.files_failed
               << " small_write_failed=" << small_stats.files_failed
+              << " medium_write_failed=" << medium_stats.files_failed
               << " large_write_failed=" << large_stats.files_failed
               << " small_bytes_written=" << small_stats.bytes_written
+              << " medium_bytes_written=" << medium_stats.bytes_written
               << " large_bytes_written=" << large_stats.bytes_written
               << " queued_small_files=" << queued_data_read_files(small_queue)
+              << " queued_medium_files=" << queued_data_read_files(medium_queue)
               << " queued_large_files=" << queued_data_read_files(large_queue)
               << " elapsed_seconds=" << elapsed << '\n';
 }
 
 void run_mixed_folder_ready_write_stats_printer(DataReadBenchmarkStats& stats,
                                                 DataReadFileQueue& small_queue,
+                                                DataReadFileQueue& medium_queue,
                                                 DataReadFileQueue& large_queue,
                                                 const DirectTargetWriterStats& small_writer,
+                                                const TargetDataWriterJob& medium_writer,
                                                 const TargetDataWriterJob& large_writer) {
     const auto interval = std::chrono::seconds(stats.print_interval_seconds);
     std::unique_lock<std::mutex> lock(stats.printer_mutex);
@@ -6102,7 +6122,13 @@ void run_mixed_folder_ready_write_stats_printer(DataReadBenchmarkStats& stats,
         }
         std::lock_guard<std::mutex> print_lock(stats.print_mutex);
         stats.last_print_at = std::chrono::steady_clock::now();
-        print_mixed_folder_ready_write_stats(stats, small_queue, large_queue, small_writer, large_writer);
+        print_mixed_folder_ready_write_stats(stats,
+                                             small_queue,
+                                             medium_queue,
+                                             large_queue,
+                                             small_writer,
+                                             medium_writer,
+                                             large_writer);
     }
 }
 
@@ -6315,30 +6341,43 @@ bool enqueue_data_read_files(DataReadFileQueue& queue, std::vector<FileSpec>&& f
     return true;
 }
 
-bool enqueue_split_ready_files(SplitDataReadFileQueues& queues,
-                               std::vector<FileSpec>&& files,
-                               std::size_t& small_count,
-                               std::size_t& large_count,
-                               std::uint64_t& small_bytes,
-                               std::uint64_t& large_bytes) {
+bool enqueue_three_way_ready_files(DataReadFileQueue& small_queue,
+                                   DataReadFileQueue& medium_queue,
+                                   DataReadFileQueue& large_queue,
+                                   std::uint64_t small_threshold,
+                                   std::uint64_t medium_threshold,
+                                   std::vector<FileSpec>&& files,
+                                   std::size_t& small_count,
+                                   std::size_t& medium_count,
+                                   std::size_t& large_count,
+                                   std::uint64_t& small_bytes,
+                                   std::uint64_t& medium_bytes,
+                                   std::uint64_t& large_bytes) {
     std::vector<FileSpec> small_files;
+    std::vector<FileSpec> medium_files;
     std::vector<FileSpec> large_files;
     small_files.reserve(files.size());
+    medium_files.reserve(files.size());
     large_files.reserve(files.size());
     for (auto& file : files) {
         const std::uint64_t logical_size = file.declared_size != 0U ? file.declared_size : file.content.size();
-        if (logical_size <= queues.small_file_threshold) {
+        if (logical_size <= small_threshold) {
             small_bytes += logical_size;
             small_files.push_back(std::move(file));
+        } else if (logical_size <= medium_threshold) {
+            medium_bytes += logical_size;
+            medium_files.push_back(std::move(file));
         } else {
             large_bytes += logical_size;
             large_files.push_back(std::move(file));
         }
     }
     small_count += small_files.size();
+    medium_count += medium_files.size();
     large_count += large_files.size();
-    return enqueue_data_read_files(queues.small, std::move(small_files)) &&
-           enqueue_data_read_files(queues.large, std::move(large_files));
+    return enqueue_data_read_files(small_queue, std::move(small_files)) &&
+           enqueue_data_read_files(medium_queue, std::move(medium_files)) &&
+           enqueue_data_read_files(large_queue, std::move(large_files));
 }
 
 std::optional<FileSpec> take_data_file_work(DataReadFileQueue& queue) {
@@ -8299,10 +8338,16 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     FolderReadyBatchQueue folder_batch_queue;
     folder_batch_queue.max_entries = 4096U;
 
+    const std::uint64_t true_small_threshold = 128U * 1024U;
+    const std::uint64_t medium_threshold =
+        small_file_threshold == 0U ? (1024U * 1024U - 1U)
+                                   : std::max<std::uint64_t>(true_small_threshold, small_file_threshold);
     SplitDataReadFileQueues ready_queues;
-    ready_queues.small_file_threshold = small_file_threshold == 0U ? 128U * 1024U : small_file_threshold;
+    ready_queues.small_file_threshold = true_small_threshold;
     ready_queues.small.max_entries = std::max<std::size_t>(1U, max_files_queued);
     ready_queues.large.max_entries = std::max<std::size_t>(5'000'000U, max_files_queued);
+    DataReadFileQueue medium_ready_queue;
+    medium_ready_queue.max_entries = std::max<std::size_t>(1'000'000U, max_files_queued);
 
     DataReadBenchmarkStats stats;
     stats.print_interval_seconds = std::max<std::uint32_t>(1U, stats_interval_seconds);
@@ -8326,6 +8371,13 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     large_writer_config.worker_count = 160U;
     large_writer_config.async_window = 2U;
 
+    TargetDataWriterConfig medium_writer_config = writer_config;
+    medium_writer_config.ensure_parent_directories = false;
+    medium_writer_config.direct_reactor_submit = false;
+    medium_writer_config.direct_reactor_writes = false;
+    medium_writer_config.worker_count = 96U;
+    medium_writer_config.async_window = 2U;
+
     NfsDataReaderConfig small_data_config = data_config;
     small_data_config.pack_small_files = true;
     small_data_config.small_file_threshold = ready_queues.small_file_threshold;
@@ -8335,22 +8387,35 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     large_data_config.outstanding_requests = 2U;
     large_data_config.small_file_async_window = 2U;
     large_data_config.small_file_threshold = 0U;
+    NfsDataReaderConfig medium_data_config = data_config;
+    medium_data_config.pack_small_files = false;
+    medium_data_config.data_reader_worker_count = 96U;
+    medium_data_config.outstanding_requests = 2U;
+    medium_data_config.small_file_async_window = 2U;
+    medium_data_config.small_file_threshold = 0U;
 
     const std::size_t small_data_threads = std::max<std::size_t>(1U, small_data_config.data_reader_worker_count);
+    const std::size_t medium_data_threads = std::max<std::size_t>(1U, medium_data_config.data_reader_worker_count);
     const std::size_t large_data_threads = std::max<std::size_t>(1U, large_data_config.data_reader_worker_count);
+    const std::size_t medium_writer_threads = target_data_writer_effective_worker_count(medium_writer_config);
     const std::size_t large_writer_threads = target_data_writer_effective_worker_count(large_writer_config);
     const std::size_t large_queue_depth_per_shard =
         std::max<std::size_t>(1U, data_queue_depth == 0U ? 512U : data_queue_depth);
+    const std::size_t medium_queue_depth_per_shard = large_queue_depth_per_shard;
+    const std::size_t medium_total_queue_depth = medium_writer_threads * medium_queue_depth_per_shard;
     const std::size_t large_total_queue_depth = large_writer_threads * large_queue_depth_per_shard;
     const std::size_t minimum_pool_slots =
         small_data_threads + std::max<std::size_t>(64U, small_data_threads / 4U) + 1U +
+        medium_data_threads * std::max<std::size_t>(1U, medium_data_config.outstanding_requests) +
+        medium_total_queue_depth + medium_writer_threads +
         large_data_threads * std::max<std::size_t>(1U, large_data_config.outstanding_requests) +
         large_total_queue_depth + large_writer_threads;
-    const std::size_t default_pool_slots = minimum_pool_slots + large_data_threads * 4U;
+    const std::size_t default_pool_slots = minimum_pool_slots + (medium_data_threads + large_data_threads) * 4U;
     const std::size_t pool_slots =
         std::max<std::size_t>(minimum_pool_slots, data_buffer_slots == 0U ? default_pool_slots : data_buffer_slots);
 
     RawBufferPool data_pool = make_data_buffer_pool(pool_slots);
+    ShardedBufQueue medium_reader_to_writer(medium_writer_threads, medium_queue_depth_per_shard);
     ShardedBufQueue large_reader_to_writer(large_writer_threads, large_queue_depth_per_shard);
 
     TargetWriterBackend::Options small_direct_options;
@@ -8464,6 +8529,25 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         stats.files_failed.fetch_add(1U, std::memory_order_relaxed);
     });
 
+    NfsDataBufferReaderJob medium_reader_job(
+        medium_data_config,
+        data_pool,
+        medium_reader_to_writer,
+        make_file_provider(medium_ready_queue, SplitDataReadRoute::Large, 128U),
+        [&medium_ready_queue]() {
+            return data_read_timer_expired(medium_ready_queue);
+        });
+    medium_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
+        record_large_data_read_bytes(stats, bytes_read);
+    });
+    medium_reader_job.set_file_read_callback([&stats]() {
+        record_large_data_read_file(stats);
+    });
+    medium_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
+        stats.files_failed.fetch_add(1U, std::memory_order_relaxed);
+    });
+
+    TargetDataWriterJob medium_writer_job(medium_writer_config, data_pool, medium_reader_to_writer);
     TargetDataWriterJob large_writer_job(large_writer_config, data_pool, large_reader_to_writer);
 
     const auto started = std::chrono::steady_clock::now();
@@ -8476,6 +8560,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         scan_folder_queue.stop_at = stop_at;
         folder_batch_queue.stop_at = stop_at;
         ready_queues.small.stop_at = stop_at;
+        medium_ready_queue.stop_at = stop_at;
         ready_queues.large.stop_at = stop_at;
     }
 
@@ -8494,6 +8579,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                 request_flat_folder_stop(scan_folder_queue);
                 request_folder_ready_stop(folder_batch_queue);
                 request_data_file_stop(ready_queues.small);
+                request_data_file_stop(medium_ready_queue);
                 request_data_file_stop(ready_queues.large);
             }
         });
@@ -8502,8 +8588,10 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     std::thread stats_printer(run_mixed_folder_ready_write_stats_printer,
                               std::ref(stats),
                               std::ref(ready_queues.small),
+                              std::ref(medium_ready_queue),
                               std::ref(ready_queues.large),
                               std::cref(small_direct_writer_stats),
+                              std::cref(medium_writer_job),
                               std::cref(large_writer_job));
 
     const std::size_t folder_create_threads = target_data_writer_effective_worker_count(writer_config);
@@ -8530,34 +8618,45 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                     }
                     if (!batch->files.empty()) {
                         std::size_t small_count = 0;
+                        std::size_t medium_count = 0;
                         std::size_t large_count = 0;
                         std::uint64_t small_bytes = 0;
+                        std::uint64_t medium_bytes = 0;
                         std::uint64_t large_bytes = 0;
-                        if (!enqueue_split_ready_files(ready_queues,
-                                                       std::move(batch->files),
-                                                       small_count,
-                                                       large_count,
-                                                       small_bytes,
-                                                       large_bytes)) {
+                        if (!enqueue_three_way_ready_files(ready_queues.small,
+                                                           medium_ready_queue,
+                                                           ready_queues.large,
+                                                           true_small_threshold,
+                                                           medium_threshold,
+                                                           std::move(batch->files),
+                                                           small_count,
+                                                           medium_count,
+                                                           large_count,
+                                                           small_bytes,
+                                                           medium_bytes,
+                                                           large_bytes)) {
                             break;
                         }
                         stats.small_files_found.fetch_add(small_count, std::memory_order_relaxed);
-                        stats.large_files_found.fetch_add(large_count, std::memory_order_relaxed);
+                        stats.large_files_found.fetch_add(medium_count + large_count, std::memory_order_relaxed);
                         stats.small_logical_size_bytes.fetch_add(small_bytes, std::memory_order_relaxed);
-                        stats.large_logical_size_bytes.fetch_add(large_bytes, std::memory_order_relaxed);
+                        stats.large_logical_size_bytes.fetch_add(medium_bytes + large_bytes, std::memory_order_relaxed);
                     }
                 }
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 fail_folder_ready_work(folder_batch_queue, error);
                 fail_data_file_work(ready_queues.small, error);
+                fail_data_file_work(medium_ready_queue, error);
                 fail_data_file_work(ready_queues.large, error);
             }
         });
     }
 
+    medium_writer_job.start();
     large_writer_job.start();
     small_reader_job.start();
+    medium_reader_job.start();
     large_reader_job.start();
 
     const std::size_t metadata_threads = std::max<std::size_t>(1U, meta_config.worker_count);
@@ -8587,11 +8686,14 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         worker.join();
     }
     mark_data_file_input_done(ready_queues.small);
+    mark_data_file_input_done(medium_ready_queue);
     mark_data_file_input_done(ready_queues.large);
 
     try {
         small_reader_job.wait();
+        medium_reader_job.wait();
         large_reader_job.wait();
+        medium_writer_job.wait();
         large_writer_job.wait();
     } catch (...) {
         pipeline_error = std::current_exception();
@@ -8600,6 +8702,12 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
         } catch (...) {}
         try {
             large_reader_job.stop();
+        } catch (...) {}
+        try {
+            medium_reader_job.stop();
+        } catch (...) {}
+        try {
+            medium_writer_job.stop();
         } catch (...) {}
         try {
             large_writer_job.stop();
@@ -8630,6 +8738,9 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     if (ready_queues.small.error) {
         std::rethrow_exception(ready_queues.small.error);
     }
+    if (medium_ready_queue.error) {
+        std::rethrow_exception(medium_ready_queue.error);
+    }
     if (ready_queues.large.error) {
         std::rethrow_exception(ready_queues.large.error);
     }
@@ -8638,12 +8749,17 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     }
 
     const TargetWriterStats small_stats = small_direct_writer_stats.snapshot();
+    const TargetWriterStats medium_stats = medium_writer_job.stats();
     const TargetWriterStats large_stats = large_writer_job.stats();
-    writer_stats.worker_count = large_writer_threads;
-    writer_stats.buffers_processed = small_stats.buffers_processed + large_stats.buffers_processed;
-    writer_stats.files_written = small_stats.files_written + large_stats.files_written;
-    writer_stats.files_failed = small_stats.files_failed + large_stats.files_failed;
-    writer_stats.bytes_written = small_stats.bytes_written + large_stats.bytes_written;
+    writer_stats.worker_count = medium_writer_threads + large_writer_threads;
+    writer_stats.buffers_processed =
+        small_stats.buffers_processed + medium_stats.buffers_processed + large_stats.buffers_processed;
+    writer_stats.files_written =
+        small_stats.files_written + medium_stats.files_written + large_stats.files_written;
+    writer_stats.files_failed =
+        small_stats.files_failed + medium_stats.files_failed + large_stats.files_failed;
+    writer_stats.bytes_written =
+        small_stats.bytes_written + medium_stats.bytes_written + large_stats.bytes_written;
     writer_stats.folders_written = folders_created.load(std::memory_order_relaxed);
     queue_capacity = folder_batch_queue.max_entries;
     queue_high_watermark = folder_batch_queue.high_watermark;
@@ -8654,7 +8770,8 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
                                       ? static_cast<double>(snapshot.folders_written) / snapshot.elapsed_seconds
                                       : 0.0;
     snapshot.data_buffer_slots = pool_slots;
-    snapshot.data_queue_depth = ready_queues.small.max_entries + ready_queues.large.max_entries;
+    snapshot.data_queue_depth =
+        ready_queues.small.max_entries + medium_ready_queue.max_entries + ready_queues.large.max_entries;
     return snapshot;
 }
 
@@ -13136,7 +13253,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
         snapshot = run_parallel_folder_ready_mixed_write_scan(meta_config,
                                                               data_config,
                                                               writer_config,
-                                                              max_file_size_bytes == 0U ? 128U * 1024U
+                                                              max_file_size_bytes == 0U ? (1024U * 1024U - 1U)
                                                                                         : max_file_size_bytes,
                                                               report.max_files_queued,
                                                               data_buffer_slots,
