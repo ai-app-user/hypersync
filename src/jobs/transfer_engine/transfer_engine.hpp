@@ -523,7 +523,8 @@ public:
                                                                         std::size_t data_writer_file_window = 0,
                                                                         bool mkdir_only = false,
                                                                         bool folder_ready_discard = false,
-                                                                        bool folder_ready_write = false) const;
+                                                                        bool folder_ready_write = false,
+                                                                        bool folder_ready_mixed_write = false) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
                                                                       bool recursive = true,
                                                                       std::size_t meta_reader_threads = 0,

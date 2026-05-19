@@ -1522,7 +1522,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes|transport-discard|route-discard|sharded-discard] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--split-small-large] [--dual-scan-small-large] [--background-recon-scan] [--bucket-priority] [--morph-large-readers-to-small] [--small-file-threshold-bytes <n>] [--recon-meta-reader-threads <n>] [--recon-metadata-async-depth <n>] [--recon-page-sleep-us <n>] [--small-meta-reader-threads <n>] [--large-meta-reader-threads <n>] [--small-data-reader-threads <n>] [--large-data-reader-threads <n>] [--large-data-outstanding-requests <n>] [--pipeline-autoscale] [--large-reader-autoscale] [--large-reader-initial-threads <n>] [--autoscale-interval-ms <n>] [--autoscale-profile <name>] [--autoscale-settings <path>] [--max-file-size-bytes <n>] [--pack-small-files] [--max-files-queued <n>] [--small-max-files-queued <n>] [--large-max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-copy-mode copy|no-copy] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-data-write --source <dir|nfs-url|synthetic-profile-url> --target <dir|nfs-url> [--mode data|mkdir-only|folder-ready-discard|folder-ready-write] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-writer-threads <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--data-writer-stable-small-writes] [--data-writer-tcp-cork] [--data-writer-direct-reactors] [--data-writer-direct-submit] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--min-file-size-bytes <n>] [--max-file-size-bytes <n>] [--pack-small-files] [--skip-target-metadata] [--no-target-fsync] [--assume-target-directories] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <per-shard>] [--data-copy-mode copy|no-copy] [--verify-hash] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-data-write --source <dir|nfs-url|synthetic-profile-url> --target <dir|nfs-url> [--mode data|mkdir-only|folder-ready-discard|folder-ready-write|folder-ready-mixed-write] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--data-reader-threads <n>] [--data-writer-threads <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--data-writer-stable-small-writes] [--data-writer-tcp-cork] [--data-writer-direct-reactors] [--data-writer-direct-submit] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--min-file-size-bytes <n>] [--max-file-size-bytes <n>] [--pack-small-files] [--skip-target-metadata] [--no-target-fsync] [--assume-target-directories] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <per-shard>] [--data-copy-mode copy|no-copy] [--verify-hash] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-data-hash --source <dir|nfs-url> [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--small-file-async-window <n>] [--pack-small-files] [--hash-threads <n>] [--hash-work-factor <n>] [--max-files-queued <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-profile [--file-count <n>] [--block-file-count <n>] [--small-ratio-shift-threshold <n>] [--seed <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-replay --profile <profile.txt> [--max-files <n>] [--file-count-scale <n>] [--data-size-scale <n>] [--latency-emulation] [--with-payload] [--stats-interval-seconds <n>]\n"
@@ -3397,6 +3397,7 @@ int main(int argc, char** argv) {
             bool mkdir_only = false;
             bool folder_ready_discard = false;
             bool folder_ready_write = false;
+            bool folder_ready_mixed_write = false;
             double max_duration_seconds = 0.0;
             std::uint32_t stats_interval_seconds = 5;
 
@@ -3411,23 +3412,33 @@ int main(int argc, char** argv) {
                         mkdir_only = false;
                         folder_ready_discard = false;
                         folder_ready_write = false;
+                        folder_ready_mixed_write = false;
                     } else if (mode == "mkdir-only" || mode == "mkdir" || mode == "dirs-only" ||
                                mode == "directories-only") {
                         mkdir_only = true;
                         folder_ready_discard = false;
                         folder_ready_write = false;
+                        folder_ready_mixed_write = false;
                     } else if (mode == "folder-ready-discard" || mode == "folder-gated-discard" ||
                                mode == "mkdir-gated-discard") {
                         mkdir_only = false;
                         folder_ready_discard = true;
                         folder_ready_write = false;
+                        folder_ready_mixed_write = false;
                     } else if (mode == "folder-ready-write" || mode == "folder-gated-write" ||
                                mode == "mkdir-gated-write") {
                         mkdir_only = false;
                         folder_ready_discard = false;
                         folder_ready_write = true;
+                        folder_ready_mixed_write = false;
+                    } else if (mode == "folder-ready-mixed-write" || mode == "folder-gated-mixed-write" ||
+                               mode == "mixed-folder-ready-write" || mode == "mixed-write") {
+                        mkdir_only = false;
+                        folder_ready_discard = false;
+                        folder_ready_write = false;
+                        folder_ready_mixed_write = true;
                     } else {
-                        throw std::runtime_error("--mode must be data, mkdir-only, folder-ready-discard, or folder-ready-write");
+                        throw std::runtime_error("--mode must be data, mkdir-only, folder-ready-discard, folder-ready-write, or folder-ready-mixed-write");
                     }
                 } else if (args[i] == "--non-recursive") {
                     recursive = false;
@@ -3568,12 +3579,16 @@ int main(int argc, char** argv) {
                                                                      data_writer_file_window,
                                                                      mkdir_only,
                                                                      folder_ready_discard,
-                                                                     folder_ready_write);
+                                                                     folder_ready_write,
+                                                                     folder_ready_mixed_write);
             const char* mode_name = mkdir_only
                                         ? "mkdir-only"
                                         : (folder_ready_discard
                                                ? "folder-ready-discard"
-                                               : (folder_ready_write ? "folder-ready-write" : "data"));
+                                               : (folder_ready_write
+                                                      ? "folder-ready-write"
+                                                      : (folder_ready_mixed_write ? "folder-ready-mixed-write"
+                                                                                  : "data")));
             std::cout << "data_write_benchmark mode=" << mode_name
                       << " files_found=" << report.files_found
                       << " folders_found=" << report.folders_found
@@ -3588,6 +3603,14 @@ int main(int argc, char** argv) {
                       << " bytes_written=" << report.bytes_written
                       << " read_gigabits_per_second=" << report.gigabits_per_second
                       << " files_per_second=" << report.files_per_second
+                      << " small_files_found=" << report.small_files_found
+                      << " large_files_found=" << report.large_files_found
+                      << " small_files_read=" << report.small_files_read
+                      << " large_files_read=" << report.large_files_read
+                      << " small_files_per_second=" << report.small_files_per_second
+                      << " large_files_per_second=" << report.large_files_per_second
+                      << " small_gigabits_per_second=" << report.small_gigabits_per_second
+                      << " large_gigabits_per_second=" << report.large_gigabits_per_second
                       << " meta_reader_threads=" << report.meta_reader_threads
                       << " metadata_async_depth=" << report.metadata_async_depth
                       << " readdirplus_page_bytes=" << report.readdirplus_page_bytes
