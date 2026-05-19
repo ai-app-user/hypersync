@@ -1605,3 +1605,15 @@ logical size: 335.99 TB
     - Medium queue `1M`: `189.8 Gbit/s`, true small `~11.8K files/s`; medium queue filled and blocked classifier progress.
     - Medium queue `5M`: `189.7 Gbit/s`, true small hot `47.4K files/s`, medium `41.0 Gbit/s`, large `125.0 Gbit/s`, zero failures.
   - Interpretation: three lanes fix the correctness/priority model better than the `<1MiB` two-lane split, but current fixed medium/large knobs still do not reach the separate-lane `206 Gbit/s` proof. Avoid using `<1MiB` as the small lane; keep true small at `<=128KiB`.
+
+- 2026-05-19 PDT nonblocking mixed spillway fork:
+  - Commit `555a7fe` changed `folder-ready-mixed-write` so the classifier never blocks on full medium/large ready queues. Small files remain direct. Medium/large files first try the bounded ready queue and overflow into `ReadyFileSpillway`; background drainer threads refill the ready queues later.
+  - Stats include `spill_medium_files` and `spill_large_files`.
+  - Tested pipeline:
+    `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN-96]->(DataQueue-96x512)->[DataWriter-NFS-96] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+  - agnopo 30s result, synthetic profiled source, all 16 target IPs, zero failures:
+    - Final interval: `190.09 Gbit/s` total, true-small `48,259.8 files/s`, medium `36.02 Gbit/s`, large `129.9 Gbit/s`.
+    - Final summary: `1,707,593` files written, `756.39 GB`, `183.34 Gbit/s` average, `51,736 files/s` average.
+    - Medium queue/spillway behavior: `spill_medium_files` reached `4,293,251`, proving overflow absorbed backlog instead of blocking classifier; small queue stayed empty/fluid.
+  - Interpretation: spillway solved synchronous classifier HOL on medium/large lanes, but integrated true-small rate still stayed around `48K` rather than the separate-pipeline `75K+`. The remaining gap is likely shared upstream/folder-ready ordering and/or target namespace/server-side interaction. Optional mixed namespace isolation is still not implemented.

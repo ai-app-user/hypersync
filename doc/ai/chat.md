@@ -1067,3 +1067,29 @@ Results:
 - With medium queue `5M`, classifier starvation was fixed: hot-window total `189.7 Gbit/s`, true small `47.4K files/s`, medium `41.0 Gbit/s`, large `125.0 Gbit/s`, zero failures.
 
 Conclusion: three lanes are functionally correct and preserve true-small priority better than the `<1MiB` two-lane split, but current fixed knobs do not beat the simpler integrated two-lane `<=128KiB / >128KiB` result (`~181.6 Gbit/s`, hot small `48-57K files/s`) enough to justify the extra complexity yet. The remaining gap to the separate-lane `206 Gbit/s` proof appears to be tuning/backpressure on medium/large, not the small lane itself.
+
+**User:** Asked to remove head-of-line blocking in the integrated mixed writer by making the medium/large fork non-blocking, with dynamic spillways and a background drainer. Small files must never be blocked by full medium/large queues.
+
+**Codex:** Implemented a non-blocking spillway fork in `folder-ready-mixed-write` and pushed dev commit `555a7fe`.
+
+Updated pipeline tested on agnopo:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN-96]->(DataQueue-96x512)->[DataWriter-NFS-96] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+
+Implementation notes:
+- Small files still use the direct blocking/high-priority path.
+- Medium and large ready queues now use bounded non-blocking enqueue. Overflow goes to `ReadyFileSpillway`.
+- A background drainer moves spillway records back into medium/large ready queues when capacity is available.
+- Stats now print `spill_medium_files` and `spill_large_files`.
+
+Verification:
+- Local `make -j8 unit-test` passed (`74/74`).
+- Remote build deployed via git to agnopo at commit `555a7fe`.
+- 30s agnopo run, synthetic profiled source, all 16 target IPs, zero failures:
+  - Final interval: `190.09 Gbit/s` total.
+  - Hot true-small rate: `48,259.8 files/s`, `24.17 Gbit/s`.
+  - Medium lane: `7,626 files/s`, `36.02 Gbit/s`.
+  - Large lane: `309 files/s`, `129.9 Gbit/s`.
+  - Final summary: `1,707,593` files written, `756.39 GB`, `183.34 Gbit/s` average, `51,736 files/s` average.
+  - Queue/spillway proof: medium queue hit cap and drained, while `spill_medium_files` grew to `4,293,251`; small queue stayed at `0` and continued flowing.
+
+Conclusion: spillway fixed the classifier HOL blocking symptom. Full medium queues no longer trap small files behind synchronous push. However, it did not recover the separate-pipeline `75K+` small-file rate; the integrated run stayed around `48K` true-small files/s and `190G`. Remaining gap is likely shared upstream/folder-ready ordering and target namespace/server-side interaction rather than the medium/large queue push itself. Optional namespace isolation was not implemented in this commit.
