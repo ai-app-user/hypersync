@@ -219,6 +219,7 @@ public:
         bool fsync_on_finish = true;
         bool ensure_parent_directories = true;
         bool stable_small_file_writes = false;
+        bool direct_reactor_lane = false;
         std::size_t max_concurrent_file_transactions = 64;
     };
 

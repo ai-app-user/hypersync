@@ -5748,7 +5748,8 @@ public:
         : root_url_(std::move(root_url)),
           endpoint_index_(endpoint_index),
           options_(options),
-          reactor_fleet_(shared_target_write_reactor_fleet(root_url_, options_)) {
+          reactor_fleet_(options_.direct_reactor_lane ? nullptr
+                                                       : shared_target_write_reactor_fleet(root_url_, options_)) {
         known_directories_.insert("");
     }
 
@@ -5874,6 +5875,10 @@ public:
     }
 
     void write_files(const std::vector<WriteChunk>& files) override {
+        if (options_.direct_reactor_lane) {
+            write_files_inline(files);
+            return;
+        }
         reactor_fleet_->write_files(files);
     }
 
@@ -6072,6 +6077,214 @@ private:
         auto* handle = static_cast<struct nfsfh*>(open_state.data);
         open_handles_.emplace(rel_path, handle);
         return handle;
+    }
+
+    struct InlineFileTransaction {
+        enum class Phase { queued, creating, writing, syncing, closing, done };
+
+        const WriteChunk* file = nullptr;
+        std::string rel_path;
+        std::string remote_path;
+        std::size_t bytes_written = 0;
+        struct nfsfh* handle = nullptr;
+        AsyncCommandState create_state;
+        AsyncCommandState write_state;
+        AsyncCommandState sync_state;
+        AsyncCommandState close_state;
+        Phase phase = Phase::queued;
+    };
+
+    void queue_inline_create(InlineFileTransaction& transaction) {
+        transaction.phase = InlineFileTransaction::Phase::creating;
+        transaction.create_state = {};
+        transaction.create_state.queued_at = std::chrono::steady_clock::now();
+        const int queue_result = nfs_create_async(legacy_session().context(),
+                                                  transaction.remote_path.c_str(),
+                                                  O_TRUNC,
+                                                  static_cast<int>(transaction.file->spec.mode),
+                                                  generic_nfs_callback,
+                                                  &transaction.create_state);
+        if (queue_result != 0) {
+            throw std::runtime_error("nfs_create_async queue failed: " +
+                                     std::string(nfs_get_error(legacy_session().context())));
+        }
+    }
+
+    void queue_inline_write(InlineFileTransaction& transaction) {
+        transaction.phase = InlineFileTransaction::Phase::writing;
+        transaction.write_state = {};
+        transaction.write_state.queued_at = std::chrono::steady_clock::now();
+        const std::size_t remaining = transaction.file->data.size() - transaction.bytes_written;
+        int queue_result = 0;
+        if (options_.stable_small_file_writes) {
+            auto* rpc = nfs_get_rpc_context(legacy_session().context());
+            auto* raw_handle = reinterpret_cast<struct nfs_fh3*>(nfs_get_fh(transaction.handle));
+            if (rpc == nullptr || raw_handle == nullptr) {
+                throw std::runtime_error("nfs raw stable write handle is unavailable");
+            }
+            queue_result = rpc_nfs_write_async(rpc,
+                                               raw_write_callback,
+                                               raw_handle,
+                                               const_cast<char*>(transaction.file->data.data() + transaction.bytes_written),
+                                               transaction.file->offset + transaction.bytes_written,
+                                               remaining,
+                                               FILE_SYNC,
+                                               &transaction.write_state);
+        } else {
+            queue_result = nfs_pwrite_async(legacy_session().context(),
+                                            transaction.handle,
+                                            transaction.file->offset + transaction.bytes_written,
+                                            remaining,
+                                            transaction.file->data.data() + transaction.bytes_written,
+                                            generic_nfs_callback,
+                                            &transaction.write_state);
+        }
+        if (queue_result != 0) {
+            throw std::runtime_error(std::string(options_.stable_small_file_writes
+                                                     ? "rpc_nfs_write_async queue failed: "
+                                                     : "nfs_pwrite_async queue failed: ") +
+                                     std::string(nfs_get_error(legacy_session().context())));
+        }
+    }
+
+    void queue_inline_sync(InlineFileTransaction& transaction) {
+        transaction.phase = InlineFileTransaction::Phase::syncing;
+        transaction.sync_state = {};
+        transaction.sync_state.queued_at = std::chrono::steady_clock::now();
+        const int queue_result =
+            nfs_fsync_async(legacy_session().context(), transaction.handle, generic_nfs_callback, &transaction.sync_state);
+        if (queue_result != 0) {
+            throw std::runtime_error("nfs_fsync_async queue failed: " +
+                                     std::string(nfs_get_error(legacy_session().context())));
+        }
+    }
+
+    void queue_inline_close(InlineFileTransaction& transaction) {
+        transaction.phase = InlineFileTransaction::Phase::closing;
+        transaction.close_state = {};
+        transaction.close_state.queued_at = std::chrono::steady_clock::now();
+        const int queue_result =
+            nfs_close_async(legacy_session().context(), transaction.handle, generic_nfs_callback, &transaction.close_state);
+        if (queue_result != 0) {
+            throw std::runtime_error("nfs_close_async queue failed: " +
+                                     std::string(nfs_get_error(legacy_session().context())));
+        }
+    }
+
+    void write_files_inline(const std::vector<WriteChunk>& files) {
+        if (files.empty()) {
+            return;
+        }
+
+        std::deque<const WriteChunk*> backlog;
+        for (const WriteChunk& file : files) {
+            backlog.push_back(&file);
+        }
+        std::vector<InlineFileTransaction> active;
+        active.reserve(std::min<std::size_t>(options_.max_concurrent_file_transactions, files.size()));
+        const std::size_t max_active = std::max<std::size_t>(1U, options_.max_concurrent_file_transactions);
+
+        auto fill_window = [&]() {
+            while (!backlog.empty() && active.size() < max_active) {
+                const WriteChunk* file = backlog.front();
+                backlog.pop_front();
+                InlineFileTransaction transaction;
+                transaction.file = file;
+                transaction.rel_path = normalize_path(file->spec.rel_path);
+                transaction.remote_path = "/" + transaction.rel_path;
+                if (options_.ensure_parent_directories) {
+                    ensure_directory_chain(parent_path(transaction.rel_path));
+                }
+                queue_inline_create(transaction);
+                active.push_back(std::move(transaction));
+            }
+        };
+
+        fill_window();
+        while (!active.empty() || !backlog.empty()) {
+            service_nfs_context(legacy_session().context(), active.empty() ? 1 : 0);
+            for (auto it = active.begin(); it != active.end();) {
+                InlineFileTransaction& transaction = *it;
+                try {
+                    if (transaction.phase == InlineFileTransaction::Phase::creating && transaction.create_state.done) {
+                        if (transaction.create_state.status < 0) {
+                            throw std::runtime_error("nfs_create_async failed: " + transaction.create_state.error);
+                        }
+                        transaction.handle = static_cast<struct nfsfh*>(transaction.create_state.data);
+                        if (transaction.handle == nullptr) {
+                            throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
+                        }
+                        if (transaction.file->data.empty()) {
+                            queue_inline_close(transaction);
+                        } else {
+                            queue_inline_write(transaction);
+                        }
+                    }
+                    if (transaction.phase == InlineFileTransaction::Phase::writing && transaction.write_state.done) {
+                        if (options_.stable_small_file_writes) {
+                            if (transaction.write_state.status != RPC_STATUS_SUCCESS) {
+                                throw std::runtime_error("rpc_nfs_write_async failed: " + transaction.write_state.error);
+                            }
+                            if (transaction.write_state.nfs_status != NFS3_OK) {
+                                throw std::runtime_error("rpc_nfs_write_async returned NFS error " +
+                                                         std::to_string(transaction.write_state.nfs_status));
+                            }
+                            const std::size_t remaining = transaction.file->data.size() - transaction.bytes_written;
+                            const std::size_t written = transaction.write_state.byte_count;
+                            if (written == 0U || written > remaining) {
+                                throw std::runtime_error("rpc_nfs_write_async short write count=" +
+                                                         std::to_string(written) + " remaining=" +
+                                                         std::to_string(remaining));
+                            }
+                            transaction.bytes_written += written;
+                        } else {
+                            if (transaction.write_state.status < 0) {
+                                throw std::runtime_error("nfs_pwrite_async failed: " + transaction.write_state.error);
+                            }
+                            const std::size_t remaining = transaction.file->data.size() - transaction.bytes_written;
+                            const std::size_t written = static_cast<std::size_t>(transaction.write_state.status);
+                            if (written == 0U || written > remaining) {
+                                throw std::runtime_error("nfs_pwrite_async short write");
+                            }
+                            transaction.bytes_written += written;
+                        }
+                        if (transaction.bytes_written < transaction.file->data.size()) {
+                            queue_inline_write(transaction);
+                        } else if (options_.fsync_on_finish) {
+                            queue_inline_sync(transaction);
+                        } else {
+                            queue_inline_close(transaction);
+                        }
+                    }
+                    if (transaction.phase == InlineFileTransaction::Phase::syncing && transaction.sync_state.done) {
+                        if (transaction.sync_state.status < 0) {
+                            throw std::runtime_error("nfs_fsync_async failed: " + transaction.sync_state.error);
+                        }
+                        queue_inline_close(transaction);
+                    }
+                    if (transaction.phase == InlineFileTransaction::Phase::closing && transaction.close_state.done) {
+                        if (transaction.close_state.status < 0) {
+                            throw std::runtime_error("nfs_close_async failed: " + transaction.close_state.error);
+                        }
+                        transaction.handle = nullptr;
+                        if (options_.preserve_metadata) {
+                            apply_remote_metadata(transaction.remote_path, transaction.file->spec);
+                        }
+                        it = active.erase(it);
+                        fill_window();
+                        continue;
+                    }
+                } catch (...) {
+                    if (transaction.handle != nullptr) {
+                        nfs_close(legacy_session().context(), transaction.handle);
+                        transaction.handle = nullptr;
+                    }
+                    throw;
+                }
+                ++it;
+            }
+            fill_window();
+        }
     }
 
     std::string root_url_;

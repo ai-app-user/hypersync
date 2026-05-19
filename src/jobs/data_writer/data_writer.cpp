@@ -2,7 +2,13 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <thread>
 #include <utility>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 #include "common/config.hpp"
 #include "common/path_utils.hpp"
@@ -37,6 +43,21 @@ namespace {
     path.push_back('/');
     path.append(child);
     return path;
+}
+
+void pin_current_thread_to_cpu(std::size_t cpu_index) noexcept {
+#if defined(__linux__)
+    const unsigned int cpu_count = std::thread::hardware_concurrency();
+    if (cpu_count == 0U) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(static_cast<int>(cpu_index % cpu_count), &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)cpu_index;
+#endif
 }
 
 }  // namespace
@@ -150,7 +171,7 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
 
 std::size_t target_data_writer_effective_worker_count(const TargetDataWriterConfig& config) {
     const std::size_t configured = std::max<std::size_t>(1U, config.worker_count);
-    if (is_nfs_url(config.target_root)) {
+    if (config.direct_reactor_writes && is_nfs_url(config.target_root)) {
         return std::min<std::size_t>(configured, 16U);
     }
     return configured;
@@ -335,7 +356,11 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     options.fsync_on_finish = config_.fsync_on_finish;
     options.ensure_parent_directories = config_.ensure_parent_directories;
     options.stable_small_file_writes = config_.stable_small_file_writes;
+    options.direct_reactor_lane = config_.direct_reactor_writes && is_nfs_url(config_.target_root);
     options.max_concurrent_file_transactions = config_.max_concurrent_file_transactions;
+    if (options.direct_reactor_lane) {
+        pin_current_thread_to_cpu(worker_index);
+    }
     auto backend = make_target_writer_backend(config_.target_root, worker_index, options);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
