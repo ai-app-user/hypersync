@@ -36,6 +36,7 @@ public:
     using BytesReadCallback = std::function<void(std::uint64_t)>;
     using FileReadCallback = std::function<void()>;
     using FileFailedCallback = std::function<void(const FileSpec&)>;
+    using BufferConsumer = std::function<bool(std::size_t worker_index, const BufferHandle& handle)>;
     using StopPredicate = std::function<bool()>;
 
     NfsDataBufferReaderJob(NfsDataReaderConfig config,
@@ -46,6 +47,11 @@ public:
     NfsDataBufferReaderJob(NfsDataReaderConfig config,
                            RawBufferPool& data_pool,
                            ShardedBufQueue& output,
+                           FileProvider file_provider,
+                           StopPredicate stop_predicate = {});
+    NfsDataBufferReaderJob(NfsDataReaderConfig config,
+                           RawBufferPool& data_pool,
+                           BufferConsumer output,
                            FileProvider file_provider,
                            StopPredicate stop_predicate = {});
     ~NfsDataBufferReaderJob() override;
@@ -80,6 +86,7 @@ private:
     RawBufferPool& data_pool_;
     BufQueue* output_ = nullptr;
     ShardedBufQueue* sharded_output_ = nullptr;
+    BufferConsumer direct_output_;
     FileProvider file_provider_;
     StopPredicate stop_predicate_;
     BytesReadCallback bytes_read_callback_;

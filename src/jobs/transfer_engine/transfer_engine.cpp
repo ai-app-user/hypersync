@@ -62,6 +62,7 @@
 #include "common/state_machine.hpp"
 #include "common/version.hpp"
 #include "common/watermarks.hpp"
+#include "core/data_buffer_codec.hpp"
 #include "core/pipeline_buffers.hpp"
 #include "jobs/buffer_discarder/buffer_discarder.hpp"
 #include "jobs/buffer_generator/buffer_generator.hpp"
@@ -5849,6 +5850,71 @@ void run_data_buffer_write_stats_printer(DataReadBenchmarkStats& stats,
     }
 }
 
+struct DirectTargetWriterStats {
+    std::atomic<std::uint64_t> buffers_processed {0};
+    std::atomic<std::uint64_t> files_written {0};
+    std::atomic<std::uint64_t> files_failed {0};
+    std::atomic<std::uint64_t> bytes_written {0};
+
+    [[nodiscard]] TargetWriterStats snapshot() const {
+        TargetWriterStats out;
+        out.worker_count = 0;
+        out.buffers_processed = buffers_processed.load(std::memory_order_acquire);
+        out.files_written = files_written.load(std::memory_order_acquire);
+        out.files_failed = files_failed.load(std::memory_order_acquire);
+        out.bytes_written = bytes_written.load(std::memory_order_acquire);
+        return out;
+    }
+};
+
+void print_direct_data_buffer_write_stats(const DataReadBenchmarkStats& stats,
+                                          DataReadFileQueue& file_queue,
+                                          const DirectTargetWriterStats& writer) {
+    const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
+    const TargetWriterStats writer_stats = writer.snapshot();
+    const double write_gbps = snapshot.elapsed_seconds > 0.0
+                                  ? static_cast<double>(writer_stats.bytes_written) * 8.0 /
+                                        snapshot.elapsed_seconds / 1'000'000'000.0
+                                  : 0.0;
+    const double write_files_per_second = snapshot.elapsed_seconds > 0.0
+                                              ? static_cast<double>(writer_stats.files_written) /
+                                                    snapshot.elapsed_seconds
+                                              : 0.0;
+    std::cerr << "data_write_stats read_gigabits_per_second=" << snapshot.gigabits_per_second
+              << " read_files_per_second=" << snapshot.files_per_second
+              << " write_gigabits_per_second=" << write_gbps
+              << " write_files_per_second=" << write_files_per_second
+              << " files_found=" << snapshot.files_found
+              << " files_read=" << snapshot.files_read
+              << " files_written=" << writer_stats.files_written
+              << " files_failed=" << snapshot.files_failed
+              << " write_failed=" << writer_stats.files_failed
+              << " bytes_read=" << snapshot.bytes_read
+              << " bytes_written=" << writer_stats.bytes_written
+              << " queued_files=" << queued_data_read_files(file_queue)
+              << " data_queue_depth=0"
+              << " data_queue_high_watermark=0"
+              << " data_queue_shards=0"
+              << " elapsed_seconds=" << snapshot.elapsed_seconds << '\n';
+}
+
+void run_direct_data_buffer_write_stats_printer(DataReadBenchmarkStats& stats,
+                                                DataReadFileQueue& file_queue,
+                                                const DirectTargetWriterStats& writer) {
+    const auto interval = std::chrono::seconds(stats.print_interval_seconds);
+    std::unique_lock<std::mutex> lock(stats.printer_mutex);
+    while (true) {
+        if (stats.printer_cv.wait_for(lock, interval, [&stats] {
+                return stats.printer_done.load(std::memory_order_relaxed);
+            })) {
+            break;
+        }
+        std::lock_guard<std::mutex> print_lock(stats.print_mutex);
+        stats.last_print_at = std::chrono::steady_clock::now();
+        print_direct_data_buffer_write_stats(stats, file_queue, writer);
+    }
+}
+
 void print_nfs_open_stats(const DataReadBenchmarkStats& stats, DataReadFileQueue& file_queue) {
     const DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
     const NfsAsyncCommandLatencySnapshot command_latency = snapshot_nfs_async_command_latency_metrics();
@@ -6874,26 +6940,106 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     reset_nfs_async_read_latency_metrics();
 
     const std::size_t data_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
-    const std::size_t writer_threads = target_data_writer_effective_worker_count(writer_config);
+    const bool direct_reactor_submit = writer_config.direct_reactor_submit && is_nfs_url(writer_config.target_root) &&
+                                       data_config.pack_small_files;
+    const std::size_t writer_threads = direct_reactor_submit ? 0U : target_data_writer_effective_worker_count(writer_config);
     const std::size_t outstanding = std::max<std::size_t>(1, data_config.outstanding_requests);
     const std::size_t metadata_threads = std::max<std::size_t>(1, meta_config.worker_count);
     const std::size_t queue_depth_per_shard =
         std::max<std::size_t>(1, data_queue_depth == 0 ? std::max<std::size_t>(64, outstanding * 4U)
                                                        : data_queue_depth);
-    const std::size_t total_queue_depth = writer_threads * queue_depth_per_shard;
+    const std::size_t total_queue_depth = direct_reactor_submit ? 0U : writer_threads * queue_depth_per_shard;
     const std::size_t pool_slots =
-        std::max<std::size_t>(data_threads * outstanding + total_queue_depth + writer_threads + 1U,
+        std::max<std::size_t>(data_threads * outstanding + total_queue_depth + std::max<std::size_t>(1U, writer_threads) + 1U,
                               data_buffer_slots == 0 ? data_threads * outstanding * 3U + total_queue_depth + 1U
                                                      : data_buffer_slots);
 
     RawBufferPool data_pool = make_data_buffer_pool(pool_slots);
-    ShardedBufQueue reader_to_writer(writer_threads, queue_depth_per_shard);
+    std::unique_ptr<ShardedBufQueue> reader_to_writer;
+    if (!direct_reactor_submit) {
+        reader_to_writer = std::make_unique<ShardedBufQueue>(writer_threads, queue_depth_per_shard);
+    }
 
-    NfsDataBufferReaderJob data_reader_job(
-        data_config,
-        data_pool,
-        reader_to_writer,
-        [&file_queue]() {
+    TargetWriterBackend::Options direct_options;
+    direct_options.preserve_metadata = writer_config.preserve_metadata;
+    direct_options.fsync_on_finish = writer_config.fsync_on_finish;
+    direct_options.ensure_parent_directories = writer_config.ensure_parent_directories;
+    direct_options.stable_small_file_writes = writer_config.stable_small_file_writes;
+    direct_options.tcp_cork_small_file_writes = writer_config.tcp_cork_small_file_writes;
+    direct_options.reactors_per_ip = std::max<std::size_t>(1U, writer_config.reactors_per_ip);
+    direct_options.reactor_count = writer_config.reactor_count;
+    direct_options.max_concurrent_file_transactions = writer_config.max_concurrent_file_transactions;
+    std::unique_ptr<TargetWriterBackend> direct_backend;
+    std::mutex direct_backend_mutex;
+    DirectTargetWriterStats direct_writer_stats;
+    if (direct_reactor_submit) {
+        direct_backend = make_target_writer_backend(writer_config.target_root, 0, direct_options);
+    }
+
+    const auto direct_consume_buffer = [&](std::size_t, const BufferHandle& handle) {
+        std::uint64_t payload_bytes = 0;
+        std::size_t files_written = 0;
+        try {
+            const DataBuffer& buffer = data_buffer(data_pool, handle);
+            if (hypersync::is_packed_small_file_buffer(buffer)) {
+                std::vector<TargetWriterBackend::WriteChunk> files;
+                files.reserve(hypersync::packed_small_file_count(buffer));
+                const bool ok = hypersync::visit_packed_small_files(buffer, [&](hypersync::PackedSmallFileView view) {
+                    FileSpec file;
+                    file.rel_path = std::string(view.rel_path);
+                    file.declared_size = view.file_size;
+                    file.mtime = view.mtime;
+                    file.mode = view.mode != 0U ? view.mode : 0644U;
+                    file.uid = view.uid;
+                    file.gid = view.gid;
+                    TargetWriterBackend::WriteChunk chunk;
+                    chunk.spec = std::move(file);
+                    chunk.data = view.data;
+                    chunk.offset = 0;
+                    chunk.last_chunk = true;
+                    payload_bytes += view.data.size();
+                    files.push_back(std::move(chunk));
+                });
+                if (!ok) {
+                    throw std::runtime_error("direct DataWriter-NFS received malformed packed-small-file buffer");
+                }
+                files_written = files.size();
+                direct_backend->write_files(files);
+            } else {
+                const std::size_t data_len = static_cast<std::size_t>(buffer.trailer.data_len);
+                if (data_len > buffer.bytes.size()) {
+                    throw std::runtime_error("direct DataWriter-NFS received oversized data buffer");
+                }
+                TargetWriterBackend::WriteChunk chunk;
+                chunk.spec.rel_path = std::string(buffer.trailer.rel_path.view());
+                chunk.spec.declared_size = buffer.trailer.file_size;
+                chunk.spec.mtime = buffer.trailer.mtime;
+                chunk.spec.mode = buffer.trailer.mode != 0U ? buffer.trailer.mode : 0644U;
+                chunk.spec.uid = buffer.trailer.uid;
+                chunk.spec.gid = buffer.trailer.gid;
+                chunk.data = std::string_view(reinterpret_cast<const char*>(buffer.bytes.data()), data_len);
+                chunk.offset = buffer.trailer.data_offset;
+                chunk.last_chunk = (buffer.trailer.flags & kFlagLastChunk) != 0U;
+                payload_bytes = data_len;
+                files_written = chunk.last_chunk ? 1U : 0U;
+                std::vector<TargetWriterBackend::WriteChunk> chunks;
+                chunks.push_back(std::move(chunk));
+                std::lock_guard<std::mutex> lock(direct_backend_mutex);
+                direct_backend->write_chunks(chunks);
+            }
+            direct_writer_stats.buffers_processed.fetch_add(1U, std::memory_order_relaxed);
+            direct_writer_stats.files_written.fetch_add(files_written, std::memory_order_relaxed);
+            direct_writer_stats.bytes_written.fetch_add(payload_bytes, std::memory_order_relaxed);
+            data_pool.release(handle);
+            return true;
+        } catch (...) {
+            direct_writer_stats.files_failed.fetch_add(1U, std::memory_order_relaxed);
+            data_pool.release(handle);
+            throw;
+        }
+    };
+
+    const auto file_provider = [&file_queue]() {
             thread_local std::deque<FileSpec> worker_file_batch;
             if (worker_file_batch.empty()) {
                 std::vector<FileSpec> next_batch = take_data_file_work_batch(file_queue, 128);
@@ -6907,21 +7053,41 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
             FileSpec file = std::move(worker_file_batch.front());
             worker_file_batch.pop_front();
             return std::optional<FileSpec> {std::move(file)};
-        },
-        [&file_queue]() {
+    };
+    const auto stop_predicate = [&file_queue]() {
             return data_read_timer_expired(file_queue);
-        });
-    data_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
+    };
+
+    std::unique_ptr<NfsDataBufferReaderJob> data_reader_job;
+    if (direct_reactor_submit) {
+        data_reader_job = std::make_unique<NfsDataBufferReaderJob>(
+            data_config,
+            data_pool,
+            NfsDataBufferReaderJob::BufferConsumer(direct_consume_buffer),
+            file_provider,
+            stop_predicate);
+    } else {
+        data_reader_job = std::make_unique<NfsDataBufferReaderJob>(
+            data_config,
+            data_pool,
+            *reader_to_writer,
+            file_provider,
+            stop_predicate);
+    }
+    data_reader_job->set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
         record_data_read_bytes(stats, bytes_read);
     });
-    data_reader_job.set_file_read_callback([&stats]() {
+    data_reader_job->set_file_read_callback([&stats]() {
         record_data_read_file(stats);
     });
-    data_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
+    data_reader_job->set_file_failed_callback([&stats](const FileSpec&) {
         stats.files_failed.fetch_add(1, std::memory_order_relaxed);
     });
 
-    TargetDataWriterJob writer_job(writer_config, data_pool, reader_to_writer);
+    std::unique_ptr<TargetDataWriterJob> writer_job;
+    if (!direct_reactor_submit) {
+        writer_job = std::make_unique<TargetDataWriterJob>(writer_config, data_pool, *reader_to_writer);
+    }
 
     const auto benchmark_started_at = std::chrono::steady_clock::now();
     stats.started_at = benchmark_started_at;
@@ -6952,14 +7118,24 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
         });
     }
 
-    std::thread stats_printer(run_data_buffer_write_stats_printer,
-                              std::ref(stats),
-                              std::ref(file_queue),
-                              std::cref(reader_to_writer),
-                              std::cref(writer_job));
+    std::thread stats_printer;
+    if (direct_reactor_submit) {
+        stats_printer = std::thread(run_direct_data_buffer_write_stats_printer,
+                                    std::ref(stats),
+                                    std::ref(file_queue),
+                                    std::cref(direct_writer_stats));
+    } else {
+        stats_printer = std::thread(run_data_buffer_write_stats_printer,
+                                    std::ref(stats),
+                                    std::ref(file_queue),
+                                    std::cref(*reader_to_writer),
+                                    std::cref(*writer_job));
+    }
 
-    writer_job.start();
-    data_reader_job.start();
+    if (writer_job) {
+        writer_job->start();
+    }
+    data_reader_job->start();
 
     std::vector<std::thread> metadata_workers;
     metadata_workers.reserve(metadata_threads);
@@ -6983,16 +7159,20 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     mark_data_file_input_done(file_queue);
 
     try {
-        data_reader_job.wait();
-        writer_job.wait();
+        data_reader_job->wait();
+        if (writer_job) {
+            writer_job->wait();
+        }
     } catch (...) {
         pipeline_error = std::current_exception();
         try {
-            data_reader_job.stop();
+            data_reader_job->stop();
         } catch (...) {}
-        try {
-            writer_job.stop();
-        } catch (...) {}
+        if (writer_job) {
+            try {
+                writer_job->stop();
+            } catch (...) {}
+        }
     }
 
     stats.printer_done.store(true, std::memory_order_relaxed);
@@ -7020,9 +7200,9 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
         std::rethrow_exception(pipeline_error);
     }
 
-    writer_stats = writer_job.stats();
-    data_queue_capacity = reader_to_writer.capacity();
-    data_queue_high_watermark = reader_to_writer.high_watermark();
+    writer_stats = direct_reactor_submit ? direct_writer_stats.snapshot() : writer_job->stats();
+    data_queue_capacity = direct_reactor_submit ? 0U : reader_to_writer->capacity();
+    data_queue_high_watermark = direct_reactor_submit ? 0U : reader_to_writer->high_watermark();
 
     DataReadBenchmarkSnapshot snapshot = snapshot_data_read_stats(stats);
     snapshot.data_buffer_slots = pool_slots;
@@ -11298,6 +11478,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool stable_small_file_writes,
                                                                       bool tcp_cork_small_file_writes,
                                                                       bool direct_reactor_writes,
+                                                                      bool direct_reactor_submit,
                                                                       std::size_t data_writer_reactors,
                                                                       std::size_t reactors_per_ip,
                                                                       std::size_t data_writer_file_window) const {
@@ -11340,6 +11521,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     writer_config.stable_small_file_writes = stable_small_file_writes;
     writer_config.tcp_cork_small_file_writes = tcp_cork_small_file_writes;
     writer_config.direct_reactor_writes = direct_reactor_writes;
+    writer_config.direct_reactor_submit = direct_reactor_submit;
     writer_config.reactor_count = data_writer_reactors;
     writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
     if (data_writer_file_window != 0U) {
@@ -11362,7 +11544,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.metadata_async_depth = std::max<std::size_t>(1, meta_config.async_directory_depth);
     report.readdirplus_page_bytes = meta_config.readdirplus_page_bytes;
     report.data_reader_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
-    report.data_writer_threads = target_data_writer_effective_worker_count(writer_config);
+    report.data_writer_threads = writer_config.direct_reactor_submit ? 0U
+                                                                      : target_data_writer_effective_worker_count(writer_config);
     report.data_outstanding_requests = std::max<std::size_t>(1, data_config.outstanding_requests);
     report.small_file_async_window = data_config.small_file_async_window != 0U
                                          ? data_config.small_file_async_window
@@ -11411,7 +11594,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.files_written = static_cast<std::size_t>(writer_stats.files_written);
     report.write_failed = static_cast<std::size_t>(writer_stats.files_failed);
     report.bytes_written = writer_stats.bytes_written;
-    report.data_queue_shards = report.data_writer_threads;
+    report.data_queue_shards = writer_config.direct_reactor_submit ? 0U : report.data_writer_threads;
     report.data_queue_capacity = queue_capacity;
     report.data_queue_high_watermark = queue_high_watermark;
 

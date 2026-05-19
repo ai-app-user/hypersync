@@ -66,6 +66,28 @@ NfsDataBufferReaderJob::NfsDataBufferReaderJob(NfsDataReaderConfig config,
     }
 }
 
+NfsDataBufferReaderJob::NfsDataBufferReaderJob(NfsDataReaderConfig config,
+                                               RawBufferPool& data_pool,
+                                               BufferConsumer output,
+                                               FileProvider file_provider,
+                                               StopPredicate stop_predicate)
+    : ThreadedJob(std::max<std::size_t>(1, config.data_reader_worker_count)),
+      config_(std::move(config)),
+      data_pool_(data_pool),
+      direct_output_(std::move(output)),
+      file_provider_(std::move(file_provider)),
+      stop_predicate_(std::move(stop_predicate)) {
+    if (data_pool_.pool_id() != kDataBufferPoolId) {
+        throw std::invalid_argument("nfs data buffer reader requires the data buffer pool");
+    }
+    if (!direct_output_) {
+        throw std::invalid_argument("nfs data buffer reader requires a direct output consumer");
+    }
+    if (!file_provider_) {
+        throw std::invalid_argument("nfs data buffer reader requires a file provider");
+    }
+}
+
 NfsDataBufferReaderJob::~NfsDataBufferReaderJob() {
     stop();
 }
@@ -254,6 +276,9 @@ void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
 }
 
 bool NfsDataBufferReaderJob::publish_buffer(std::size_t worker_index, const BufferHandle& handle) {
+    if (direct_output_) {
+        return direct_output_(worker_index, handle);
+    }
     if (output_ != nullptr) {
         return wait_for_output(worker_index, *output_, handle);
     }

@@ -174,6 +174,7 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
                                   config_size_t_or(values, "reactors_per_ip", 1U),
                                   config_size_t_or(values, "max_concurrent_file_transactions", 64U));
     result.reactor_count = config_size_t_or(values, "reactor_count", 0U);
+    result.direct_reactor_submit = config_bool_or(values, "direct_reactor_submit", false);
     return result;
 }
 
