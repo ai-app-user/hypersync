@@ -12574,6 +12574,12 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     writer_config.direct_reactor_submit = direct_reactor_submit;
     writer_config.reactor_count = data_writer_reactors;
     writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
+    if (folder_ready_write && writer_config.direct_reactor_submit && writer_config.reactor_count == 0U) {
+        writer_config.reactor_count = 64U;
+    }
+    if (folder_ready_write && writer_config.direct_reactor_submit && data_writer_file_window == 0U) {
+        writer_config.max_concurrent_file_transactions = 64U;
+    }
     if (data_writer_file_window != 0U) {
         writer_config.max_concurrent_file_transactions = data_writer_file_window;
     }

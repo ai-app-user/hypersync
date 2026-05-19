@@ -1568,3 +1568,4 @@ logical size: 335.99 TB
     - `80/80`: `49,466.4 files/s`, `24.7747 Gbit/s`.
     - `96/96`: `74,412.8 files/s`, `37.2635 Gbit/s`.
   - Matched pairs confirm low total in-flight concurrency is insufficient; higher session/window pairs can work, but placement variability is large. Repeat top candidates before changing defaults.
+  - Default choice after discussion: for `benchmark-data-write --mode folder-ready-write --data-writer-direct-submit`, use `64/64` when `--data-writer-reactors` and `--data-writer-file-window` are omitted. Keep `96/96` as a remembered alternate tuning point, but not the default because placement variability is high.

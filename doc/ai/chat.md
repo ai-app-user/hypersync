@@ -1002,3 +1002,7 @@ Results:
 - `96/96`: `74,412.8 files/s`, `37.2635 Gbit/s`, zero failures.
 
 Conclusion: matched reactor/window pairs show that total in-flight concurrency below `64/64` is insufficient. `96/96` was slightly faster than this run's `64/64`, but both are below the previous `64/64` peak, so backend placement/noise is material. `80/80` was poor in this run.
+
+**User:** Asked to remember `64/64` and `96/96`, but use `64/64` by default.
+
+**Codex:** Updated `benchmark-data-write --mode folder-ready-write --data-writer-direct-submit` defaults so that when the caller does not explicitly set `--data-writer-reactors` or `--data-writer-file-window`, the mode uses `64` reactors and a `64` per-reactor file window. `96/96` remains a remembered alternate tuning point, not the default. Local `make -j8 unit-test` passed (`74/74`) and the folder-ready-write CLI smoke passed.
