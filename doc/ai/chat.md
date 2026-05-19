@@ -1093,3 +1093,34 @@ Verification:
   - Queue/spillway proof: medium queue hit cap and drained, while `spill_medium_files` grew to `4,293,251`; small queue stayed at `0` and continued flowing.
 
 Conclusion: spillway fixed the classifier HOL blocking symptom. Full medium queues no longer trap small files behind synchronous push. However, it did not recover the separate-pipeline `75K+` small-file rate; the integrated run stayed around `48K` true-small files/s and `190G`. Remaining gap is likely shared upstream/folder-ready ordering and target namespace/server-side interaction rather than the medium/large queue push itself. Optional namespace isolation was not implemented in this commit.
+
+**User:** Asked to implement VIP target segregation for mixed writes so small-file reactors can use one VIP range and medium/large writers another, with validation on agnopo using small `.2-.9` and bulk `.10-.17`.
+
+**Codex:** Added `benchmark-data-write` options:
+- `--small-file-target-ips <expr>`
+- `--large-file-target-ips <expr>`
+
+Implementation:
+- The canonical `--target` still defines the export and target subpath.
+- For `folder-ready-mixed-write`, the small writer lane derives an NFS URL by replacing only the server expression with `--small-file-target-ips`.
+- Medium and large writer lanes derive URLs from `--large-file-target-ips`.
+- The first implementation leaves folder creation on the canonical `--target` URL to preserve the existing folder-ready correctness boundary.
+- Local `make -j8 unit-test` passed (`74/74`).
+- Pushed dev commit `190e63f`.
+
+Validation run 1, canonical target all 16 VIPs, small `.2-.9`, medium/large `.10-.17`:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8/allVIPs]->[ReadyClassifier+Spillway]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64 VIPs=.2-.9] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN-96]->(DataQueue-96x512)->[DataWriter-NFS-96 VIPs=.10-.17] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN-160]->(DataQueue-160x512)->[DataWriter-NFS-160 VIPs=.10-.17]`.
+
+Result:
+- Final interval: `182.66 Gbit/s` total.
+- Hot true-small rate: `53,820.8 files/s`, `26.95 Gbit/s`.
+- Medium: `31.77 Gbit/s`.
+- Large: `123.94 Gbit/s`.
+- Final average: `175.99 Gbit/s`, `49,348 small files/s`, zero failures.
+
+Validation run 2, canonical/folder creation target moved to bulk VIPs `.10-.17`, small still `.2-.9`, medium/large `.10-.17`:
+- Hot small rate climbed to `64,874.6 files/s`, `32.49 Gbit/s`.
+- Medium/large writers did not make progress until shutdown, so the final average collapsed to `42.05 Gbit/s`.
+- Zero failures, but not a viable combined-write setting.
+
+Conclusion: VIP segregation is implemented and does affect the small lane in the expected direction. A strict 8/8 split does not hit the combined target: small improves modestly in the normal run but total bandwidth falls because bulk only has half the VIPs. Moving folder creation off small VIPs improves small rate significantly, but exposes a bulk-lane progress/stall issue that needs separate diagnosis before using that mode.

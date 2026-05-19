@@ -1617,3 +1617,20 @@ logical size: 335.99 TB
     - Final summary: `1,707,593` files written, `756.39 GB`, `183.34 Gbit/s` average, `51,736 files/s` average.
     - Medium queue/spillway behavior: `spill_medium_files` reached `4,293,251`, proving overflow absorbed backlog instead of blocking classifier; small queue stayed empty/fluid.
   - Interpretation: spillway solved synchronous classifier HOL on medium/large lanes, but integrated true-small rate still stayed around `48K` rather than the separate-pipeline `75K+`. The remaining gap is likely shared upstream/folder-ready ordering and/or target namespace/server-side interaction. Optional mixed namespace isolation is still not implemented.
+
+- 2026-05-19 PDT mixed writer VIP target partitioning:
+  - Commit `190e63f` added `benchmark-data-write --small-file-target-ips <expr>` and `--large-file-target-ips <expr>`.
+  - Scope: `folder-ready-mixed-write` derives lane-specific NFS URLs by replacing only the server expression of the canonical `--target`. The export and subpath stay identical.
+  - Current routing:
+    - Small direct reactor lane uses `--small-file-target-ips`.
+    - Medium and large writer lanes use `--large-file-target-ips`.
+    - Folder creation still uses canonical `--target` to preserve the folder-ready correctness boundary.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+  - agnopo validation, canonical target all 16 VIPs, small `.2-.9`, medium/large `.10-.17`, zero failures:
+    - Final interval: `182.66 Gbit/s` total, true-small `53,820.8 files/s`, medium `31.77 Gbit/s`, large `123.94 Gbit/s`.
+    - Final average: `175.99 Gbit/s`, true-small `49,348 files/s`.
+    - Compared with the non-partitioned spillway result (`190.09 Gbit/s`, true-small `48,259.8 files/s` final interval), strict 8/8 VIP partitioning improves small IOPS but reduces total bandwidth materially.
+  - Exploratory agnopo run with canonical/folder-creation target on bulk VIPs `.10-.17`, small `.2-.9`, medium/large `.10-.17`:
+    - Hot small reached `64,874.6 files/s`, but medium/large writers made no progress until shutdown; final average only `42.05 Gbit/s`.
+    - This suggests cleaner small VIPs help IOPS, but the bulk lane/folder target arrangement needs a separate stall diagnosis before it is usable.
+  - Current conclusion: endpoint partitioning is implemented and measurable, but strict `.2-.9` / `.10-.17` is not the 200G/80K answer. It trades too much bulk bandwidth for modest small-file improvement in the normal configuration.
