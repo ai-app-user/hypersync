@@ -1657,3 +1657,26 @@ logical size: 335.99 TB
     - Top average softirq cores were CPUs `0-10`, roughly `4.5-6.4% soft`.
     - Hot samples showed concentrated softirq spikes: CPU `7` up to `51.52% soft`, CPU `4` up to `48.48% soft`, CPU `6` up to `48.00% soft`.
   - Interpretation: no persistent hardware ring/drop counter issue was observed. The run does hit physical line rate in hot seconds with very high PPS and concentrated softirq bursts. The remaining mixed-workload limit is more consistent with hot-second link/PPS/softirq pressure than with NIC drops.
+
+- 2026-05-19 PDT two-independent-pipeline telemetry proof:
+  - Experiment only; ran on deployed commit `63860fa` / `hypersync 0.0.3` with no code changes or branch changes.
+  - First attempt failed because the large lane used `--assume-target-directories` without precreated target folders and aborted on `NFS3ERR_NOENT`. Valid rerun precreated `10,000` `/synthetic/batch_*` directories in the large target before the measured telemetry window.
+  - Valid output directory: `/tmp/hypersync-telemetry-parallel-telemetry-precreated-20260519T233429`.
+  - NIC: `ens3`.
+  - Pipelines:
+    - Small: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`
+    - Large: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue-500000)->[DataReader-SYN-112]->(DataQueue-112x512)->[DataWriter-NFS-112]`
+  - Benchmark result:
+    - Small lane final average: `39.55 Gbit/s`, `78,973 files/s`, zero failures.
+    - Small lane hot intervals: `80K-84.8K files/s`, peak `84,767 files/s`.
+    - Large lane final average: `178.87 Gbit/s`, `12,252` large files written, zero failures.
+    - Large lane final interval: `179.78 Gbit/s`.
+    - Combined final averages: about `218.42 Gbit/s` with `~79K` small files/s.
+    - Combined final active interval: about `219.78 Gbit/s` with `79,885` small files/s.
+  - Hardware/kernel telemetry:
+    - `ethtool -S ens3` matching `drop|fifo|miss|discard|overrun|alloc_fail`: `none_nonzero`.
+    - `sar -n DEV` average over 40s: `558,616.88 rxpck/s`, `1,857,260.27 txpck/s`, `108,611.35 rxkB/s`, `14,449,380.26 txkB/s`, `%ifutil 59.18`.
+    - Hot samples reached line rate: up to `2,916,336 txpck/s`, `800,349 rxpck/s`, `24,347,141 txkB/s`, `%ifutil 99.73`.
+    - `mpstat -P ALL` average: `41.78% usr`, `36.51% sys`, `8.66% soft`, `13.05% idle`.
+    - Top average softirq core: CPU `7` at `41.54% soft`; hot samples: CPU `7` up to `56.44% soft`, CPU `6` up to `50.50% soft`.
+  - Interpretation: the hardware path can exceed the target mix when small and large workloads are truly independent. No NIC error/drop deltas were observed. The integrated mixed writer’s remaining gap is orchestration/workload interaction, not raw NIC loss.

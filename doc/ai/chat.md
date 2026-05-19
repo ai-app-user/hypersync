@@ -1150,3 +1150,39 @@ Hardware/kernel telemetry:
 - Hot samples showed individual interrupt cores spiking high, e.g. CPU `7` at `51.52% soft`, CPU `4` at `48.48% soft`, CPU `6` at `48.00% soft`.
 
 Conclusion: there were no NIC ring/drop counter deltas, but the hot `sar` samples show the physical link is reaching near `100% ifutil` with almost `2.9M tx packets/s`. The mixed writer bottleneck is consistent with hot-second NIC/link saturation and softirq concentration during the peak, not persistent hardware drops.
+
+**User:** Asked to repeat the low-level telemetry capture for the two independent pipelines that previously proved about `206 Gbit/s`, while keeping the current source checkout easy to return to.
+
+**Codex:** Ran this as an experiment only on the current deployed binary (`63860fa`, `hypersync 0.0.3`). No code changes or branch changes were made. First attempt used `--assume-target-directories` for the large lane without precreating the synthetic target folders; it aborted with `NFS3ERR_NOENT`. The valid rerun precreated `10,000` large-lane `/synthetic/batch_*` directories before the telemetry window and then ran both pipelines in parallel.
+
+Valid telemetry run:
+- Output directory: `/tmp/hypersync-telemetry-parallel-telemetry-precreated-20260519T233429`
+- NIC: `ens3`
+- Small target: `/mnt/8ed98ee4-b263-4319-be97-2093377beb65/parallel-telemetry-precreated-20260519T233429-small`
+- Large target: `/mnt/8ed98ee4-b263-4319-be97-2093377beb65/parallel-telemetry-precreated-20260519T233429-large`
+- Large target precreated dirs: `10,000`
+
+Pipelines:
+- Small:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`
+- Large:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue-500000)->[DataReader-SYN-112]->(DataQueue-112x512)->[DataWriter-NFS-112]`
+
+Benchmark results:
+- Small lane final average: `39.55 Gbit/s`, `78,973 files/s`, zero failures.
+- Small lane hot intervals: `80K-84.8K files/s`, peaking at `84,767 files/s`.
+- Large lane final average: `178.87 Gbit/s`, `12,252` large files written, zero failures.
+- Large lane final interval: `179.78 Gbit/s`.
+- Combined final averages: about `218.42 Gbit/s` (`39.55 + 178.87`) while sustaining `~79K` small files/s.
+- Combined final active interval: about `219.78 Gbit/s` (`40.01 + 179.78`) while sustaining `79,885` small files/s.
+
+Hardware/kernel telemetry:
+- `ethtool -S ens3` drop/fifo/miss/discard/overrun/alloc_fail deltas: `none_nonzero`.
+- `sar -n DEV` average over the 40s capture: `558,616.88 rxpck/s`, `1,857,260.27 txpck/s`, `108,611.35 rxkB/s`, `14,449,380.26 txkB/s`, `%ifutil 59.18`.
+- Hot samples hit line rate:
+  - `23:35:11 ens3 800,349 rxpck/s 2,916,336 txpck/s 142,489 rxkB/s 24,347,141 txkB/s %ifutil 99.73`
+  - Multiple neighboring samples were `~2.91M txpck/s` and `%ifutil 99.6-99.7`.
+- `mpstat -P ALL` average: `41.78% usr`, `36.51% sys`, `8.66% soft`, `13.05% idle`.
+- Top average softirq core: CPU `7` at `41.54% soft`; hot samples showed CPU `7` up to `56.44% soft`, CPU `6` up to `50.50% soft`.
+
+Conclusion: the independent two-pipeline experiment still beats the integrated mixed writer and exceeds the original `206G` proof, reaching about `218-220 Gbit/s` combined while sustaining about `79-80K` small files/s. There were still no NIC error/drop deltas. This shows the hardware path can do the target mix when the small and large workloads are truly independent; the integrated mixed path’s remaining gap is orchestration/interaction, not raw NIC loss.
