@@ -300,8 +300,10 @@ void TargetMetaWriterJob::process_buffer(TargetWriterBackend& backend, const Buf
         folder.mode = info.folder_mode != 0U ? info.folder_mode : 0755U;
         folder.uid = info.folder_uid;
         folder.gid = info.folder_gid;
-        backend.apply_directory_metadata(folder);
-        record_folder_written();
+        if (config_.preserve_metadata) {
+            backend.apply_directory_metadata(folder);
+            record_folder_written();
+        }
     }
     buffers_processed_.fetch_add(1U, std::memory_order_relaxed);
 }

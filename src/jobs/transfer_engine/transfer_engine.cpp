@@ -1010,6 +1010,8 @@ struct DataReadBenchmarkSnapshot {
     double large_files_per_second = 0.0;
     double small_gigabits_per_second = 0.0;
     double large_gigabits_per_second = 0.0;
+    std::size_t folders_written = 0;
+    double folders_per_second = 0.0;
     std::size_t small_files_found = 0;
     std::size_t large_files_found = 0;
     std::size_t small_files_read = 0;
@@ -7210,6 +7212,78 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     return snapshot;
 }
 
+DataReadBenchmarkSnapshot run_parallel_mkdir_only_scan(const NfsMetaReaderConfig& meta_config,
+                                                       const TargetMetaWriterConfig& writer_config,
+                                                       std::size_t metadata_buffer_slots,
+                                                       double max_duration_seconds,
+                                                       TargetWriterStats& writer_stats,
+                                                       std::size_t& metadata_queue_capacity,
+                                                       std::size_t& metadata_queue_high_watermark) {
+    const std::size_t metadata_threads = std::max<std::size_t>(1U, meta_config.worker_count);
+    const std::size_t flat_slots =
+        std::max<std::size_t>(1U, metadata_buffer_slots == 0U ? kMetadataDiscardDefaultBufferSlots
+                                                              : metadata_buffer_slots);
+    RawBufferPool metadata_pool = make_metadata_batch_buffer_pool(flat_slots);
+    RawBufferPool folder_pool = make_folder_work_buffer_pool(
+        kFolderWorkBufferPoolId,
+        folder_work_slots(metadata_threads, meta_config.async_directory_depth));
+    RawBufferPool folder_feedback_pool = make_folder_work_buffer_pool(
+        kFolderFeedbackBufferPoolId,
+        folder_work_slots(metadata_threads, meta_config.async_directory_depth));
+
+    BufQueue metadata_queue(flat_slots);
+    BufQueue folder_queue(folder_pool.capacity());
+    BufQueue folder_feedback_queue(folder_feedback_pool.capacity());
+
+    FolderSeederJob folder_seeder(meta_config.recursive,
+                                  max_duration_seconds,
+                                  folder_pool,
+                                  folder_feedback_pool,
+                                  folder_queue,
+                                  folder_feedback_queue);
+    NfsMetaReaderBufferJob scanner(meta_config.source_root,
+                                   "size",
+                                   metadata_threads,
+                                   std::max<std::size_t>(1U, meta_config.async_directory_depth),
+                                   folder_pool,
+                                   folder_feedback_pool,
+                                   folder_queue,
+                                   folder_feedback_queue,
+                                   metadata_pool,
+                                   metadata_queue,
+                                   max_duration_seconds);
+    TargetMetaWriterJob writer(writer_config, metadata_pool, metadata_queue);
+
+    const auto started = std::chrono::steady_clock::now();
+    folder_seeder.start();
+    writer.start();
+    scanner.start();
+
+    scanner.wait();
+    folder_seeder.wait();
+    if (auto error = folder_seeder.error()) {
+        std::rethrow_exception(error);
+    }
+    writer.wait();
+
+    writer_stats = writer.stats();
+    metadata_queue_capacity = metadata_queue.capacity();
+    metadata_queue_high_watermark = metadata_queue.high_watermark();
+
+    const DistributedDiffRunReport scanner_stats = scanner.stats();
+    DataReadBenchmarkSnapshot snapshot;
+    snapshot.files_found = static_cast<std::size_t>(scanner_stats.files_compared);
+    snapshot.folders_found = static_cast<std::size_t>(scanner_stats.folders_sent);
+    snapshot.logical_size_bytes = scanner_stats.source_logical_size_bytes;
+    snapshot.folders_written = static_cast<std::size_t>(writer_stats.folders_written);
+    snapshot.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (snapshot.elapsed_seconds > 0.0) {
+        snapshot.files_per_second = static_cast<double>(snapshot.files_found) / snapshot.elapsed_seconds;
+        snapshot.folders_per_second = static_cast<double>(snapshot.folders_written) / snapshot.elapsed_seconds;
+    }
+    return snapshot;
+}
+
 DataReadBenchmarkSnapshot run_parallel_split_data_read_scan(const NfsMetaReaderConfig& meta_config,
                                                             NfsDataReaderConfig small_data_config,
                                                             NfsDataReaderConfig large_data_config,
@@ -11481,7 +11555,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool direct_reactor_submit,
                                                                       std::size_t data_writer_reactors,
                                                                       std::size_t reactors_per_ip,
-                                                                      std::size_t data_writer_file_window) const {
+                                                                      std::size_t data_writer_file_window,
+                                                                      bool mkdir_only) const {
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
     meta_config.recursive = recursive;
@@ -11539,11 +11614,11 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
 
     DataReadBenchmarkReport report;
     report.meta_reader_async = meta_reader.using_async_backend();
-    report.data_reader_async = data_reader.using_async_backend();
+    report.data_reader_async = mkdir_only ? false : data_reader.using_async_backend();
     report.meta_reader_threads = std::max<std::size_t>(1, meta_config.worker_count);
     report.metadata_async_depth = std::max<std::size_t>(1, meta_config.async_directory_depth);
     report.readdirplus_page_bytes = meta_config.readdirplus_page_bytes;
-    report.data_reader_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
+    report.data_reader_threads = mkdir_only ? 0U : std::max<std::size_t>(1, data_config.data_reader_worker_count);
     report.data_writer_threads = writer_config.direct_reactor_submit ? 0U
                                                                       : target_data_writer_effective_worker_count(writer_config);
     report.data_outstanding_requests = std::max<std::size_t>(1, data_config.outstanding_requests);
@@ -11566,19 +11641,35 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     TargetWriterStats writer_stats;
     std::size_t queue_capacity = 0;
     std::size_t queue_high_watermark = 0;
-    const DataReadBenchmarkSnapshot snapshot = run_parallel_data_write_scan(meta_config,
-                                                                            data_config,
-                                                                            writer_config,
-                                                                            min_file_size_bytes,
-                                                                            max_file_size_bytes,
-                                                                            report.max_files_queued,
-                                                                            data_buffer_slots,
-                                                                            data_queue_depth,
-                                                                            max_duration_seconds,
-                                                                            stats_interval_seconds,
-                                                                            writer_stats,
-                                                                            queue_capacity,
-                                                                            queue_high_watermark);
+    DataReadBenchmarkSnapshot snapshot;
+    if (mkdir_only) {
+        TargetMetaWriterConfig meta_writer_config(
+            data_writer_threads == 0U ? target_data_writer_effective_worker_count(writer_config)
+                                      : data_writer_threads,
+            target_root);
+        meta_writer_config.preserve_metadata = false;
+        snapshot = run_parallel_mkdir_only_scan(meta_config,
+                                                meta_writer_config,
+                                                report.max_files_queued,
+                                                max_duration_seconds,
+                                                writer_stats,
+                                                queue_capacity,
+                                                queue_high_watermark);
+    } else {
+        snapshot = run_parallel_data_write_scan(meta_config,
+                                                data_config,
+                                                writer_config,
+                                                min_file_size_bytes,
+                                                max_file_size_bytes,
+                                                report.max_files_queued,
+                                                data_buffer_slots,
+                                                data_queue_depth,
+                                                max_duration_seconds,
+                                                stats_interval_seconds,
+                                                writer_stats,
+                                                queue_capacity,
+                                                queue_high_watermark);
+    }
     report.files_found = snapshot.files_found;
     report.folders_found = snapshot.folders_found;
     report.files_read = snapshot.files_read;
@@ -11593,8 +11684,10 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.data_queue_depth = snapshot.data_queue_depth;
     report.files_written = static_cast<std::size_t>(writer_stats.files_written);
     report.write_failed = static_cast<std::size_t>(writer_stats.files_failed);
+    report.folders_written = static_cast<std::size_t>(writer_stats.folders_written);
+    report.folders_per_second = snapshot.folders_per_second;
     report.bytes_written = writer_stats.bytes_written;
-    report.data_queue_shards = writer_config.direct_reactor_submit ? 0U : report.data_writer_threads;
+    report.data_queue_shards = mkdir_only ? 1U : (writer_config.direct_reactor_submit ? 0U : report.data_writer_threads);
     report.data_queue_capacity = queue_capacity;
     report.data_queue_high_watermark = queue_high_watermark;
 

@@ -163,6 +163,8 @@ struct DataReadBenchmarkReport {
     double async_close_max_latency_ms = 0.0;
     std::size_t files_written = 0;
     std::size_t write_failed = 0;
+    std::size_t folders_written = 0;
+    double folders_per_second = 0.0;
     std::uint64_t bytes_written = 0;
     std::size_t data_writer_threads = 0;
     std::size_t data_writer_async_window = 1;
@@ -518,7 +520,8 @@ public:
                                                                         bool direct_reactor_submit = false,
                                                                         std::size_t data_writer_reactors = 0,
                                                                         std::size_t reactors_per_ip = 1,
-                                                                        std::size_t data_writer_file_window = 0) const;
+                                                                        std::size_t data_writer_file_window = 0,
+                                                                        bool mkdir_only = false) const;
     [[nodiscard]] DataReadBenchmarkReport benchmark_nfs_open_pipeline(const std::filesystem::path& source_root,
                                                                       bool recursive = true,
                                                                       std::size_t meta_reader_threads = 0,

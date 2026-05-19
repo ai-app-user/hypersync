@@ -54,6 +54,7 @@ private:
 struct TargetMetaWriterConfig {
     std::size_t worker_count = 1;
     std::string target_root;
+    bool preserve_metadata = true;
 
     TargetMetaWriterConfig();
     TargetMetaWriterConfig(std::size_t worker_count, std::string target_root);
