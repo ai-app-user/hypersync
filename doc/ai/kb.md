@@ -1539,3 +1539,11 @@ logical size: 335.99 TB
     - `FolderCreation-NFS-32`, `DataReader-SYN-640`, 30s: `1,421,196` files written, `17,969` folders created, zero failures, `46,777 files/s`, `23.426 Gbit/s`. More folder creators were slower.
     - `FolderCreation-NFS-8`, `DataReader-SYN-768`, 20s: `1,008,869` files written, `14,295` folders created, zero failures, `49,528 files/s`, `24.805 Gbit/s`; last interval `49,781 files/s`.
   - Current recommendation for 1K-files-per-folder synthetic small-file writes with target dirs created inline: use `--mode folder-ready-write --data-writer-threads 8 --data-writer-direct-submit --data-reader-threads 640` or `768`, `--data-writer-reactors 16 --data-writer-file-window 1024`, stable writes off, TCP cork off.
+  - Fixed-window reactor scaling at `--data-writer-file-window 512`, same folder-ready-write pipeline, `FolderCreation-NFS-8`, `DataReader-SYN-768/direct-submit`:
+    - `1` reactor: `3,405.64 files/s`, `1.70792 Gbit/s`.
+    - `2` reactors: `6,903.4 files/s`, `3.45549 Gbit/s`.
+    - `4` reactors: `13,091.1 files/s`, `6.55712 Gbit/s`.
+    - `8` reactors: `25,735.3 files/s`, `12.889 Gbit/s`.
+    - `16` reactors: `48,766.2 files/s`, `24.4178 Gbit/s`.
+    - `64` reactors: `57,868.9 files/s`, `28.9774 Gbit/s`.
+  - Reactor count scales nearly linearly through 16 and still improves at 64, supporting the idea that repeated connections to the same VIP range can hit additional backend lanes. 64-reactor results are noisier and need repeat confirmation before becoming the default.

@@ -945,3 +945,18 @@ Agnopo results, all 16 target IPs, synthetic profile, `files-per-batch=1024`, `m
   - Average: `49,528 files/s`, `24.805 Gbit/s`, zero failures; last interval was `49,781 files/s`.
 
 Conclusion: the real folder-gated NFS write path is correct and essentially at the previous precreated-directory limit (`~50K files/s`) while creating target directories on the fly. The best observed balance so far is `FolderCreation-NFS-8` with `DataReader-SYN-640..768/direct-submit`; `32` folder creators is counterproductive for this workload.
+
+**User:** Asked for a reactor-count sweep at fixed `--data-writer-file-window 512`, using `1,2,4,8,16,64` reactors.
+
+**Codex:** Ran agnopo sweep with constant pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=X window=512]`.
+
+Results:
+- `1` reactor: `3,405.64 files/s`, `1.70792 Gbit/s`, zero failures.
+- `2` reactors: `6,903.4 files/s`, `3.45549 Gbit/s`, zero failures.
+- `4` reactors: `13,091.1 files/s`, `6.55712 Gbit/s`, zero failures.
+- `8` reactors: `25,735.3 files/s`, `12.889 Gbit/s`, zero failures.
+- `16` reactors: `48,766.2 files/s`, `24.4178 Gbit/s`, zero failures.
+- `64` reactors: `57,868.9 files/s`, `28.9774 Gbit/s`, zero failures.
+
+Conclusion: fixed-window scaling is clean from 1 to 16 reactors and still improves at 64, confirming that additional NFS sessions can expose more backend concurrency even when the advertised target IP range has only 16 VIPs. The 64-reactor result was lower than the prior `63K files/s` row, so 64-reactor tuning should be repeated for stability before becoming a default.
