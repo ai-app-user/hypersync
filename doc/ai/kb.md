@@ -1561,3 +1561,10 @@ logical size: 335.99 TB
     - `window=64`: `83,904.8 files/s`, `42.0269 Gbit/s`.
     - `window=96`: `45,735 files/s`, `22.9006 Gbit/s`.
   - Current top observed small-file NFS write result is `64 reactors / window 64` at `83.9K files/s`, zero failures. There is a sharp regression by `window=96`, so use `64` as the current candidate, not deeper windows.
+  - Matched reactor/window pair sweep, same folder-ready-write pipeline, `FolderCreation-NFS-8`, `DataReader-SYN-768/direct-submit`:
+    - `16/16`: `15,485.1 files/s`, `7.75453 Gbit/s`.
+    - `32/32`: `36,691.9 files/s`, `18.3672 Gbit/s`.
+    - `64/64`: `72,748.3 files/s`, `36.4295 Gbit/s`.
+    - `80/80`: `49,466.4 files/s`, `24.7747 Gbit/s`.
+    - `96/96`: `74,412.8 files/s`, `37.2635 Gbit/s`.
+  - Matched pairs confirm low total in-flight concurrency is insufficient; higher session/window pairs can work, but placement variability is large. Repeat top candidates before changing defaults.

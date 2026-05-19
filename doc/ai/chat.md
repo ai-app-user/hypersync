@@ -988,3 +988,17 @@ Results:
 - `window=96`: `45,735 files/s`, `22.9006 Gbit/s`, zero failures.
 
 Conclusion: current top observed small-file NFS write result is `64 reactors / window 64` at `83.9K files/s`, zero failures. The cliff at `window=96` suggests the optimum is near 64 in this session-count regime; do not extrapolate to larger windows.
+
+**User:** Asked to test matched reactor/window pairs: `16/16`, `32/32`, `64/64`, `80/80`, `96/96`.
+
+**Codex:** Ran agnopo sweep with constant pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=X window=X]`.
+
+Results:
+- `16/16`: `15,485.1 files/s`, `7.75453 Gbit/s`, zero failures.
+- `32/32`: `36,691.9 files/s`, `18.3672 Gbit/s`, zero failures.
+- `64/64`: `72,748.3 files/s`, `36.4295 Gbit/s`, zero failures.
+- `80/80`: `49,466.4 files/s`, `24.7747 Gbit/s`, zero failures.
+- `96/96`: `74,412.8 files/s`, `37.2635 Gbit/s`, zero failures.
+
+Conclusion: matched reactor/window pairs show that total in-flight concurrency below `64/64` is insufficient. `96/96` was slightly faster than this run's `64/64`, but both are below the previous `64/64` peak, so backend placement/noise is material. `80/80` was poor in this run.
