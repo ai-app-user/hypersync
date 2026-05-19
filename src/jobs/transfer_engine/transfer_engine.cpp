@@ -8347,7 +8347,7 @@ DataReadBenchmarkSnapshot run_parallel_folder_ready_mixed_write_scan(const NfsMe
     ready_queues.small.max_entries = std::max<std::size_t>(1U, max_files_queued);
     ready_queues.large.max_entries = std::max<std::size_t>(5'000'000U, max_files_queued);
     DataReadFileQueue medium_ready_queue;
-    medium_ready_queue.max_entries = std::max<std::size_t>(1'000'000U, max_files_queued);
+    medium_ready_queue.max_entries = std::max<std::size_t>(5'000'000U, max_files_queued);
 
     DataReadBenchmarkStats stats;
     stats.print_interval_seconds = std::max<std::uint32_t>(1U, stats_interval_seconds);
