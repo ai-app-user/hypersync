@@ -1431,3 +1431,14 @@ logical size: 335.99 TB
   Result: `434,076` files in `30.50s`, `14,234 files/s`, `7.12 Gbit/s`, zero failures.
   CPU average: user `19.59%`, system `56.49%`, idle `22.94%`; `64/80` cores >=80% busy, `1/80` >=95% busy.
   Compared with previous reactor result (`10,868 files/s`, system `63.78%`) this is a useful gain; compared with old 96-context result (`~1.32K files/s`, system `84.88%`) this is about `10.8x` faster.
+
+- 2026-05-18 PDT `DataWriter-NFS` reactor flight-window/stable-write update:
+  - `--data-writer-file-window` now allows reactors to fill to the configured active transaction window; the old internal `32` CREATE-per-service-turn cap was removed.
+  - New config/CLI: `target_data_writer.stable_small_file_writes` / `--data-writer-stable-small-writes` uses raw NFSv3 `rpc_nfs_write_async(..., FILE_SYNC, ...)` for packed small-file writes.
+  - Raw libnfs WRITE3 result data must be consumed inside the raw callback. Do not keep the `WRITE3res*` pointer for later reactor-loop processing; copy `status`, `count`, and `committed` into local state in the callback.
+  - Raw NFS WRITE may complete partially. Stable-write mode must keep issuing WRITE calls until the full payload is acknowledged; treat zero-byte or over-sized completions as errors.
+- agnopo small-file writer window sweep after commit `747272f`, all 16 target IPs, packed synthetic small files, no fsync/metadata restore, assumed dirs, `files-per-batch=1024`, `MetaReader-SYN-96`, `DataReader-SYN-96`, `DataWriter-NFS-96/reactors=16 pinned workers=16+`:
+  - `window=256`, existing write path: `567,897` files, `18,712.7 files/s`, `9.36 Gbit/s`, CPU avg user `17.14%`, system `53.23%`, idle `28.40%`.
+  - `window=256`, raw `FILE_SYNC`: `564,729` files, `18,620.3 files/s`, `9.32 Gbit/s`, CPU avg user `17.31%`, system `53.04%`, idle `28.47%`.
+  - `window=512`, existing write path: `501,988` files, `16,523.7 files/s`, `8.27 Gbit/s`, CPU avg user `17.23%`, system `53.24%`, idle `28.36%`.
+  Recommendation for current agnopo small-file NFS write tuning: use `--data-writer-file-window 256`; leave `--data-writer-stable-small-writes` off because it is neutral/slightly slower on this target.

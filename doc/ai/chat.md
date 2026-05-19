@@ -762,3 +762,19 @@ all 16 target IPs, packed small files, no fsync/metadata restore, assumed target
 **Codex:** Validation: local build and unit suite passed (`74/74`), agnopo release build passed. New benchmark on agnopo:
 `[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue)->[DataReader-SYN-96]->(DataQueue)->[DataWriter-NFS-96/reactors=16 pinned workers=16+]`,
 same packed small-file settings, `files-per-batch=1024`, file window `32`. Result: `434,076` files in `30.50s`, `14,234 files/s`, `7.12 Gbit/s`, zero failures. CPU average: user `19.59%`, system `56.49%`, idle `22.94%`; `64/80` cores >=80% busy, `1/80` >=95% busy. This is a further improvement over the previous reactor result (`10.9K files/s`, system `63.78%`) and a ~10.8x improvement over the old 96-context NFS writer baseline.
+
+**User:** Asked to expand the `DataWriter-NFS` reactor flight window so `--data-writer-file-window` can run at `256`/`512`, add a packed-small-file stable-write mode using NFSv3 `FILE_SYNC`, and run the requested agnopo sweeps.
+
+**Codex:** Implemented and pushed reactor headroom/stable-write changes to `dev`:
+- Removed the internal `32` CREATE-per-service-turn cap so each reactor can fill up to the configured `--data-writer-file-window`.
+- Added `target_data_writer.stable_small_file_writes` and CLI flag `--data-writer-stable-small-writes`.
+- Added a raw NFSv3 `rpc_nfs_write_async(..., FILE_SYNC, ...)` path for packed small-file writes.
+- Fixed two raw-libnfs details found during agnopo validation: raw WRITE may complete partially, so the reactor now continues writing until the full payload is acknowledged; raw RPC result memory is callback-scoped, so WRITE3 status/count are copied inside `raw_write_callback`.
+- Local build/unit suite passed (`74/74`), agnopo libnfs release build passed.
+
+Agnopo sweep results, 2026-05-18 PDT, all 16 target IPs, packed small synthetic files, no fsync/metadata restore, assumed target dirs, `files-per-batch=1024`, `MetaReader-SYN-96`, `DataReader-SYN-96`, `DataWriter-NFS-96/reactors=16 pinned workers=16+`:
+- `window=256`, existing high-level write path: `567,897` files in `30.35s`, `18,712.7 files/s`, `9.36 Gbit/s`, CPU avg user `17.14%`, system `53.23%`, idle `28.40%`, hot cores >=80%: `1/80`.
+- `window=256`, raw `FILE_SYNC` stable writes: `564,729` files in `30.33s`, `18,620.3 files/s`, `9.32 Gbit/s`, CPU avg user `17.31%`, system `53.04%`, idle `28.47%`, hot cores >=80%: `1/80`.
+- Extra probe `window=512`, existing high-level write path: `501,988` files in `30.38s`, `16,523.7 files/s`, `8.27 Gbit/s`, CPU avg user `17.23%`, system `53.24%`, idle `28.36%`.
+
+Conclusion: expanding the flight window from `32` to `256` improved small-file NFS writes from `14.2K` to about `18.7K files/s`. `FILE_SYNC` is functionally correct now but neutral on this storage target, and `512` overfills/overqueues enough to regress throughput. Current best small-write setting is `--data-writer-file-window 256` with stable writes off unless a later target behaves differently.
