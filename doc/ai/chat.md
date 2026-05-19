@@ -1186,3 +1186,34 @@ Hardware/kernel telemetry:
 - Top average softirq core: CPU `7` at `41.54% soft`; hot samples showed CPU `7` up to `56.44% soft`, CPU `6` up to `50.50% soft`.
 
 Conclusion: the independent two-pipeline experiment still beats the integrated mixed writer and exceeds the original `206G` proof, reaching about `218-220 Gbit/s` combined while sustaining about `79-80K` small files/s. There were still no NIC error/drop deltas. This shows the hardware path can do the target mix when the small and large workloads are truly independent; the integrated mixed path’s remaining gap is orchestration/interaction, not raw NIC loss.
+
+**User:** Asked to implement an integrated priority governor for `folder-ready-mixed-write`: high-frequency small-file IOPS tracking, adaptive throttling for medium/large lanes when small IOPS drops below `75K/s`, and tighter default bulk thread pools (`medium=64`, `large=112`) to better match the parallel proof.
+
+**Codex:** Implemented mixed-mode governor in dev commits:
+- `05f4c7e` `Add mixed write small IOPS governor`
+- `e850a3d` `Increase mixed bulk governor authority`
+- `2ff3c8d` `Raise mixed governor pacing ceiling`
+- `2042c05` `Restore best mixed governor pacing ceiling`
+
+Current retained implementation:
+- `folder-ready-mixed-write` samples small completed writes every `200ms`.
+- Reports `current_small_iops` and `bulk_pacing_us` in `mixed_data_write_stats`.
+- If smoothed small IOPS is below `75K/s` and small work is pending, medium/large file providers sleep before returning work.
+- Pacing backs off exponentially from `5us` up to a retained best ceiling of `2000us`.
+- Medium defaults changed from `96` readers/writers to `64`.
+- Large defaults changed from `160` readers/writers to `112`.
+- Unit tests passed (`74/74`).
+
+Validation, `2000us` ceiling (`e850a3d`):
+- Pipeline:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway+Governor]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN-64 governed]->(DataQueue-64x512)->[DataWriter-NFS-64] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN-112 governed]->(DataQueue-112x512)->[DataWriter-NFS-112]`
+- Final useful interval: `189.05 Gbit/s` total, small `66,388 files/s`, medium `34.16 Gbit/s`, large `121.64 Gbit/s`, zero failures.
+- Final average: `180.96 Gbit/s`, small `62,401 files/s`, large bucket `149.71 Gbit/s`, zero failures.
+- Governor was pegged at `bulk_pacing_us=2000` for the run.
+
+Validation, `10000us` ceiling (`2ff3c8d`):
+- Final useful interval: `188.13 Gbit/s` total, small `62,928 files/s`, medium `26.93 Gbit/s`, large `129.69 Gbit/s`, zero failures.
+- Final average: `181.58 Gbit/s`, small `58,836 files/s`, zero failures.
+- Worse than the `2000us` ceiling, so the ceiling was restored to `2000us` in `2042c05`.
+
+Conclusion: the governor improves integrated true-small IOPS materially versus the non-governed spillway run (`~48K/s` hot small) while preserving about `189G` total, but it does not achieve the requested stable `75K/s` floor. Since the governor stayed pegged yet small stayed below target, the bottleneck is not just bulk reader overrun. The likely remaining limiter is the integrated folder-ready/classifier/source ordering path: the small queue is usually empty, meaning the small writer is not continuously supplied like it is in the two-independent-pipeline proof.

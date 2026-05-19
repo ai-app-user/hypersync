@@ -1680,3 +1680,28 @@ logical size: 335.99 TB
     - `mpstat -P ALL` average: `41.78% usr`, `36.51% sys`, `8.66% soft`, `13.05% idle`.
     - Top average softirq core: CPU `7` at `41.54% soft`; hot samples: CPU `7` up to `56.44% soft`, CPU `6` up to `50.50% soft`.
   - Interpretation: the hardware path can exceed the target mix when small and large workloads are truly independent. No NIC error/drop deltas were observed. The integrated mixed writer’s remaining gap is orchestration/workload interaction, not raw NIC loss.
+
+- 2026-05-19 PDT integrated mixed priority governor:
+  - Commits:
+    - `05f4c7e` added a `folder-ready-mixed-write` small IOPS governor.
+    - `e850a3d` raised bulk governor authority.
+    - `2ff3c8d` tested a `10ms` ceiling.
+    - `2042c05` restored the better `2ms` ceiling.
+  - Current retained implementation:
+    - Samples small completed writes every `200ms`.
+    - Emits `current_small_iops` and `bulk_pacing_us` in `mixed_data_write_stats`.
+    - If smoothed small IOPS is below `75K/s` and small work is pending, medium/large providers apply an exponential sleep before returning work.
+    - Sleep starts at `5us` and caps at `2000us`.
+    - Integrated mixed defaults were realigned to `medium=64` readers/writers and `large=112` readers/writers; small remains `768` direct-submit readers with `64/64` NFS reactors/window.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+  - agnopo validation with `2000us` ceiling:
+    - Final useful interval: `189.05 Gbit/s`, small `66,388 files/s`, medium `34.16 Gbit/s`, large `121.64 Gbit/s`, zero failures.
+    - Final average: `180.96 Gbit/s`, small `62,401 files/s`, large bucket `149.71 Gbit/s`, zero failures.
+    - Governor stayed pegged at `bulk_pacing_us=2000`.
+  - agnopo validation with `10000us` ceiling:
+    - Final useful interval: `188.13 Gbit/s`, small `62,928 files/s`, medium `26.93 Gbit/s`, large `129.69 Gbit/s`, zero failures.
+    - Final average: `181.58 Gbit/s`, small `58,836 files/s`.
+    - Worse than `2000us`; reverted to `2000us`.
+  - Interpretation:
+    - Governor improved hot small-file rate from the non-governed spillway baseline (`~48K/s`) to about `66K/s` while preserving about `189G`.
+    - It did not reach the `75K/s` floor. Because the governor was pegged and the small queue was usually empty, bulk reader pacing is not the whole bottleneck. The integrated path is not supplying the small writer continuously enough; likely next target is folder-ready/classifier/source ordering or a true independent small-discovery lane inside the integrated mode.
