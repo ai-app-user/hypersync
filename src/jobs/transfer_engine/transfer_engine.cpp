@@ -7009,9 +7009,6 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     TargetDataWriterConfig file_writer_config = writer_config;
     const std::size_t data_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
     const bool create_target_directories = writer_config.ensure_parent_directories;
-    if (create_target_directories) {
-        file_writer_config.ensure_parent_directories = false;
-    }
     const bool direct_reactor_submit = file_writer_config.direct_reactor_submit && is_nfs_url(file_writer_config.target_root) &&
                                        data_config.pack_small_files;
     const std::size_t writer_threads = direct_reactor_submit ? 0U : target_data_writer_effective_worker_count(file_writer_config);
