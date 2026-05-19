@@ -11648,6 +11648,9 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                       : data_writer_threads,
             target_root);
         meta_writer_config.preserve_metadata = false;
+        if (data_writer_file_window != 0U) {
+            meta_writer_config.async_window = data_writer_file_window;
+        }
         snapshot = run_parallel_mkdir_only_scan(meta_config,
                                                 meta_writer_config,
                                                 report.max_files_queued,

@@ -1758,6 +1758,12 @@ public:
         std::filesystem::create_directories(std::filesystem::path(root_) / rel_path);
     }
 
+    void ensure_directories(const std::vector<FileSpec>& specs) override {
+        for (const FileSpec& spec : specs) {
+            ensure_directory(spec);
+        }
+    }
+
     void apply_directory_metadata(const FileSpec& spec) override {
         const std::string rel_path = normalize_path(spec.rel_path);
         if (rel_path.empty()) {
@@ -1837,6 +1843,10 @@ public:
 
     void ensure_directory(const FileSpec& spec) override {
         (void)spec;
+    }
+
+    void ensure_directories(const std::vector<FileSpec>& specs) override {
+        (void)specs;
     }
 
     void apply_directory_metadata(const FileSpec& spec) override {
@@ -5859,6 +5869,99 @@ public:
         ensure_directory_chain(spec.rel_path);
     }
 
+    void ensure_directories(const std::vector<FileSpec>& specs) override {
+        struct PendingMkdir {
+            AsyncCommandState state;
+            std::string rel_path;
+        };
+
+        std::vector<std::vector<std::string>> paths_by_depth;
+        for (const FileSpec& spec : specs) {
+            const std::string normalized = normalize_path(spec.rel_path);
+            if (normalized.empty()) {
+                continue;
+            }
+
+            std::string current_path;
+            std::string component;
+            std::size_t depth = 0;
+            const auto add_component = [&]() {
+                if (component.empty()) {
+                    return;
+                }
+                if (!current_path.empty()) {
+                    current_path.push_back('/');
+                }
+                current_path += component;
+                component.clear();
+                if (known_directories_.find(current_path) != known_directories_.end()) {
+                    return;
+                }
+                if (paths_by_depth.size() <= depth) {
+                    paths_by_depth.resize(depth + 1U);
+                }
+                paths_by_depth[depth].push_back(current_path);
+                ++depth;
+            };
+
+            for (char ch : normalized) {
+                if (ch == '/') {
+                    add_component();
+                } else {
+                    component.push_back(ch);
+                }
+            }
+            add_component();
+        }
+
+        const std::size_t window = std::max<std::size_t>(1U, options_.max_concurrent_file_transactions);
+        for (std::vector<std::string>& depth_paths : paths_by_depth) {
+            std::sort(depth_paths.begin(), depth_paths.end());
+            depth_paths.erase(std::unique(depth_paths.begin(), depth_paths.end()), depth_paths.end());
+
+            std::deque<std::string> pending_paths;
+            for (std::string& rel_path : depth_paths) {
+                if (known_directories_.find(rel_path) == known_directories_.end()) {
+                    pending_paths.push_back(std::move(rel_path));
+                }
+            }
+
+            std::vector<PendingMkdir> active;
+            while (!pending_paths.empty() || !active.empty()) {
+                while (!pending_paths.empty() && active.size() < window) {
+                    active.push_back(PendingMkdir {});
+                    PendingMkdir& mkdir = active.back();
+                    mkdir.rel_path = std::move(pending_paths.front());
+                    pending_paths.pop_front();
+                    const std::string remote_path = "/" + mkdir.rel_path;
+                    mkdir.state.queued_at = std::chrono::steady_clock::now();
+                    const int queue_result = nfs_mkdir2_async(legacy_session().context(),
+                                                              remote_path.c_str(),
+                                                              0755,
+                                                              generic_nfs_callback,
+                                                              &mkdir.state);
+                    if (queue_result != 0) {
+                        throw std::runtime_error("nfs_mkdir2_async queue failed: " +
+                                                 std::string(nfs_get_error(legacy_session().context())));
+                    }
+                }
+
+                service_nfs_context(legacy_session().context(), active.empty() ? 1 : 0);
+                for (auto it = active.begin(); it != active.end();) {
+                    if (!it->state.done) {
+                        ++it;
+                        continue;
+                    }
+                    if (it->state.status < 0 && it->state.status != -EEXIST) {
+                        throw std::runtime_error("nfs_mkdir2_async failed: " + it->state.error);
+                    }
+                    known_directories_.insert(it->rel_path);
+                    it = active.erase(it);
+                }
+            }
+        }
+    }
+
     void apply_directory_metadata(const FileSpec& spec) override {
         const std::string rel_path = normalize_path(spec.rel_path);
         if (rel_path.empty()) {
@@ -6448,6 +6551,12 @@ void TargetWriterBackend::write_chunks(const std::vector<WriteChunk>& chunks) {
         if (chunk.last_chunk) {
             finish_file(chunk.spec);
         }
+    }
+}
+
+void TargetWriterBackend::ensure_directories(const std::vector<FileSpec>& specs) {
+    for (const FileSpec& spec : specs) {
+        ensure_directory(spec);
     }
 }
 

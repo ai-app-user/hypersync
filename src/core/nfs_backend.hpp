@@ -229,6 +229,7 @@ public:
     virtual ~TargetWriterBackend() = default;
 
     virtual void ensure_directory(const FileSpec& spec) = 0;
+    virtual void ensure_directories(const std::vector<FileSpec>& specs);
     virtual void apply_directory_metadata(const FileSpec& spec) = 0;
     virtual void write_chunk(const FileSpec& spec, std::string_view data, std::uint64_t offset) = 0;
     struct WriteChunk {

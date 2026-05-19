@@ -156,8 +156,11 @@ TargetDataWriterConfig::TargetDataWriterConfig(std::size_t worker_count,
 
 TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config) {
     const ConfigSection values = config.merged_sections(default_job_config_sections("target_meta_writer"));
-    return TargetMetaWriterConfig(config_size_t_or(values, "worker_count", 1U),
+    TargetMetaWriterConfig result(config_size_t_or(values, "worker_count", 1U),
                                   config_string_or(values, "target_root", "."));
+    result.preserve_metadata = config_bool_or(values, "preserve_metadata", true);
+    result.async_window = config_size_t_or(values, "async_window", 64U);
+    return result;
 }
 
 TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config) {
@@ -230,7 +233,10 @@ TargetWriterStats TargetMetaWriterJob::stats() const {
 }
 
 void TargetMetaWriterJob::run_worker(std::size_t worker_index) {
-    auto backend = make_target_writer_backend(config_.target_root, worker_index);
+    TargetWriterBackend::Options options;
+    options.preserve_metadata = config_.preserve_metadata;
+    options.max_concurrent_file_transactions = std::max<std::size_t>(1U, config_.async_window);
+    auto backend = make_target_writer_backend(config_.target_root, worker_index, options);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
         try {
@@ -279,6 +285,8 @@ void TargetMetaWriterJob::process_buffer(TargetWriterBackend& backend, const Buf
         return;
     }
 
+    std::vector<FileSpec> folders;
+    folders.reserve(static_cast<std::size_t>(info.total_folder_count));
     visit_flat_folder_children(buffer, [&](FlatFolderChildView child) {
         if (child.is_file) {
             return;
@@ -289,9 +297,12 @@ void TargetMetaWriterJob::process_buffer(TargetWriterBackend& backend, const Buf
         folder.mode = child.mode != 0U ? child.mode : 0755U;
         folder.uid = child.uid;
         folder.gid = child.gid;
-        backend.ensure_directory(folder);
-        record_folder_written();
+        folders.push_back(std::move(folder));
     });
+    backend.ensure_directories(folders);
+    if (!folders.empty()) {
+        folders_written_.fetch_add(folders.size(), std::memory_order_relaxed);
+    }
 
     if (info.final_batch) {
         FileSpec folder;

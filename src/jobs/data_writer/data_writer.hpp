@@ -55,6 +55,7 @@ struct TargetMetaWriterConfig {
     std::size_t worker_count = 1;
     std::string target_root;
     bool preserve_metadata = true;
+    std::size_t async_window = 64;
 
     TargetMetaWriterConfig();
     TargetMetaWriterConfig(std::size_t worker_count, std::string target_root);
