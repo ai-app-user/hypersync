@@ -6153,7 +6153,9 @@ void record_data_read_metadata_batch(bool recursive,
                                      DataReadBenchmarkStats& stats,
                                      FlatFolderScanBatch batch,
                                      std::uint64_t min_file_size_bytes,
-                                     std::uint64_t max_file_size_bytes) {
+                                     std::uint64_t max_file_size_bytes,
+                                     RawBufferPool* target_metadata_pool = nullptr,
+                                     BufQueue* target_metadata_queue = nullptr) {
     if (batch.failed) {
         std::cerr << "metadata scan skipped folder '"
                   << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
@@ -6197,6 +6199,51 @@ void record_data_read_metadata_batch(bool recursive,
     }
 
     record_data_read_metadata(stats, files_to_read.size(), batch.directories.size(), logical_size_bytes);
+    if (target_metadata_pool != nullptr && target_metadata_queue != nullptr && !batch.directories.empty()) {
+        std::uint32_t sequence = 0;
+        std::optional<BufferHandle> handle;
+        const auto flush_current = [&]() {
+            if (!handle.has_value()) {
+                return;
+            }
+            if (!target_metadata_queue->push_wait(*handle)) {
+                target_metadata_pool->release(*handle);
+            }
+            handle.reset();
+        };
+        const auto start_buffer = [&]() {
+            handle = target_metadata_pool->acquire_wait();
+            MetadataBatchBuffer& buffer = metadata_batch_buffer(*target_metadata_pool, *handle);
+            reset_flat_folder_buffer(buffer,
+                                     batch.folder,
+                                     sequence++,
+                                     false,
+                                     false,
+                                     {},
+                                     0,
+                                     batch.directories.size(),
+                                     0,
+                                     0,
+                                     0,
+                                     0);
+        };
+        start_buffer();
+        for (const FileSpec& directory : batch.directories) {
+            MetadataBatchBuffer& buffer = metadata_batch_buffer(*target_metadata_pool, *handle);
+            if (append_flat_folder_folder(buffer, directory, "size")) {
+                continue;
+            }
+            flush_current();
+            start_buffer();
+            MetadataBatchBuffer& next_buffer = metadata_batch_buffer(*target_metadata_pool, *handle);
+            if (!append_flat_folder_folder(next_buffer, directory, "size")) {
+                target_metadata_pool->release(*handle);
+                handle.reset();
+                throw std::runtime_error("target directory metadata record exceeds buffer capacity");
+            }
+        }
+        flush_current();
+    }
     if (!enqueue_data_read_files(file_queue, std::move(files_to_read))) {
         if (batch.complete) {
             finish_flat_folder_work(folder_queue);
@@ -6425,7 +6472,9 @@ void scan_data_read_metadata_worker(const std::string& source_root,
                                     std::uint64_t max_file_size_bytes,
                                     FlatMetadataWorkQueue& folder_queue,
                                     DataReadFileQueue& file_queue,
-                                    DataReadBenchmarkStats& stats) {
+                                    DataReadBenchmarkStats& stats,
+                                    RawBufferPool* target_metadata_pool = nullptr,
+                                    BufQueue* target_metadata_queue = nullptr) {
     auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
     try {
         backend->scan_flat_folders_streaming(
@@ -6441,14 +6490,18 @@ void scan_data_read_metadata_worker(const std::string& source_root,
              max_file_size_bytes,
              &folder_queue,
              &file_queue,
-             &stats](FlatFolderScanBatch batch) {
+             &stats,
+             target_metadata_pool,
+             target_metadata_queue](FlatFolderScanBatch batch) {
                 record_data_read_metadata_batch(recursive,
                                                 folder_queue,
                                                 file_queue,
                                                 stats,
                                                 std::move(batch),
                                                 min_file_size_bytes,
-                                                max_file_size_bytes);
+                                                max_file_size_bytes,
+                                                target_metadata_pool,
+                                                target_metadata_queue);
             });
     } catch (...) {
         const std::exception_ptr error = std::current_exception();
@@ -6662,7 +6715,9 @@ DataReadBenchmarkSnapshot run_parallel_nfs_open_scan(const NfsMetaReaderConfig& 
                                       0,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
-                                      std::ref(stats));
+                                      std::ref(stats),
+                                      nullptr,
+                                      nullptr);
     }
 
     for (auto& worker : metadata_workers) {
@@ -6875,7 +6930,9 @@ DataReadBenchmarkSnapshot run_parallel_data_read_scan(const NfsMetaReaderConfig&
                                       max_file_size_bytes,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
-                                      std::ref(stats));
+                                      std::ref(stats),
+                                      nullptr,
+                                      nullptr);
     }
 
     for (auto& worker : metadata_workers) {
@@ -6960,6 +7017,24 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     std::unique_ptr<ShardedBufQueue> reader_to_writer;
     if (!direct_reactor_submit) {
         reader_to_writer = std::make_unique<ShardedBufQueue>(writer_threads, queue_depth_per_shard);
+    }
+    const bool create_target_directories = writer_config.ensure_parent_directories;
+    std::unique_ptr<RawBufferPool> target_metadata_pool;
+    std::unique_ptr<BufQueue> target_metadata_queue;
+    std::unique_ptr<TargetMetaWriterJob> target_meta_writer;
+    if (create_target_directories) {
+        const std::size_t metadata_slots = std::max<std::size_t>(4096U, max_files_queued);
+        target_metadata_pool = std::make_unique<RawBufferPool>(kMetadataBatchBufferPoolId,
+                                                               metadata_slots,
+                                                               sizeof(MetadataBatchBuffer),
+                                                               alignof(MetadataBatchBuffer));
+        target_metadata_queue = std::make_unique<BufQueue>(metadata_slots);
+        TargetMetaWriterConfig meta_writer_config(std::max<std::size_t>(1U, writer_config.worker_count),
+                                                  writer_config.target_root);
+        meta_writer_config.preserve_metadata = false;
+        meta_writer_config.async_window = writer_config.max_concurrent_file_transactions;
+        target_meta_writer =
+            std::make_unique<TargetMetaWriterJob>(meta_writer_config, *target_metadata_pool, *target_metadata_queue);
     }
 
     TargetWriterBackend::Options direct_options;
@@ -7137,6 +7212,9 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     if (writer_job) {
         writer_job->start();
     }
+    if (target_meta_writer) {
+        target_meta_writer->start();
+    }
     data_reader_job->start();
 
     std::vector<std::thread> metadata_workers;
@@ -7151,7 +7229,9 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
                                       max_file_size_bytes,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
-                                      std::ref(stats));
+                                      std::ref(stats),
+                                      target_metadata_pool.get(),
+                                      target_metadata_queue.get());
     }
 
     std::exception_ptr pipeline_error;
@@ -7159,11 +7239,17 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
         worker.join();
     }
     mark_data_file_input_done(file_queue);
+    if (target_metadata_queue) {
+        target_metadata_queue->close();
+    }
 
     try {
         data_reader_job->wait();
         if (writer_job) {
             writer_job->wait();
+        }
+        if (target_meta_writer) {
+            target_meta_writer->wait();
         }
     } catch (...) {
         pipeline_error = std::current_exception();
@@ -7173,6 +7259,11 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
         if (writer_job) {
             try {
                 writer_job->stop();
+            } catch (...) {}
+        }
+        if (target_meta_writer) {
+            try {
+                target_meta_writer->stop();
             } catch (...) {}
         }
     }
@@ -7203,6 +7294,10 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     }
 
     writer_stats = direct_reactor_submit ? direct_writer_stats.snapshot() : writer_job->stats();
+    if (target_meta_writer) {
+        const TargetWriterStats meta_writer_stats = target_meta_writer->stats();
+        writer_stats.folders_written += meta_writer_stats.folders_written;
+    }
     data_queue_capacity = direct_reactor_submit ? 0U : reader_to_writer->capacity();
     data_queue_high_watermark = direct_reactor_submit ? 0U : reader_to_writer->high_watermark();
 
@@ -8473,7 +8568,9 @@ DataHashBenchmarkReport run_parallel_data_hash_scan(const NfsMetaReaderConfig& m
                                       0,
                                       std::ref(folder_queue),
                                       std::ref(file_queue),
-                                      std::ref(stats));
+                                      std::ref(stats),
+                                      nullptr,
+                                      nullptr);
     }
 
     for (auto& worker : metadata_workers) {
