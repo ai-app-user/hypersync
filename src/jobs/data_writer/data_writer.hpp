@@ -84,6 +84,7 @@ struct TargetDataWriterConfig {
 
 [[nodiscard]] TargetMetaWriterConfig load_target_meta_writer_config(const ConfigStore& config);
 [[nodiscard]] TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config);
+[[nodiscard]] std::size_t target_data_writer_effective_worker_count(const TargetDataWriterConfig& config);
 
 struct TargetWriterStats {
     bool running = false;

@@ -148,6 +148,14 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
                                   config_size_t_or(values, "max_concurrent_file_transactions", 64U));
 }
 
+std::size_t target_data_writer_effective_worker_count(const TargetDataWriterConfig& config) {
+    const std::size_t configured = std::max<std::size_t>(1U, config.worker_count);
+    if (is_nfs_url(config.target_root)) {
+        return std::min<std::size_t>(configured, 16U);
+    }
+    return configured;
+}
+
 TargetMetaWriterJob::TargetMetaWriterJob(TargetMetaWriterConfig config,
                                          RawBufferPool& metadata_pool,
                                          BufQueue& input)
@@ -275,7 +283,7 @@ void TargetMetaWriterJob::record_folder_written() {
 TargetDataWriterJob::TargetDataWriterJob(TargetDataWriterConfig config,
                                          RawBufferPool& data_pool,
                                          BufQueue& input)
-    : ThreadedJob(config.worker_count),
+    : ThreadedJob(target_data_writer_effective_worker_count(config)),
       config_(std::move(config)),
       data_pool_(data_pool),
       input_(&input) {
@@ -292,7 +300,7 @@ TargetDataWriterJob::TargetDataWriterJob(TargetDataWriterConfig config,
 TargetDataWriterJob::TargetDataWriterJob(TargetDataWriterConfig config,
                                          RawBufferPool& data_pool,
                                          ShardedBufQueue& input)
-    : ThreadedJob(config.worker_count),
+    : ThreadedJob(target_data_writer_effective_worker_count(config)),
       config_(std::move(config)),
       data_pool_(data_pool),
       sharded_input_(&input) {
@@ -300,7 +308,7 @@ TargetDataWriterJob::TargetDataWriterJob(TargetDataWriterConfig config,
         throw std::invalid_argument("DataWriter-" + backend_job_suffix(config_.target_root) +
                                     " requires data buffers");
     }
-    if (config_.worker_count < input.shard_count()) {
+    if (worker_count() < input.shard_count()) {
         throw std::invalid_argument("DataWriter-" + backend_job_suffix(config_.target_root) +
                                     " needs at least one worker per input shard");
     }

@@ -6874,7 +6874,7 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     reset_nfs_async_read_latency_metrics();
 
     const std::size_t data_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
-    const std::size_t writer_threads = std::max<std::size_t>(1, writer_config.worker_count);
+    const std::size_t writer_threads = target_data_writer_effective_worker_count(writer_config);
     const std::size_t outstanding = std::max<std::size_t>(1, data_config.outstanding_requests);
     const std::size_t metadata_threads = std::max<std::size_t>(1, meta_config.worker_count);
     const std::size_t queue_depth_per_shard =
@@ -11354,7 +11354,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.metadata_async_depth = std::max<std::size_t>(1, meta_config.async_directory_depth);
     report.readdirplus_page_bytes = meta_config.readdirplus_page_bytes;
     report.data_reader_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
-    report.data_writer_threads = std::max<std::size_t>(1, writer_config.worker_count);
+    report.data_writer_threads = target_data_writer_effective_worker_count(writer_config);
     report.data_outstanding_requests = std::max<std::size_t>(1, data_config.outstanding_requests);
     report.small_file_async_window = data_config.small_file_async_window != 0U
                                          ? data_config.small_file_async_window
