@@ -7013,10 +7013,15 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
         std::max<std::size_t>(1, data_queue_depth == 0 ? std::max<std::size_t>(64, outstanding * 4U)
                                                        : data_queue_depth);
     const std::size_t total_queue_depth = direct_reactor_submit ? 0U : writer_threads * queue_depth_per_shard;
+    const std::size_t minimum_pool_slots =
+        direct_reactor_submit
+            ? data_threads + std::max<std::size_t>(64U, data_threads / 4U) + 1U
+            : data_threads * outstanding + total_queue_depth + std::max<std::size_t>(1U, writer_threads) + 1U;
+    const std::size_t default_pool_slots =
+        direct_reactor_submit ? minimum_pool_slots
+                              : data_threads * outstanding * 3U + total_queue_depth + 1U;
     const std::size_t pool_slots =
-        std::max<std::size_t>(data_threads * outstanding + total_queue_depth + std::max<std::size_t>(1U, writer_threads) + 1U,
-                              data_buffer_slots == 0 ? data_threads * outstanding * 3U + total_queue_depth + 1U
-                                                     : data_buffer_slots);
+        std::max<std::size_t>(minimum_pool_slots, data_buffer_slots == 0 ? default_pool_slots : data_buffer_slots);
 
     RawBufferPool data_pool = make_data_buffer_pool(pool_slots);
     std::unique_ptr<ShardedBufQueue> reader_to_writer;
