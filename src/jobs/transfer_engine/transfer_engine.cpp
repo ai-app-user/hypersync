@@ -11296,6 +11296,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool target_fsync,
                                                                       bool ensure_target_directories,
                                                                       bool stable_small_file_writes,
+                                                                      bool direct_reactor_writes,
                                                                       std::size_t data_writer_file_window) const {
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
@@ -11334,7 +11335,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     writer_config.fsync_on_finish = target_fsync;
     writer_config.ensure_parent_directories = ensure_target_directories;
     writer_config.stable_small_file_writes = stable_small_file_writes;
-    writer_config.direct_reactor_writes = pack_small_files;
+    writer_config.direct_reactor_writes = direct_reactor_writes;
     if (data_writer_file_window != 0U) {
         writer_config.max_concurrent_file_transactions = data_writer_file_window;
     }
