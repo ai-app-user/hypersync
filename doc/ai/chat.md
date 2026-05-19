@@ -1006,3 +1006,23 @@ Conclusion: matched reactor/window pairs show that total in-flight concurrency b
 **User:** Asked to remember `64/64` and `96/96`, but use `64/64` by default.
 
 **Codex:** Updated `benchmark-data-write --mode folder-ready-write --data-writer-direct-submit` defaults so that when the caller does not explicitly set `--data-writer-reactors` or `--data-writer-file-window`, the mode uses `64` reactors and a `64` per-reactor file window. `96/96` remains a remembered alternate tuning point, not the default. Local `make -j8 unit-test` passed (`74/74`) and the folder-ready-write CLI smoke passed.
+
+**User:** Asked to combine small and large file writes and see whether we can keep max small-file rate while also reaching about `200 Gbit/s`, with small files having priority.
+
+**Codex:** Deployed `dev` commit `6ecec3e` to agnopo and tested the current single mixed folder-ready-write stream first:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
+
+Result without a small-file filter: only `263 files/s` and `1.35 Gbit/s`. The single FIFO ready queue is not viable for mixed source profiles because large files at the head of the stream monopolize the writer and bury small-file IOPS.
+
+Then ran two explicit concurrent lanes against separate target roots:
+- Small-priority lane:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`, filtered to `size <= 128 KiB`.
+- Large-bandwidth lane:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FileQueue-500000)->[DataReader-SYN-112]->(DataQueue-112x512)->[DataWriter-NFS-112]`, filtered to `size >= 1 MiB`.
+
+Concurrent result:
+- Small lane: `2,312,957` files in `30.56s`, `75,677.8 files/s`, `37.90 Gbit/s`, zero failures.
+- Large lane: `656.63 GB` in `31.63s`, final `166.10 Gbit/s`, useful 30s interval `168.33 Gbit/s`, zero failures.
+- Combined useful bandwidth: about `206 Gbit/s` while the small lane stayed above `75K files/s`.
+
+Conclusion: agnopo and the target storage can do high small-file IOPS and near-200G aggregate write bandwidth at the same time. The bad single-stream run is an orchestration problem. The integrated mixed writer should keep independent small and large ready queues/lanes, give the small lane priority, and let the large lane consume remaining bandwidth.

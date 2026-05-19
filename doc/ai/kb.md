@@ -1569,3 +1569,11 @@ logical size: 335.99 TB
     - `96/96`: `74,412.8 files/s`, `37.2635 Gbit/s`.
   - Matched pairs confirm low total in-flight concurrency is insufficient; higher session/window pairs can work, but placement variability is large. Repeat top candidates before changing defaults.
   - Default choice after discussion: for `benchmark-data-write --mode folder-ready-write --data-writer-direct-submit`, use `64/64` when `--data-writer-reactors` and `--data-writer-file-window` are omitted. Keep `96/96` as a remembered alternate tuning point, but not the default because placement variability is high.
+
+- 2026-05-19 PDT mixed small/large NFS write concurrency:
+  - Single mixed folder-ready-write queue with no size filter is bad for the profiled source shape: `263 files/s`, `1.35 Gbit/s`. Large files at the head of FIFO monopolize the writer and suppress small-file IOPS.
+  - Running explicit concurrent lanes proves the hardware/storage can satisfy both goals:
+    - Small lane, `size <= 128 KiB`, folder-ready-write, `FolderCreation-NFS-8`, `DataReader-SYN-768/direct-submit`, `DataWriter-NFS/reactors=64 window=64`: `75,677.8 files/s`, `37.90 Gbit/s`, zero failures.
+    - Large lane, `size >= 1 MiB`, data write, `DataReader-SYN-112`, `DataWriter-NFS-112`, async window `2`: final `166.10 Gbit/s`, useful 30s interval `168.33 Gbit/s`, zero failures.
+    - Combined useful bandwidth was about `206 Gbit/s` while the small lane stayed above `75K files/s`.
+  - Design implication: integrated mixed write mode must not merge small and large files into one FIFO ready queue. Keep independent small and large ready queues/lanes, prioritize small files, and let the large lane consume remaining bandwidth.
