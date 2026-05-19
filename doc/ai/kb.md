@@ -1508,3 +1508,12 @@ logical size: 335.99 TB
     - `MetaWriter-NFS-32`: `17,275 dirs/s`, CPU idle `65.22%`.
     - `MetaWriter-NFS-64`: `17,041 dirs/s`, CPU idle `36.70%`.
   - Current recommendation for mkdir-only on agnopo: use async mkdir with `--data-writer-file-window 256` and about `16-32` `MetaWriter-NFS` threads. This replaces the old many-hundreds-thread approach and raises observed mkdir throughput from `~7.6K dirs/s` to `~17.3K dirs/s`.
+
+- 2026-05-19 PDT combined mkdir + file write lane:
+  - `benchmark-data-write` now runs a concurrent target mkdir side lane whenever target directories are not assumed:
+    `[scanner]->(TargetMetadataQueue-4096)->[MetaWriter-NFS-N]` beside the file lane.
+  - The scanner emits target directory metadata for both the current scanned folder and child folders. Emitting only children is not sufficient; synthetic and some real scan shapes can produce files in a folder that was not previously seen as a child in the same run.
+  - Direct-submit data buffer pool sizing must not use `data_reader_threads * outstanding_requests` as a hard lower bound. That created `~160 GiB` of 1 MiB buffers for `640 readers * 256 outstanding`, causing long startup allocation. Direct-submit should size by active reader buffers plus headroom.
+  - The background mkdir lane alone is not enough for correctness yet; file creates can race ahead of mkdir completion. Keep file-writer parent-directory fallback enabled until there is a proper directory-ready acknowledgement path.
+  - agnopo combined run with fallback enabled, all 16 target IPs, `files-per-batch=1024`, `max-file-size=128KiB`, `MetaReader-SYN-96`, `DataReader-SYN-640/direct-submit`, `MetaWriter-NFS-32`, `DataWriter-NFS/reactors=16 window=1024`, deep file reservoir: zero failures, `178,977` files in `31.7s`, about `5,643 files/s`, `2.82 Gbit/s`, `7061` folder-create records.
+  - This is functionally correct but far below the precreated-directory `50,841 files/s` result. Next required optimization is a directory readiness map/ack path: `MetaWriter-NFS` publishes completed folder paths, and file providers/readers release files only after their target parent directory is ready. This should remove per-file-reactor parent checks without reintroducing ENOENT races.

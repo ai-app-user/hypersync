@@ -869,3 +869,23 @@ Agnopo mkdir-only async/batched sweep, all 16 target IPs, synthetic metadata, `f
 - `MetaWriter-NFS-64`: `17,041 dirs/s`, CPU idle `36.70%`.
 
 Conclusion: yes, async APIs are the correct direction, but they only helped after the job also batch-drained enough metadata buffers to keep async windows full. The mkdir-only sweet spot moved from hundreds of writer threads to roughly `16-32` writer contexts, with best observed rate about `17.3K dirs/s`; adding more writers mostly burns CPU without improving throughput.
+
+**User:** Asked to combine folder creation and file creation at the same time, because the expected production ratio is closer to 1K files per folder and the folder lane only needs to stay ahead of file creation.
+
+**Codex:** Implemented a concurrent target mkdir lane for `benchmark-data-write` when target directories are not assumed:
+- Commit `bc68e72` wires scanner metadata into a target directory metadata queue while still feeding file work to the file queue. Pipeline shape is:
+  `[FolderSeeder/scan]->(FileQueue)->[DataReader-SYN/direct-submit]->[DataWriter-NFS/reactors]`
+  plus side lane:
+  `[scanner]->(TargetMetadataQueue-4096)->[MetaWriter-NFS-N]`.
+- Commit `1d34eb1` initially removed parent-dir work from the file writer hot path, but real tests showed races where files reached reactors before the mkdir lane completed.
+- Commit `caa9d65` fixed direct-submit memory sizing: the old direct-submit pool formula allocated `data_reader_threads * outstanding_requests` 1 MiB buffers, which meant `640 * 256 ~= 160 GiB` before the run even started. Direct-submit now sizes by active reader buffers instead.
+- Commit `e2fff3c` added a small warmup gate so the mkdir lane gets a head start.
+- Commit `3552681` keeps target mkdir metadata queue bounded at 4096 buffers, independent of file queue depth.
+- Commit `f4fc8ae` also enqueues the current folder itself, not only child folders, so files in a folder are not dependent on that folder having appeared previously as a child.
+- Commit `fd8f9ff` restored file-writer parent-directory fallback for correctness. Without it, combined runs still saw ENOENT-style failures when file creates beat the mkdir lane.
+
+Agnopo combined small-file run, all 16 target IPs, synthetic profile, `files-per-batch=1024`, `max-file-size=128KiB`, `MetaReader-SYN-96`, `DataReader-SYN-640/direct-submit`, `MetaWriter-NFS-32`, `DataWriter-NFS/reactors=16 window=1024`, deep file reservoir:
+- With mkdir lane but no file-writer fallback: failures persisted (`3146-6139` failed packed buffers depending on run), throughput stayed near `5.3K files/s`.
+- With fallback restored: zero failures, `178,977` files written in `31.7s`, about `5,643 files/s`, `2.82 Gbit/s`, `7061` folder-create records processed.
+
+Conclusion: the combined architecture is functionally correct now, but it does not yet preserve the `50K files/s` precreated-directory rate. The bottleneck is the remaining directory readiness/fallback cost: file reactors still have to verify or create parent directories for folders that are not known-ready in their local caches. Next architectural step should be a real directory-ready acknowledgement path: `MetaWriter-NFS` should publish completed folder paths into a readiness map, and file providers/readers should only release files for folders whose target directory is ready. That would keep mkdir out of the file hot path without allowing ENOENT races.
