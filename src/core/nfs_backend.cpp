@@ -5195,8 +5195,11 @@ public:
     explicit NfsTargetWriteReactorFleet(std::string root_url, TargetWriterBackend::Options options)
         : root_url_(std::move(root_url)), options_(options) {
         const std::vector<std::string> endpoints = expand_nfs_url_server_candidates(root_url_);
+        const std::size_t endpoint_count = std::max<std::size_t>(1U, endpoints.empty() ? 1U : endpoints.size());
         const std::size_t reactor_count =
-            std::max<std::size_t>(1U, std::min<std::size_t>(16U, endpoints.empty() ? 1U : endpoints.size()));
+            options_.reactor_count != 0U
+                ? options_.reactor_count
+                : endpoint_count * std::max<std::size_t>(1U, options_.reactors_per_ip);
         reactors_.reserve(reactor_count);
         for (std::size_t index = 0; index < reactor_count; ++index) {
             reactors_.push_back(std::make_unique<Reactor>(*this, index));
@@ -5705,12 +5708,15 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
         bool fsync_on_finish = true;
         bool ensure_parent_directories = true;
         bool stable_small_file_writes = false;
+        std::size_t reactors_per_ip = 1;
+        std::size_t reactor_count = 0;
         std::size_t max_concurrent_file_transactions = 64;
 
         [[nodiscard]] std::string string() const {
             std::ostringstream out;
             out << root_url << "|pm=" << preserve_metadata << "|fs=" << fsync_on_finish
                 << "|ep=" << ensure_parent_directories << "|sw=" << stable_small_file_writes
+                << "|rpi=" << reactors_per_ip << "|rc=" << reactor_count
                 << "|fw=" << max_concurrent_file_transactions;
             return out.str();
         }
@@ -5725,6 +5731,8 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
     key.fsync_on_finish = options.fsync_on_finish;
     key.ensure_parent_directories = options.ensure_parent_directories;
     key.stable_small_file_writes = options.stable_small_file_writes;
+    key.reactors_per_ip = std::max<std::size_t>(1U, options.reactors_per_ip);
+    key.reactor_count = options.reactor_count;
     key.max_concurrent_file_transactions = options.max_concurrent_file_transactions;
     const std::string key_text = key.string();
 

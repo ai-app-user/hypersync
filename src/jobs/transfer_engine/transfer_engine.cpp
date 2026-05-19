@@ -11297,6 +11297,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool ensure_target_directories,
                                                                       bool stable_small_file_writes,
                                                                       bool direct_reactor_writes,
+                                                                      std::size_t data_writer_reactors,
+                                                                      std::size_t reactors_per_ip,
                                                                       std::size_t data_writer_file_window) const {
     NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
     meta_config.source_root = source_root.string();
@@ -11336,6 +11338,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     writer_config.ensure_parent_directories = ensure_target_directories;
     writer_config.stable_small_file_writes = stable_small_file_writes;
     writer_config.direct_reactor_writes = direct_reactor_writes;
+    writer_config.reactor_count = data_writer_reactors;
+    writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
     if (data_writer_file_window != 0U) {
         writer_config.max_concurrent_file_transactions = data_writer_file_window;
     }
@@ -11369,6 +11373,10 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     report.pack_small_files = data_config.pack_small_files;
     report.target_root = target_root;
     report.data_writer_file_window = writer_config.max_concurrent_file_transactions;
+    report.data_writer_reactors = writer_config.reactor_count != 0U
+                                      ? writer_config.reactor_count
+                                      : expand_nfs_url_server_candidates(target_root).size() *
+                                            std::max<std::size_t>(1U, writer_config.reactors_per_ip);
 
     TargetWriterStats writer_stats;
     std::size_t queue_capacity = 0;
