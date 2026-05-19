@@ -11296,6 +11296,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
                                                                       bool target_fsync,
                                                                       bool ensure_target_directories,
                                                                       bool stable_small_file_writes,
+                                                                      bool tcp_cork_small_file_writes,
                                                                       bool direct_reactor_writes,
                                                                       std::size_t data_writer_reactors,
                                                                       std::size_t reactors_per_ip,
@@ -11337,6 +11338,7 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     writer_config.fsync_on_finish = target_fsync;
     writer_config.ensure_parent_directories = ensure_target_directories;
     writer_config.stable_small_file_writes = stable_small_file_writes;
+    writer_config.tcp_cork_small_file_writes = tcp_cork_small_file_writes;
     writer_config.direct_reactor_writes = direct_reactor_writes;
     writer_config.reactor_count = data_writer_reactors;
     writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);

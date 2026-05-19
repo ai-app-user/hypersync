@@ -219,6 +219,7 @@ public:
         bool fsync_on_finish = true;
         bool ensure_parent_directories = true;
         bool stable_small_file_writes = false;
+        bool tcp_cork_small_file_writes = false;
         bool direct_reactor_lane = false;
         std::size_t reactors_per_ip = 1;
         std::size_t reactor_count = 0;

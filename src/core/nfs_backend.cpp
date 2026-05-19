@@ -5360,12 +5360,13 @@ private:
                        !backlog_.empty() || !active_.empty()) {
                     drain_inbound();
                     const std::size_t queued_creates = fill_window();
-                    if (queued_creates != 0U || !active_.empty()) {
+                    if (fleet_.options_.tcp_cork_small_file_writes &&
+                        (queued_creates != 0U || !active_.empty())) {
                         TcpCorkGuard cork(nfs_get_fd(session_.context()));
                         (void)cork;
                         service_nfs_context(session_.context(), active_.empty() ? 1 : 0);
                     } else {
-                        service_nfs_context(session_.context(), 1);
+                        service_nfs_context(session_.context(), active_.empty() ? 1 : 0);
                     }
                     advance_active();
                     if (active_.empty() && backlog_.empty() && inbound_.load(std::memory_order_acquire) == nullptr) {
@@ -5754,6 +5755,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
         bool fsync_on_finish = true;
         bool ensure_parent_directories = true;
         bool stable_small_file_writes = false;
+        bool tcp_cork_small_file_writes = false;
         std::size_t reactors_per_ip = 1;
         std::size_t reactor_count = 0;
         std::size_t max_concurrent_file_transactions = 64;
@@ -5762,6 +5764,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
             std::ostringstream out;
             out << root_url << "|pm=" << preserve_metadata << "|fs=" << fsync_on_finish
                 << "|ep=" << ensure_parent_directories << "|sw=" << stable_small_file_writes
+                << "|tc=" << tcp_cork_small_file_writes
                 << "|rpi=" << reactors_per_ip << "|rc=" << reactor_count
                 << "|fw=" << max_concurrent_file_transactions;
             return out.str();
@@ -5777,6 +5780,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
     key.fsync_on_finish = options.fsync_on_finish;
     key.ensure_parent_directories = options.ensure_parent_directories;
     key.stable_small_file_writes = options.stable_small_file_writes;
+    key.tcp_cork_small_file_writes = options.tcp_cork_small_file_writes;
     key.reactors_per_ip = std::max<std::size_t>(1U, options.reactors_per_ip);
     key.reactor_count = options.reactor_count;
     key.max_concurrent_file_transactions = options.max_concurrent_file_transactions;

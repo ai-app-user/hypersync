@@ -139,6 +139,7 @@ TargetDataWriterConfig::TargetDataWriterConfig(std::size_t worker_count,
                                                bool fsync_on_finish,
                                                bool ensure_parent_directories,
                                                bool stable_small_file_writes,
+                                               bool tcp_cork_small_file_writes,
                                                std::size_t reactors_per_ip,
                                                std::size_t max_concurrent_file_transactions)
     : worker_count(std::max<std::size_t>(1U, worker_count)),
@@ -149,6 +150,7 @@ TargetDataWriterConfig::TargetDataWriterConfig(std::size_t worker_count,
       fsync_on_finish(fsync_on_finish),
       ensure_parent_directories(ensure_parent_directories),
       stable_small_file_writes(stable_small_file_writes),
+      tcp_cork_small_file_writes(tcp_cork_small_file_writes),
       reactors_per_ip(std::max<std::size_t>(1U, reactors_per_ip)),
       max_concurrent_file_transactions(std::max<std::size_t>(1U, max_concurrent_file_transactions)) {}
 
@@ -168,6 +170,7 @@ TargetDataWriterConfig load_target_data_writer_config(const ConfigStore& config)
                                   config_bool_or(values, "fsync_on_finish", true),
                                   config_bool_or(values, "ensure_parent_directories", true),
                                   config_bool_or(values, "stable_small_file_writes", false),
+                                  config_bool_or(values, "tcp_cork_small_file_writes", false),
                                   config_size_t_or(values, "reactors_per_ip", 1U),
                                   config_size_t_or(values, "max_concurrent_file_transactions", 64U));
     result.reactor_count = config_size_t_or(values, "reactor_count", 0U);
@@ -361,6 +364,7 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     options.fsync_on_finish = config_.fsync_on_finish;
     options.ensure_parent_directories = config_.ensure_parent_directories;
     options.stable_small_file_writes = config_.stable_small_file_writes;
+    options.tcp_cork_small_file_writes = config_.tcp_cork_small_file_writes;
     options.direct_reactor_lane = config_.direct_reactor_writes && is_nfs_url(config_.target_root);
     options.reactors_per_ip = std::max<std::size_t>(1U, config_.reactors_per_ip);
     options.reactor_count = config_.reactor_count;

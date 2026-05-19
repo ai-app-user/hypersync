@@ -513,6 +513,7 @@ public:
                                                                         bool target_fsync = true,
                                                                         bool ensure_target_directories = true,
                                                                         bool stable_small_file_writes = false,
+                                                                        bool tcp_cork_small_file_writes = false,
                                                                         bool direct_reactor_writes = false,
                                                                         std::size_t data_writer_reactors = 0,
                                                                         std::size_t reactors_per_ip = 1,

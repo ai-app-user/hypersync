@@ -800,3 +800,9 @@ Benchmark sweeps on agnopo, direct mode off, all 16 target IPs, packed synthetic
 - `reactors=64`: `382,709` files in `30.39s`, `12,592.7 files/s`, `6.30 Gbit/s`; CPU avg user `21.73%`, system `44.33%`, idle `32.45%`, hot cores >=80%: `1/80`.
 
 Conclusion: more TCP sessions per IP did not break the `18.7K files/s` plateau. It regressed throughput while lowering aggregate system percentage mostly because less useful work was completed. Current best remains 16 shared reactors with `--data-writer-file-window 256`, stable writes off. The next useful investigation is likely inside the per-file NFS CREATE/WRITE/CLOSE transaction tax or directory/file creation semantics, not just multiplying sockets.
+
+**User:** Asked to try socket-level TCP corking because libnfs appears to enable `TCP_NODELAY`, and to return to the 16-reactor baseline.
+
+**Codex:** Added Linux TCP cork support around the NFS writer reactor service turn and tested it on agnopo. The first implementation forced corking on for reactor writes; the 16-reactor `window=256` run completed cleanly but regressed: `535,858` files in `30.40s`, `17,629.7 files/s`, `8.82 Gbit/s`; CPU avg user `15.75%`, system `54.86%`, idle `28.35%`. This is worse than the previous best `18,712.7 files/s`, `9.36 Gbit/s`, system `53.23%`.
+
+Because it regressed, corking is now an explicit benchmark knob instead of a default: config `target_data_writer.tcp_cork_small_file_writes` and CLI `--data-writer-tcp-cork`. Default remains off. The synthetic folder layout was reviewed: the recursive synthetic backend already seeds multiple `batch_N` folders and advances each scanner lane by `+lane_count`, which is the contract-safe interleaving. We should not make one folder scan emit file paths belonging to different folders; that would break downstream scanner/writer assumptions.
