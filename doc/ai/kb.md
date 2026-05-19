@@ -1547,3 +1547,10 @@ logical size: 335.99 TB
     - `16` reactors: `48,766.2 files/s`, `24.4178 Gbit/s`.
     - `64` reactors: `57,868.9 files/s`, `28.9774 Gbit/s`.
   - Reactor count scales nearly linearly through 16 and still improves at 64, supporting the idea that repeated connections to the same VIP range can hit additional backend lanes. 64-reactor results are noisier and need repeat confirmation before becoming the default.
+  - 64-reactor window sweep, same folder-ready-write pipeline, `FolderCreation-NFS-8`, `DataReader-SYN-768/direct-submit`:
+    - `window=8`: `65,552.9 files/s`, `32.8263 Gbit/s`.
+    - `window=32`: `72,287.6 files/s`, `36.2049 Gbit/s`.
+    - `window=128`: `61,506 files/s`, `30.8054 Gbit/s`.
+    - `window=512`: `64,248.6 files/s`, `32.174 Gbit/s`.
+    - `window=1024`: `37,328.9 files/s`, `18.6819 Gbit/s`.
+  - New top observed small-file NFS write result is `64 reactors / window 32` at `72.3K files/s`, zero failures. For many-session mode, shallow per-reactor windows are better than deep windows.

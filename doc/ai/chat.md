@@ -960,3 +960,17 @@ Results:
 - `64` reactors: `57,868.9 files/s`, `28.9774 Gbit/s`, zero failures.
 
 Conclusion: fixed-window scaling is clean from 1 to 16 reactors and still improves at 64, confirming that additional NFS sessions can expose more backend concurrency even when the advertised target IP range has only 16 VIPs. The 64-reactor result was lower than the prior `63K files/s` row, so 64-reactor tuning should be repeated for stability before becoming a default.
+
+**User:** Asked to hold `64` reactors and sweep window sizes `8,32,128,512,1024`.
+
+**Codex:** Ran agnopo sweep with constant pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=Y]`.
+
+Results:
+- `window=8`: `65,552.9 files/s`, `32.8263 Gbit/s`, zero failures.
+- `window=32`: `72,287.6 files/s`, `36.2049 Gbit/s`, zero failures.
+- `window=128`: `61,506 files/s`, `30.8054 Gbit/s`, zero failures.
+- `window=512`: `64,248.6 files/s`, `32.174 Gbit/s`, zero failures.
+- `window=1024`: `37,328.9 files/s`, `18.6819 Gbit/s`, zero failures.
+
+Conclusion: with 64 reactors, shallow per-reactor windows are much better. `window=32` is the new top observed small-file NFS write result at `72.3K files/s`, and deep windows (`1024`) hurt badly. This fits the create/write metadata lifecycle better: many independent sessions with small in-flight queues beat fewer/deeper per-session queues.
