@@ -1528,3 +1528,14 @@ logical size: 335.99 TB
     - `FolderCreation-NFS-32`, `DataWriter-NULL-32`, 30s: `8,692,447` files discarded, `78,431` folders created, zero failures, `287,150 files/s`, `143.873 Gbit/s`, `2,590 folders/s`.
     - `FolderCreation-NFS-8`, `DataWriter-NULL-32`, 20s: `5,429,402` files discarded, `49,069` folders created, zero failures, `268,245 files/s`, `134.387 Gbit/s`, `2,424 folders/s`.
   - Conclusion: the folder-ready acknowledgement boundary has enough headroom for the `50K files/s` small-file target when folder batches contain about 1K files. Next reconnect the real file writer behind `ReadyFileQueue` and keep parent-directory fallback out of the hot path.
+
+- 2026-05-19 PDT folder-ready write mode:
+  - New mode: `benchmark-data-write --mode folder-ready-write`.
+  - Pipeline shape: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-N]->(FolderReadyQueue-4096)->[FolderCreation-NFS/FS-N]->(ReadyFileQueue)->[DataReader-SYN/direct-submit]->[DataWriter-NFS/reactors]`.
+  - In this mode the final file writer uses `ensure_parent_directories=false`; parent directory correctness must come only from the folder-ready queue.
+  - Local verification: unit suite passed and CLI smoke proved local folders are created before real payload files are written.
+  - agnopo verification, all 16 target IPs, synthetic profile, `files-per-batch=1024`, `max-file-size=128KiB`, direct-submit, `MetaReader-SYN-96`, `DataWriter-NFS/reactors=16 window=1024`, no fsync, no metadata restore:
+    - `FolderCreation-NFS-8`, `DataReader-SYN-640`, 30s: `1,495,900` files written, `18,577` folders created, zero failures, `49,304 files/s`, `24.692 Gbit/s`; last interval `49,493 files/s`.
+    - `FolderCreation-NFS-32`, `DataReader-SYN-640`, 30s: `1,421,196` files written, `17,969` folders created, zero failures, `46,777 files/s`, `23.426 Gbit/s`. More folder creators were slower.
+    - `FolderCreation-NFS-8`, `DataReader-SYN-768`, 20s: `1,008,869` files written, `14,295` folders created, zero failures, `49,528 files/s`, `24.805 Gbit/s`; last interval `49,781 files/s`.
+  - Current recommendation for 1K-files-per-folder synthetic small-file writes with target dirs created inline: use `--mode folder-ready-write --data-writer-threads 8 --data-writer-direct-submit --data-reader-threads 640` or `768`, `--data-writer-reactors 16 --data-writer-file-window 1024`, stable writes off, TCP cork off.

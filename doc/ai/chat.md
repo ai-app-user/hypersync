@@ -918,3 +918,30 @@ Agnopo verification after deploying commit `e1683cd` from `dev`:
   - Average: `268,245 files/s`, `134.387 Gbit/s`, `2,424 folders/s`.
 
 Conclusion: the folder-ready acknowledgement boundary is fast enough in discard mode. Even `8` folder creation contexts released files at roughly `268K files/s` for the 1K-files-per-folder synthetic layout; the next step can replace `DataWriter-NULL` with the real file writer using this ready-file queue, without parent-directory fallback in the file hot path.
+
+**User:** Asked to connect the actual file writer as the final job and report results.
+
+**Codex:** Added `benchmark-data-write --mode folder-ready-write`, preserving the same folder-ready boundary and replacing `DataWriter-NULL` with the real data path:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-N]->(FolderReadyQueue-4096)->[FolderCreation-NFS-N]->(ReadyFileQueue)->[DataReader-SYN/direct-submit]->[DataWriter-NFS/reactors]`.
+
+Implementation notes:
+- In folder-ready-write mode, the final file writer has `ensure_parent_directories=false`; directory correctness is enforced by the ready queue.
+- Direct-submit remains supported, so the final small-file path can use the proven `DataReader-SYN -> DataWriter-NFS/reactor fleet` path without intermediate writer workers.
+- Added a local CLI smoke test that creates real local files through the folder-ready-write mode.
+
+Verification:
+- Local `make -j8 unit-test` passed: `74/74`.
+- Targeted integration test passed: `main_cli_benchmark_data_write_folder_ready_write_smoke`.
+- Commit `e69e9f6` pushed to `dev` and deployed to agnopo.
+
+Agnopo results, all 16 target IPs, synthetic profile, `files-per-batch=1024`, `max-file-size=128KiB`, `MetaReader-SYN-96`, `DataWriter-NFS/reactors=16 window=1024`, direct-submit, no fsync, no metadata restore:
+- `FolderCreation-NFS-8`, `DataReader-SYN-640`, 30s:
+  - Pipeline: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-640/direct-submit]->[DataWriter-NFS/reactors=16 window=1024]`
+  - Final: `1,495,900 files_written`, `0` file/read/write failures, `18,577 folders_written`.
+  - Average: `49,304 files/s`, `24.692 Gbit/s`; last interval was `49,493 files/s`.
+- `FolderCreation-NFS-32`, `DataReader-SYN-640`, 30s:
+  - Average: `46,777 files/s`, `23.426 Gbit/s`, zero failures. More folder creators stole enough CPU/network attention to slow the file path.
+- `FolderCreation-NFS-8`, `DataReader-SYN-768`, 20s:
+  - Average: `49,528 files/s`, `24.805 Gbit/s`, zero failures; last interval was `49,781 files/s`.
+
+Conclusion: the real folder-gated NFS write path is correct and essentially at the previous precreated-directory limit (`~50K files/s`) while creating target directories on the fly. The best observed balance so far is `FolderCreation-NFS-8` with `DataReader-SYN-640..768/direct-submit`; `32` folder creators is counterproductive for this workload.
