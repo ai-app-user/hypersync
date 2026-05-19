@@ -4267,6 +4267,35 @@ void test_main_cli_benchmark_data_write_folder_ready_discard_smoke() {
     EXPECT_TRUE(!fs::exists(target.path / "a" / "one.txt"));
 }
 
+void test_main_cli_benchmark_data_write_folder_ready_write_smoke() {
+    TempDir source("hypersync_cli_folder_ready_write_source");
+    TempDir target("hypersync_cli_folder_ready_write_target");
+    TempDir output("hypersync_cli_folder_ready_write_output");
+
+    write_file(source.path / "a" / "one.txt", "one");
+    write_file(source.path / "b" / "two.txt", "two2");
+
+    const std::string app = (fs::current_path() / "build" / "hypersync").string();
+    const fs::path stdout_path = output.path / "folder_ready_write.txt";
+
+    EXPECT_TRUE(command_succeeds(app + " benchmark-data-write --mode folder-ready-write --source " +
+                                 source.path.string() + " --target " + target.path.string() +
+                                 " --meta-reader-threads 2 --metadata-async-depth 4" +
+                                 " --data-writer-threads 2 --data-reader-threads 2" +
+                                 " --data-outstanding-requests 4 --data-queue-depth 8" +
+                                 " --max-files-queued 16 --max-duration-seconds 10 > " +
+                                 stdout_path.string() + " 2>&1"));
+    const std::string output_text = hypersync::read_file_contents(stdout_path);
+    EXPECT_TRUE(output_text.find("data_write_benchmark mode=folder-ready-write") != std::string::npos);
+    EXPECT_TRUE(output_text.find("files_found=2") != std::string::npos);
+    EXPECT_TRUE(output_text.find("files_read=2") != std::string::npos);
+    EXPECT_TRUE(output_text.find("files_written=2") != std::string::npos);
+    EXPECT_TRUE(fs::is_directory(target.path / "a"));
+    EXPECT_TRUE(fs::is_directory(target.path / "b"));
+    EXPECT_EQ(hypersync::read_file_contents(target.path / "a" / "one.txt"), std::string("one"));
+    EXPECT_EQ(hypersync::read_file_contents(target.path / "b" / "two.txt"), std::string("two2"));
+}
+
 void test_main_cli_benchmark_data_hash_smoke() {
     TempDir source("hypersync_cli_benchmark_data_hash_source");
     TempDir output("hypersync_cli_benchmark_data_hash_output");
@@ -5317,6 +5346,9 @@ int main(int argc, char** argv) {
         {"main_cli_benchmark_data_write_folder_ready_discard_smoke",
          TestSuite::integration,
          test_main_cli_benchmark_data_write_folder_ready_discard_smoke},
+        {"main_cli_benchmark_data_write_folder_ready_write_smoke",
+         TestSuite::integration,
+         test_main_cli_benchmark_data_write_folder_ready_write_smoke},
         {"main_cli_benchmark_data_hash_smoke", TestSuite::integration, test_main_cli_benchmark_data_hash_smoke},
         {"main_cli_benchmark_synthetic_profile_smoke",
          TestSuite::integration,
