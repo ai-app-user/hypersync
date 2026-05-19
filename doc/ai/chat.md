@@ -1026,3 +1026,25 @@ Concurrent result:
 - Combined useful bandwidth: about `206 Gbit/s` while the small lane stayed above `75K files/s`.
 
 Conclusion: agnopo and the target storage can do high small-file IOPS and near-200G aggregate write bandwidth at the same time. The bad single-stream run is an orchestration problem. The integrated mixed writer should keep independent small and large ready queues/lanes, give the small lane priority, and let the large lane consume remaining bandwidth.
+
+**User:** Clarified that the real implementation should be one pipeline that forks after `ReadyFileQueue` / folder readiness by file type, not two independent source scans, and asked Codex to implement and test it.
+
+**Codex:** Added `benchmark-data-write --mode folder-ready-mixed-write`.
+
+Implemented pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN/NFS-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier]->(SmallReadyFileQueue-500000)->[DataReader-SYN/NFS-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (LargeReadyFileQueue-5000000)->[DataReader-SYN/NFS-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+
+Rules:
+- Folder creation remains the correctness gate. Files enter small/large queues only after `ensure_directories()`.
+- Gapless classifier: small is `size <= 128 KiB`, large is `size > 128 KiB` by default.
+- Small lane keeps the tuned direct reactor writer path.
+- Large lane keeps the sharded writer path for bandwidth.
+- Runtime reporting now prints `mixed_data_write_stats` with small files/s, small Gbit/s, large Gbit/s, total Gbit/s, queue depths, and per-lane failures.
+
+Iteration results:
+- First integrated run with `LargeReadyFileQueue=50K`: `185 Gbit/s` total but only `~2.6K small files/s`; large queue filled and blocked the classifier before small discovery could run.
+- Deepened large ready queue to `500K`: small improved to `~57K files/s`, total `~173 Gbit/s`.
+- Deepened large ready queue to `5M`: small held `~57K files/s` in the hot window, total `~170-173 Gbit/s`.
+- Raised large lane from `112/112` to `160/160`: final run reached `181.6 Gbit/s` total with hot-window small rate `48-57K files/s`, zero failures.
+
+Conclusion: the integrated fork now preserves small-file priority and correctness, but it does not yet reach the `206 Gbit/s` separate-lane proof. The gap is because the integrated large lane correctly includes every file `>128KiB`, including medium files, whereas the large-only proof filtered to `>=1MiB`. Next tuning should split or tune the `>128KiB` lane further, probably with a medium-file path or adaptive large-lane concurrency/window settings.

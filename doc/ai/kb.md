@@ -1577,3 +1577,16 @@ logical size: 335.99 TB
     - Large lane, `size >= 1 MiB`, data write, `DataReader-SYN-112`, `DataWriter-NFS-112`, async window `2`: final `166.10 Gbit/s`, useful 30s interval `168.33 Gbit/s`, zero failures.
     - Combined useful bandwidth was about `206 Gbit/s` while the small lane stayed above `75K files/s`.
   - Design implication: integrated mixed write mode must not merge small and large files into one FIFO ready queue. Keep independent small and large ready queues/lanes, prioritize small files, and let the large lane consume remaining bandwidth.
+
+- 2026-05-19 PDT integrated folder-ready mixed write mode:
+  - Added `benchmark-data-write --mode folder-ready-mixed-write`.
+  - Pipeline shape:
+    `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN/NFS-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier]->(SmallReadyFileQueue-500000)->[DataReader-SYN/NFS-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (LargeReadyFileQueue-5000000)->[DataReader-SYN/NFS-160]->(DataQueue-160x512)->[DataWriter-NFS-160]`.
+  - Folder readiness remains the correctness gate. File classification happens only after `TargetWriterBackend::ensure_directories()` completes for the folder batch.
+  - Default gapless routing: small `size <= 128 KiB`, large `size > 128 KiB`.
+  - Important backpressure finding: a shallow large ready queue (`50K`) is incorrect for this architecture because it can fill and block the classifier, starving small discovery even though the small writer has priority. The current test setting uses a deep `5M` large ready reservoir; production should replace this with a nonblocking classifier/backlog policy.
+  - agnopo integrated mixed write result, synthetic profile, all 16 target IPs, zero failures:
+    - `LargeReadyFileQueue=50K`: `185 Gbit/s` total but only `~2.6K small files/s`; classifier blocked behind large queue.
+    - `LargeReadyFileQueue=5M`, large lane `112/112`: hot small `~57K files/s`, total `~170-173 Gbit/s`.
+    - `LargeReadyFileQueue=5M`, large lane `160/160`: final `181.6 Gbit/s` total, hot small `48-57K files/s`, final small `45.96K files/s`, large `157.0 Gbit/s`.
+  - Interpretation: integrated small priority is now structurally working, but total bandwidth remains below the `206 Gbit/s` separate-lane proof because the integrated large bucket includes all files `>128KiB`, including medium files. The separate proof used `>=1MiB` for the large bandwidth lane. Next step is to tune/split the medium/large side without disturbing the `<=128KiB` small priority lane.
