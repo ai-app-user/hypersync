@@ -6180,7 +6180,7 @@ private:
         for (const WriteChunk& file : files) {
             backlog.push_back(&file);
         }
-        std::vector<InlineFileTransaction> active;
+        std::vector<std::unique_ptr<InlineFileTransaction>> active;
         active.reserve(std::min<std::size_t>(options_.max_concurrent_file_transactions, files.size()));
         const std::size_t max_active = std::max<std::size_t>(1U, options_.max_concurrent_file_transactions);
 
@@ -6188,15 +6188,15 @@ private:
             while (!backlog.empty() && active.size() < max_active) {
                 const WriteChunk* file = backlog.front();
                 backlog.pop_front();
-                InlineFileTransaction transaction;
-                transaction.file = file;
-                transaction.rel_path = normalize_path(file->spec.rel_path);
-                transaction.remote_path = "/" + transaction.rel_path;
+                auto transaction = std::make_unique<InlineFileTransaction>();
+                transaction->file = file;
+                transaction->rel_path = normalize_path(file->spec.rel_path);
+                transaction->remote_path = "/" + transaction->rel_path;
                 if (options_.ensure_parent_directories) {
-                    ensure_directory_chain(parent_path(transaction.rel_path));
+                    ensure_directory_chain(parent_path(transaction->rel_path));
                 }
-                queue_inline_create(transaction);
                 active.push_back(std::move(transaction));
+                queue_inline_create(*active.back());
             }
         };
 
@@ -6204,7 +6204,7 @@ private:
         while (!active.empty() || !backlog.empty()) {
             service_nfs_context(legacy_session().context(), active.empty() ? 1 : 0);
             for (auto it = active.begin(); it != active.end();) {
-                InlineFileTransaction& transaction = *it;
+                InlineFileTransaction& transaction = **it;
                 try {
                     if (transaction.phase == InlineFileTransaction::Phase::creating && transaction.create_state.done) {
                         if (transaction.create_state.status < 0) {
