@@ -788,3 +788,15 @@ Conclusion: expanding the flight window from `32` to `256` improved small-file N
 Agnopo direct-inline result, same synthetic packed-small workload, `window=256`: `90,528` files in `32.16s`, `2,815 files/s`, CPU avg user `11.13%`, system `51.98%`, idle `36.84%`. This is much worse than the reactor-fleet path. Interpretation: direct-lane consumption loses the useful file-level hash redistribution performed by the reactor fleet, and the 16 direct consumers become imbalanced/slow even though they remove one queue hop.
 
 **Codex:** Kept the direct-inline implementation as an explicit experimental switch `--data-writer-direct-reactors`, but gated it off by default. Default packed-small-file NFS writes remain on the better reactor-fleet path. A post-gating control run on agnopo with the default path produced `515,064` files in `30.43s`, `16,924 files/s`, CPU avg user `17.50%`, system `53.09%`, idle `28.24%`; slightly below the earlier best `18.7K files/s`, but back in the expected reactor-fleet range and far above direct-inline.
+
+**User:** Asked to scale NFS writer reactor sessions per target IP, audit libnfs RPC slot caps, and sweep 32/64 reactors with direct mode off.
+
+**Codex:** Implemented configurable NFS writer reactor counts in `09d2064` on `dev`: `--data-writer-reactors <n>` sets an explicit total reactor fleet size, `--reactors-per-ip <n>` is available as a multiplier default, and the shared fleet cache key now includes those settings. The existing endpoint selection already rotates reactor indexes over the 16-IP range, so 32 reactors becomes 2 TCP sessions per IP and 64 becomes 4 per IP. Local build and unit suite passed (`74/74`), and agnopo was deployed from `origin/dev`.
+
+Libnfs header audit on agnopo found `rpc_queue_length(struct rpc_context*)`, but no exposed NFSv3 runtime setter for max outstanding RPC slots/credits in the installed `/usr/include/nfsc` headers. NFSv4 headers contain slot structures, but this writer path is NFSv3, so there is no clean public knob to bind to `--data-writer-file-window` yet.
+
+Benchmark sweeps on agnopo, direct mode off, all 16 target IPs, packed synthetic small files, no fsync/metadata restore, assumed target dirs, `files-per-batch=1024`, `MetaReader-SYN-96`, `DataReader-SYN-96`, `DataWriter-NFS-96`, `window=128`:
+- `reactors=32`: `488,021` files in `30.34s`, `16,084.6 files/s`, `8.05 Gbit/s`; CPU avg user `18.13%`, system `49.38%`, idle `31.07%`, hot cores >=80%: `1/80`.
+- `reactors=64`: `382,709` files in `30.39s`, `12,592.7 files/s`, `6.30 Gbit/s`; CPU avg user `21.73%`, system `44.33%`, idle `32.45%`, hot cores >=80%: `1/80`.
+
+Conclusion: more TCP sessions per IP did not break the `18.7K files/s` plateau. It regressed throughput while lowering aggregate system percentage mostly because less useful work was completed. Current best remains 16 shared reactors with `--data-writer-file-window 256`, stable writes off. The next useful investigation is likely inside the per-file NFS CREATE/WRITE/CLOSE transaction tax or directory/file creation semantics, not just multiplying sockets.

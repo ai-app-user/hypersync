@@ -35,10 +35,13 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 
 #if defined(__linux__)
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <sched.h>
 #endif
@@ -205,6 +208,40 @@ std::uint64_t steady_latency_ns(std::chrono::steady_clock::time_point start,
     (void)cpu_index;
 #endif
 }
+
+class TcpCorkGuard {
+public:
+    explicit TcpCorkGuard(int fd) noexcept : fd_(fd) {
+#if defined(__linux__) && defined(TCP_CORK)
+        if (fd_ >= 0) {
+            int value = 1;
+            active_ = ::setsockopt(fd_, IPPROTO_TCP, TCP_CORK, &value, sizeof(value)) == 0;
+        }
+#else
+        (void)fd_;
+#endif
+    }
+
+    ~TcpCorkGuard() {
+#if defined(__linux__) && defined(TCP_CORK)
+        if (active_) {
+            int value = 0;
+            (void)::setsockopt(fd_, IPPROTO_TCP, TCP_CORK, &value, sizeof(value));
+        }
+#endif
+    }
+
+    TcpCorkGuard(const TcpCorkGuard&) = delete;
+    TcpCorkGuard& operator=(const TcpCorkGuard&) = delete;
+
+    [[nodiscard]] bool active() const noexcept {
+        return active_;
+    }
+
+private:
+    int fd_ = -1;
+    bool active_ = false;
+};
 
 [[maybe_unused]] void record_async_read_queued(std::size_t requested) {
     NfsAsyncReadLatencyMetrics& metrics = nfs_async_read_latency_metrics();
@@ -5322,8 +5359,14 @@ private:
                 while (!stop_requested_.load(std::memory_order_acquire) || inbound_.load(std::memory_order_acquire) != nullptr ||
                        !backlog_.empty() || !active_.empty()) {
                     drain_inbound();
-                    fill_window();
-                    service_nfs_context(session_.context(), active_.empty() ? 1 : 0);
+                    const std::size_t queued_creates = fill_window();
+                    if (queued_creates != 0U || !active_.empty()) {
+                        TcpCorkGuard cork(nfs_get_fd(session_.context()));
+                        (void)cork;
+                        service_nfs_context(session_.context(), active_.empty() ? 1 : 0);
+                    } else {
+                        service_nfs_context(session_.context(), 1);
+                    }
                     advance_active();
                     if (active_.empty() && backlog_.empty() && inbound_.load(std::memory_order_acquire) == nullptr) {
                         std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -5353,9 +5396,10 @@ private:
             }
         }
 
-        void fill_window() {
+        std::size_t fill_window() {
             const std::size_t max_active =
                 std::max<std::size_t>(1U, fleet_.options_.max_concurrent_file_transactions);
+            std::size_t queued = 0;
             while (!backlog_.empty() && active_.size() < max_active) {
                 std::shared_ptr<FileTransaction> transaction = std::move(backlog_.front());
                 backlog_.pop_front();
@@ -5364,7 +5408,9 @@ private:
                 }
                 queue_create(*transaction);
                 active_.push_back(std::move(transaction));
+                ++queued;
             }
+            return queued;
         }
 
         void queue_create(FileTransaction& transaction) {
