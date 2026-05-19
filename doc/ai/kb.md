@@ -1496,3 +1496,15 @@ logical size: 335.99 TB
     - 1024 threads: failed immediately with `all healthy NFS endpoints failed; unhealthy endpoints are cooling down`.
   - CPU stayed mostly idle (`~96.6-97.7%` idle in the useful runs), and the metadata queue was full throughout, so the measured ceiling is storage/backend metadata transaction latency, not client CPU.
   - Current stable measured directory creation ceiling on agnopo is about `7.6K dirs/s`; do not assume the `50K files/s` payload write path will hold when every file requires unique target directory creation.
+
+- 2026-05-19 PDT async mkdir batching:
+  - `DataWriter-NFS` / `MetaWriter-NFS` supports batched async directory creation through `TargetWriterBackend::ensure_directories()`. The NFS implementation expands requested paths into parent chains, groups by depth, deduplicates per depth, and submits up to `--data-writer-file-window` concurrent `nfs_mkdir2_async()` operations per writer context.
+  - Important lifetime rule: libnfs async callbacks must point to stable-address state. Do not store active callback state in a `std::vector` that can reallocate or erase/move entries while RPCs are in flight. Use stable-address storage such as `std::list` or owning pointers.
+  - Async mkdir only works well when `TargetMetaWriterJob` batch-drains multiple metadata buffers before calling `ensure_directories()`. A one-buffer call shape starves the async window when each metadata buffer contains only one/few directories.
+  - agnopo mkdir-only async/batched sweep, all 16 target IPs, synthetic metadata, `files-per-batch=16`, `MetaReader-SYN-96`, metadata async depth `256`, queue depth `4096`, fresh prefixes, `--data-writer-file-window 256`:
+    - `MetaWriter-NFS-4`: `6,074 dirs/s`, CPU idle `93.83%`.
+    - `MetaWriter-NFS-8`: `9,997 dirs/s`, CPU idle `89.49%`.
+    - `MetaWriter-NFS-16`: `16,187 dirs/s`, CPU idle `81.08%`.
+    - `MetaWriter-NFS-32`: `17,275 dirs/s`, CPU idle `65.22%`.
+    - `MetaWriter-NFS-64`: `17,041 dirs/s`, CPU idle `36.70%`.
+  - Current recommendation for mkdir-only on agnopo: use async mkdir with `--data-writer-file-window 256` and about `16-32` `MetaWriter-NFS` threads. This replaces the old many-hundreds-thread approach and raises observed mkdir throughput from `~7.6K dirs/s` to `~17.3K dirs/s`.

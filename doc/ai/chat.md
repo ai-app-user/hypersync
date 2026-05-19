@@ -852,3 +852,20 @@ Conclusion: producer-side reactor publication batching fixed the old 256-produce
 - `MetaWriter-NFS-1024`: failed immediately with `all healthy NFS endpoints failed; unhealthy endpoints are cooling down`.
 
 Conclusion: directory creation is a separate storage-side metadata bottleneck. It scales with extreme concurrency up to at least `768` sessions but remains far below the `50K files/s` payload write rate, while agnopo CPU stays mostly idle. Current stable measured ceiling is about `7.6K dirs/s`; `1024` writer sessions overloads endpoint health.
+
+**User:** Asked whether we can just call async APIs instead of making so many metadata writer threads for directory creation.
+
+**Codex:** Implemented async batched mkdir in `DataWriter-NFS` / `MetaWriter-NFS`:
+- Commit `735bce0` added `TargetWriterBackend::ensure_directories()` and an NFS implementation that expands directory chains, groups paths by depth, and submits up to `--data-writer-file-window` concurrent `nfs_mkdir2_async()` calls per writer context.
+- The first agnopo test (`16` writers, window `256`) segfaulted immediately. Root cause: libnfs callbacks pointed at `AsyncCommandState` objects inside a `std::vector` that could reallocate/erase and move those states while RPCs were still in flight. Fixed in `e368c74` by keeping active mkdir state in stable-address storage.
+- After that fix, `16` writers/window `256` was stable but only reached `2,831 dirs/s`, because the writer job was still feeding the backend one metadata buffer at a time. With `files-per-batch=16`, that meant about one directory per backend call, so the async window never filled.
+- Commit `a049a53` batch-drains metadata buffers inside `TargetMetaWriterJob` before calling `ensure_directories()`, allowing each writer to submit many mkdir RPCs per backend turn.
+
+Agnopo mkdir-only async/batched sweep, all 16 target IPs, synthetic metadata, `files-per-batch=16`, `MetaReader-SYN-96`, metadata async depth `256`, queue depth `4096`, fresh target prefixes, `--data-writer-file-window 256`:
+- `MetaWriter-NFS-4`: `6,074 dirs/s`, CPU idle `93.83%`.
+- `MetaWriter-NFS-8`: `9,997 dirs/s`, CPU idle `89.49%`.
+- `MetaWriter-NFS-16`: `16,187 dirs/s`, CPU idle `81.08%`.
+- `MetaWriter-NFS-32`: `17,275 dirs/s`, CPU idle `65.22%`.
+- `MetaWriter-NFS-64`: `17,041 dirs/s`, CPU idle `36.70%`.
+
+Conclusion: yes, async APIs are the correct direction, but they only helped after the job also batch-drained enough metadata buffers to keep async windows full. The mkdir-only sweet spot moved from hundreds of writer threads to roughly `16-32` writer contexts, with best observed rate about `17.3K dirs/s`; adding more writers mostly burns CPU without improving throughput.
