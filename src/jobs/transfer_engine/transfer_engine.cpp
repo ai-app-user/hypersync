@@ -6998,10 +6998,15 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     stats.folders_found.store(1, std::memory_order_relaxed);
     reset_nfs_async_read_latency_metrics();
 
+    TargetDataWriterConfig file_writer_config = writer_config;
     const std::size_t data_threads = std::max<std::size_t>(1, data_config.data_reader_worker_count);
-    const bool direct_reactor_submit = writer_config.direct_reactor_submit && is_nfs_url(writer_config.target_root) &&
+    const bool create_target_directories = writer_config.ensure_parent_directories;
+    if (create_target_directories) {
+        file_writer_config.ensure_parent_directories = false;
+    }
+    const bool direct_reactor_submit = file_writer_config.direct_reactor_submit && is_nfs_url(file_writer_config.target_root) &&
                                        data_config.pack_small_files;
-    const std::size_t writer_threads = direct_reactor_submit ? 0U : target_data_writer_effective_worker_count(writer_config);
+    const std::size_t writer_threads = direct_reactor_submit ? 0U : target_data_writer_effective_worker_count(file_writer_config);
     const std::size_t outstanding = std::max<std::size_t>(1, data_config.outstanding_requests);
     const std::size_t metadata_threads = std::max<std::size_t>(1, meta_config.worker_count);
     const std::size_t queue_depth_per_shard =
@@ -7018,7 +7023,6 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     if (!direct_reactor_submit) {
         reader_to_writer = std::make_unique<ShardedBufQueue>(writer_threads, queue_depth_per_shard);
     }
-    const bool create_target_directories = writer_config.ensure_parent_directories;
     std::unique_ptr<RawBufferPool> target_metadata_pool;
     std::unique_ptr<BufQueue> target_metadata_queue;
     std::unique_ptr<TargetMetaWriterJob> target_meta_writer;
@@ -7038,19 +7042,19 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     }
 
     TargetWriterBackend::Options direct_options;
-    direct_options.preserve_metadata = writer_config.preserve_metadata;
-    direct_options.fsync_on_finish = writer_config.fsync_on_finish;
-    direct_options.ensure_parent_directories = writer_config.ensure_parent_directories;
-    direct_options.stable_small_file_writes = writer_config.stable_small_file_writes;
-    direct_options.tcp_cork_small_file_writes = writer_config.tcp_cork_small_file_writes;
-    direct_options.reactors_per_ip = std::max<std::size_t>(1U, writer_config.reactors_per_ip);
-    direct_options.reactor_count = writer_config.reactor_count;
-    direct_options.max_concurrent_file_transactions = writer_config.max_concurrent_file_transactions;
+    direct_options.preserve_metadata = file_writer_config.preserve_metadata;
+    direct_options.fsync_on_finish = file_writer_config.fsync_on_finish;
+    direct_options.ensure_parent_directories = file_writer_config.ensure_parent_directories;
+    direct_options.stable_small_file_writes = file_writer_config.stable_small_file_writes;
+    direct_options.tcp_cork_small_file_writes = file_writer_config.tcp_cork_small_file_writes;
+    direct_options.reactors_per_ip = std::max<std::size_t>(1U, file_writer_config.reactors_per_ip);
+    direct_options.reactor_count = file_writer_config.reactor_count;
+    direct_options.max_concurrent_file_transactions = file_writer_config.max_concurrent_file_transactions;
     std::unique_ptr<TargetWriterBackend> direct_backend;
     std::mutex direct_backend_mutex;
     DirectTargetWriterStats direct_writer_stats;
     if (direct_reactor_submit) {
-        direct_backend = make_target_writer_backend(writer_config.target_root, 0, direct_options);
+        direct_backend = make_target_writer_backend(file_writer_config.target_root, 0, direct_options);
     }
 
     const auto direct_consume_buffer = [&](std::size_t, const BufferHandle& handle) {
@@ -7163,7 +7167,7 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
 
     std::unique_ptr<TargetDataWriterJob> writer_job;
     if (!direct_reactor_submit) {
-        writer_job = std::make_unique<TargetDataWriterJob>(writer_config, data_pool, *reader_to_writer);
+        writer_job = std::make_unique<TargetDataWriterJob>(file_writer_config, data_pool, *reader_to_writer);
     }
 
     const auto benchmark_started_at = std::chrono::steady_clock::now();
