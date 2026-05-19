@@ -818,3 +818,18 @@ Agnopo direct-submit results, all 16 target IPs, packed synthetic small files, n
 - `DataReader-SYN-256/direct-submit`: `804,203` files in `30.20s`, `26,632 files/s`, `13.34 Gbit/s`; CPU avg user `9.30%`, system `5.74%`, softirq `1.08%`, idle `83.88%`.
 
 Conclusion: direct-submit is a major architectural win. It nearly doubled the previous best (`18.7K -> 34.7K files/s`) and dropped total busy CPU from about `71.6%` to about `20.6%`. The 96 relay workers were indeed burning CPU. The current direct-submit sweet spot is 160 reader threads; 256 oversubscribes/harms progress. Remaining gap to `50K/s` is no longer CPU saturation, so the next bottleneck is likely per-file NFS create/write/close round-trip pressure, backend metadata serialization, or reader blocking while each packed buffer waits for reactor completion.
+
+**User:** Asked to retest deeper direct-submit flight windows (`512`, `1024`) now that the relay workers are gone, then add producer-side microbatching so higher producer counts do not hammer the 16 reactor MPSC queues one file at a time.
+
+**Codex:** Re-tested direct-submit on agnopo before the batching patch with fresh target prefixes, precreated synthetic batch directories, all 16 target IPs, packed small synthetic files, no fsync/metadata restore, assumed dirs, `files-per-batch=1024`, `MetaReader-SYN-96`, `DataWriter-NFS/reactors=16`, stable off, cork off:
+- `DataReader-SYN-160`, `window=512`: `1,056,507` files in `30.06s`, `35,151 files/s`, `17.60 Gbit/s`, zero failures, CPU avg user `3.96%`, system `2.98%`, idle `92.43%`.
+- `DataReader-SYN-160`, `window=1024`: `1,051,454` files in `30.05s`, `34,990 files/s`, `17.52 Gbit/s`, zero failures, CPU avg user `3.82%`, system `2.88%`, idle `92.74%`.
+
+**Codex:** Implemented reactor submission batching in `21e7767`: `NfsTargetWriteReactorFleet::write_files()` now groups a packed buffer's file transactions by destination reactor and publishes one linked chunk per reactor instead of one atomic enqueue per file. Local validation passed: clean release build and unit suite (`74/74`). Deployed `21e7767` to agnopo and reran the direct-submit writer sweeps:
+- `DataReader-SYN-256`, `window=512`: `1,149,875` files in `30.08s`, `38,227 files/s`, `19.14 Gbit/s`, zero failures.
+- `DataReader-SYN-160`, `window=512` control: `1,055,449` files in `30.07s`, `35,104 files/s`, `17.58 Gbit/s`, zero failures.
+- `DataReader-SYN-256`, `window=1024`: `1,173,526` files in `30.09s`, `38,997 files/s`, `19.53 Gbit/s`, zero failures.
+- Opportunistic `DataReader-SYN-512`, `window=1024`: `1,480,119` files in `30.12s`, `49,144 files/s`, `24.61 Gbit/s`, zero failures.
+- Final nudge `DataReader-SYN-640`, `window=1024`: `1,535,390` files in `30.20s`, `50,841 files/s`, `25.46 Gbit/s`, zero failures.
+
+Conclusion: producer-side reactor publication batching fixed the old 256-producer regression and allowed higher producer counts to scale. Current agnopo packed-small-file NFS write recommendation is `--data-writer-direct-submit --data-reader-threads 640 --data-writer-reactors 16 --data-writer-file-window 1024`, stable writes off, cork off, with target directories precreated or handled outside the payload hot path. This finally crosses the `50K files/s` small-file write goal.

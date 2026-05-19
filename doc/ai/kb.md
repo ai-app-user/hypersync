@@ -1468,4 +1468,12 @@ logical size: 335.99 TB
     - 128 data readers: `32,876 files/s`, `16.46 Gbit/s`, CPU avg user `11.24%`, system `7.55%`, softirq `1.58%`, idle `79.63%`.
     - 160 data readers: `34,670 files/s`, `17.36 Gbit/s`, CPU avg user `11.49%`, system `7.60%`, softirq `1.56%`, idle `79.35%`.
     - 256 data readers: `26,632 files/s`, `13.34 Gbit/s`, CPU avg user `9.30%`, system `5.74%`, softirq `1.08%`, idle `83.88%`.
-  - Current recommendation for agnopo packed small-file NFS writes: use `--data-writer-direct-submit --data-reader-threads 160 --data-writer-reactors 16 --data-writer-file-window 256`, stable writes off, cork off. This improves the previous best from `18.7K` to `34.7K files/s` and lowers total busy CPU from about `71.6%` to about `20.6%`. The remaining gap to `50K/s` is no longer CPU saturation.
+  - After commit `21e7767`, `NfsTargetWriteReactorFleet::write_files()` groups each packed buffer's file transactions by destination reactor and publishes one linked chunk per reactor instead of one atomic enqueue per file. This fixed the high-producer regression.
+  - agnopo direct-submit post-batching sweeps, all 16 target IPs, fresh precreated target dirs, packed synthetic small files, no fsync/metadata restore, assumed dirs, `files-per-batch=1024`, `DataWriter-NFS/reactors=16`, stable off, cork off:
+    - `160` readers, `window=512`: `35,104-35,151 files/s`, about `17.6 Gbit/s`, zero failures.
+    - `160` readers, `window=1024`: `34,990 files/s`, `17.52 Gbit/s`, zero failures.
+    - `256` readers, `window=512`: `38,227 files/s`, `19.14 Gbit/s`, zero failures.
+    - `256` readers, `window=1024`: `38,997 files/s`, `19.53 Gbit/s`, zero failures.
+    - `512` readers, `window=1024`: `49,144 files/s`, `24.61 Gbit/s`, zero failures.
+    - `640` readers, `window=1024`: `50,841 files/s`, `25.46 Gbit/s`, zero failures.
+  - Current recommendation for agnopo packed small-file NFS writes: use `--data-writer-direct-submit --data-reader-threads 640 --data-writer-reactors 16 --data-writer-file-window 1024`, stable writes off, cork off, with target directories precreated or handled outside the payload hot path. This crosses the `50K files/s` small-file write goal.
