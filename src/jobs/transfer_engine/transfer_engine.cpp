@@ -7224,7 +7224,6 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
     if (target_meta_writer) {
         target_meta_writer->start();
     }
-    data_reader_job->start();
 
     std::vector<std::thread> metadata_workers;
     metadata_workers.reserve(metadata_threads);
@@ -7242,6 +7241,23 @@ DataReadBenchmarkSnapshot run_parallel_data_write_scan(const NfsMetaReaderConfig
                                       target_metadata_pool.get(),
                                       target_metadata_queue.get());
     }
+    if (target_meta_writer) {
+        const auto warmup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < warmup_deadline &&
+               !data_read_timer_expired(file_queue)) {
+            const TargetWriterStats meta_stats = target_meta_writer->stats();
+            if (meta_stats.folders_written >= 1024U) {
+                break;
+            }
+            if (target_metadata_queue != nullptr &&
+                target_metadata_queue->empty() &&
+                queued_data_read_files(file_queue) >= 1024U) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    data_reader_job->start();
 
     std::exception_ptr pipeline_error;
     for (auto& worker : metadata_workers) {
