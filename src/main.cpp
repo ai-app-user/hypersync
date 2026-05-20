@@ -1511,6 +1511,8 @@ void print_usage() {
     std::cerr
         << "Usage:\n"
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
+        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories]\n"
+        << "  hypersync [--config <config.yaml>] copy-source --source <nfs-url> --host <host> [--base-port <port>] [--lanes <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--pack-small-files] [--no-pack-small-files] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync status --socket <path>\n"
         << "  hypersync tuning [--iface <name>] [--cpu-mask <mask>] [--peer <ip>] [--apply]\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
@@ -1916,6 +1918,166 @@ int main(int argc, char** argv) {
                        << " recursive=" << (recursive ? "true" : "false") << '\n';
             }
             return 0;
+        }
+
+        if (command == "copy-source") {
+            std::filesystem::path source_root;
+            std::string host;
+            std::uint16_t base_port = 43245;
+            std::size_t lanes = 16;
+            bool recursive = true;
+            std::size_t meta_reader_threads = 0;
+            std::size_t metadata_async_depth = 0;
+            std::size_t data_reader_threads = 0;
+            std::size_t data_outstanding_requests = 0;
+            std::size_t data_buffer_slots = 0;
+            std::size_t data_queue_depth = 0;
+            bool pack_small_files = true;
+            double max_duration_seconds = 0.0;
+            std::uint32_t stats_interval_seconds = 5;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--source") {
+                    source_root = require_option(args, i, "--source");
+                } else if (args[i] == "--host") {
+                    host = require_option(args, i, "--host");
+                } else if (args[i] == "--base-port") {
+                    base_port = parse_port(require_option(args, i, "--base-port"), "--base-port");
+                } else if (args[i] == "--lanes") {
+                    lanes = parse_size_t_option(require_option(args, i, "--lanes"), "--lanes");
+                } else if (args[i] == "--non-recursive") {
+                    recursive = false;
+                } else if (args[i] == "--meta-reader-threads") {
+                    meta_reader_threads = parse_size_t_option(require_option(args, i, "--meta-reader-threads"),
+                                                              "--meta-reader-threads");
+                } else if (args[i] == "--metadata-async-depth") {
+                    metadata_async_depth = parse_size_t_option(require_option(args, i, "--metadata-async-depth"),
+                                                               "--metadata-async-depth");
+                } else if (args[i] == "--data-reader-threads") {
+                    data_reader_threads = parse_size_t_option(require_option(args, i, "--data-reader-threads"),
+                                                              "--data-reader-threads");
+                } else if (args[i] == "--data-outstanding-requests") {
+                    data_outstanding_requests = parse_size_t_option(require_option(args, i, "--data-outstanding-requests"),
+                                                                    "--data-outstanding-requests");
+                } else if (args[i] == "--data-buffer-slots") {
+                    data_buffer_slots = parse_size_t_option(require_option(args, i, "--data-buffer-slots"),
+                                                            "--data-buffer-slots");
+                } else if (args[i] == "--data-queue-depth") {
+                    data_queue_depth = parse_size_t_option(require_option(args, i, "--data-queue-depth"),
+                                                           "--data-queue-depth");
+                } else if (args[i] == "--pack-small-files") {
+                    pack_small_files = true;
+                } else if (args[i] == "--no-pack-small-files") {
+                    pack_small_files = false;
+                } else if (args[i] == "--max-duration-seconds") {
+                    max_duration_seconds = parse_positive_double_option(require_option(args, i, "--max-duration-seconds"),
+                                                                        "--max-duration-seconds");
+                } else if (args[i] == "--stats-interval-seconds") {
+                    stats_interval_seconds = static_cast<std::uint32_t>(
+                        parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
+                                            "--stats-interval-seconds"));
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            const auto report = engine.run_copy_source_pipeline(source_root,
+                                                                host,
+                                                                base_port,
+                                                                lanes,
+                                                                recursive,
+                                                                meta_reader_threads,
+                                                                metadata_async_depth,
+                                                                data_reader_threads,
+                                                                data_outstanding_requests,
+                                                                data_buffer_slots,
+                                                                data_queue_depth,
+                                                                pack_small_files,
+                                                                max_duration_seconds,
+                                                                stats_interval_seconds);
+            std::cout << "pipeline=" << report.pipeline_description << '\n'
+                      << "copy_source_result"
+                      << " files_found=" << report.files_total
+                      << " files_read=" << report.files_transferred
+                      << " failed=" << report.files_failed
+                      << " bytes=" << report.bytes_transferred
+                      << " buffers_sent=" << report.chunks_sent
+                      << " elapsed_s=" << report.elapsed_seconds
+                      << " gbit_s=" << (report.bytes_per_second * 8.0 / 1e9)
+                      << '\n';
+            return report.files_failed == 0 ? 0 : 2;
+        }
+
+        if (command == "copy-target") {
+            std::string target_root;
+            std::string bind_host = "0.0.0.0";
+            std::uint16_t base_port = 43245;
+            std::size_t lanes = 16;
+            std::size_t data_buffer_slots = 0;
+            std::size_t data_queue_depth = 0;
+            bool verify_hash = false;
+            bool preserve_metadata = true;
+            bool target_fsync = true;
+            bool ensure_target_directories = true;
+            std::size_t writer_async_window = 0;
+            std::size_t writer_file_window = 0;
+
+            for (std::size_t i = 1; i < args.size(); ++i) {
+                if (args[i] == "--target") {
+                    target_root = require_option(args, i, "--target");
+                } else if (args[i] == "--bind-host") {
+                    bind_host = require_option(args, i, "--bind-host");
+                } else if (args[i] == "--base-port") {
+                    base_port = parse_port(require_option(args, i, "--base-port"), "--base-port");
+                } else if (args[i] == "--lanes") {
+                    lanes = parse_size_t_option(require_option(args, i, "--lanes"), "--lanes");
+                } else if (args[i] == "--data-buffer-slots") {
+                    data_buffer_slots = parse_size_t_option(require_option(args, i, "--data-buffer-slots"),
+                                                            "--data-buffer-slots");
+                } else if (args[i] == "--data-queue-depth") {
+                    data_queue_depth = parse_size_t_option(require_option(args, i, "--data-queue-depth"),
+                                                           "--data-queue-depth");
+                } else if (args[i] == "--data-writer-async-window") {
+                    writer_async_window = parse_size_t_option(require_option(args, i, "--data-writer-async-window"),
+                                                              "--data-writer-async-window");
+                } else if (args[i] == "--data-writer-file-window") {
+                    writer_file_window = parse_size_t_option(require_option(args, i, "--data-writer-file-window"),
+                                                             "--data-writer-file-window");
+                } else if (args[i] == "--verify-hash") {
+                    verify_hash = true;
+                } else if (args[i] == "--skip-verify") {
+                    verify_hash = false;
+                } else if (args[i] == "--no-target-fsync") {
+                    target_fsync = false;
+                } else if (args[i] == "--assume-target-directories") {
+                    ensure_target_directories = false;
+                } else if (args[i] == "--no-preserve-target-metadata") {
+                    preserve_metadata = false;
+                } else {
+                    throw std::runtime_error("unknown option: " + args[i]);
+                }
+            }
+            const auto report = engine.run_copy_target_pipeline(target_root,
+                                                                bind_host,
+                                                                base_port,
+                                                                lanes,
+                                                                data_buffer_slots,
+                                                                data_queue_depth,
+                                                                verify_hash,
+                                                                preserve_metadata,
+                                                                target_fsync,
+                                                                ensure_target_directories,
+                                                                writer_async_window,
+                                                                writer_file_window);
+            std::cout << "pipeline=" << report.pipeline_description << '\n'
+                      << "copy_target_result"
+                      << " files_written=" << report.files_transferred
+                      << " failed=" << report.files_failed
+                      << " bytes=" << report.bytes_transferred
+                      << " buffers_received=" << report.chunks_sent
+                      << " elapsed_s=" << report.elapsed_seconds
+                      << " gbit_s=" << (report.bytes_per_second * 8.0 / 1e9)
+                      << '\n';
+            return report.files_failed == 0 ? 0 : 2;
         }
 
         if (command == "receive") {

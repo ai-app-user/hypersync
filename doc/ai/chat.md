@@ -1270,3 +1270,21 @@ Validation:
 - nopo hot samples: TCP receive/NFS write path around `2-3 Gbit/s`.
 
 Conclusion: the legacy `copy` command is still a correctness path: one TCP data stream, one receiver writer thread, and full metadata pre-scan before transfer. It cannot reach the requested `~200 Gbit/s` shape. The next implementation must wire copy onto the sharded job pipeline: `[MetaReader-NFS]->(FileQueue)->[DataReader-NFS-N]->(DataBufQueue-sharded-by-file)->[BufferSender-N x lanes]->TCP->[BufferReceiver-N x lanes]->(DataBufQueue-sharded-by-file)->[DataWriter-NFS/reactors]`.
+
+## 2026-05-20 09:05 PDT
+
+**User:** Corrected the architecture: abandon synchronous copy code and use the existing async job graph, with TCP sockets only bridging queues between transfer1 and nopo.
+
+**Codex:** Added explicit queue-native copy commands instead of tuning the old `copy` path.
+
+Source pipeline:
+`[MetaReader-NFS-N]->(FileQueue)->[DataReader-NFS-N]->(DataBufQueue-D x lanes)->[BufferSender-1 x lanes]`
+
+Target pipeline:
+`[BufferReceiver-1 x lanes]->(DataBufQueue-D x lanes)->[DataWriter-NFS-1 x lanes]`
+
+Notes:
+- `copy-source` reads real NFS files with `NfsDataBufferReaderJob` and pushes `DataBuffer` ownership into lane queues.
+- `copy-target` receives opaque `DataBuffer` frames and writes them with `TargetDataWriterJob`.
+- The generic buffer transport is now used strictly as a queue bridge across TCP.
+- Local compile passed with `make -j8 build/hypersync`.

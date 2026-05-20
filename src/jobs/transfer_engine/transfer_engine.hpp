@@ -638,6 +638,32 @@ public:
                                      std::string autoscale_profile = {},
                                      std::filesystem::path autoscale_settings_path = {},
                                      std::uint64_t autoscale_interval_ms = 1000) const;
+    [[nodiscard]] TransferReport run_copy_source_pipeline(const std::filesystem::path& source_root,
+                                                          const std::string& target_host,
+                                                          std::uint16_t base_port,
+                                                          std::size_t lanes = 16,
+                                                          bool recursive = true,
+                                                          std::size_t meta_reader_threads = 0,
+                                                          std::size_t metadata_async_depth = 0,
+                                                          std::size_t data_reader_threads = 0,
+                                                          std::size_t data_outstanding_requests = 0,
+                                                          std::size_t data_buffer_slots = 0,
+                                                          std::size_t lane_queue_depth = 0,
+                                                          bool pack_small_files = true,
+                                                          double max_duration_seconds = 0.0,
+                                                          std::uint32_t stats_interval_seconds = 5) const;
+    [[nodiscard]] TransferReport run_copy_target_pipeline(const std::string& target_root,
+                                                          const std::string& bind_host,
+                                                          std::uint16_t base_port,
+                                                          std::size_t lanes = 16,
+                                                          std::size_t data_buffer_slots_per_lane = 0,
+                                                          std::size_t lane_queue_depth = 0,
+                                                          bool verify_hash = false,
+                                                          bool preserve_metadata = true,
+                                                          bool target_fsync = true,
+                                                          bool ensure_target_directories = true,
+                                                          std::size_t writer_async_window = 0,
+                                                          std::size_t writer_file_window = 0) const;
     [[nodiscard]] TransferReport transfer_directory(const SenderRuntimeConfig& runtime) const;
     void run_receiver(const ReceiverRuntimeConfig& runtime) const;
     [[nodiscard]] static std::vector<FileSpec> scan_directory(const std::filesystem::path& source_root, bool recursive = true);

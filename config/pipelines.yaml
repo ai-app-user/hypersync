@@ -79,15 +79,18 @@ use_cases:
       - "Independent small and large generator lanes proved higher aggregate hardware headroom, but integrated mixed mode remains the production-realistic target."
 
   copy:
-    status: "NFS-to-NFS copy-all acceptance passed; sync/diff copy still in progress"
+    status: "NFS-to-NFS copy-all acceptance passed; async queue-native source/target commands added; sync/diff copy still in progress"
     purpose: "Copy, sync, or merge source filesystem content into a target filesystem."
     copy_all_acceptance_pipeline: "[SourceMetaReader-NFS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-NFS]->(DataSocket)->[ReceiverDataWriter-NFS]"
+    async_copy_source_pipeline: "[MetaReader-NFS-N]->(FileQueue)->[DataReader-NFS-N]->(DataBufQueue-D x lanes)->[BufferSender-1 x lanes]"
+    async_copy_target_pipeline: "[BufferReceiver-1 x lanes]->(DataBufQueue-D x lanes)->[DataWriter-NFS-1 x lanes]"
     intended_pipeline: "[SourceMetaReader-<backend>-N]->(FileQueue)->[DataReader-<backend>-N]->(DataBufQueue-sharded-by-file)->[DataWriter-<backend>-N] + [SourceMetaReader-<backend>-N]->(MetadataBufQueue)->[MetaWriter-<backend>-N]"
     mixed_future: "[SourceMetaReader-<backend>-N]->(FolderReadyQueue)->[FolderCreation-<backend>-N]->[ReadyClassifier+Governor]->(SmallReadyFileQueue)->[DataReader-<backend>/direct-submit]->[DataWriter-<backend>/reactors] + (LargeReadyFileQueue)->[DataReader-<backend>-N]->(DataQueue-sharded-by-file)->[DataWriter-<backend>-N]"
     hash_option: "Optional hash recording or comparison is enabled per source/target policy before or after write."
     notes:
       - "The current copy-all path is a packaged source-to-target runtime acceptance path, not yet the final optimized in-process copy/sync pipeline."
       - "2026-05-19 perf probe: legacy runtime copy is still single TCP data stream plus single receiver writer, and measured only ~2.6 Gbit/s on a 13.96 GB NFS-to-NFS copy. Do not treat it as the final 200G copy architecture."
+      - "2026-05-20 architecture correction: new `copy-source` and `copy-target` commands bypass legacy `copy` and bridge DataBuffer queues over N TCP lanes. This is now the path to tune for high-throughput copy."
       - "Remote NFS large-file copy must stream chunks from NFS into transfer buffers; never materialize whole large source files into FileSpec::content."
       - "Sync should reuse diff results to copy only source-only or changed files, with optional hash comparison when metadata is insufficient."
 

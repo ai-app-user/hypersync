@@ -244,6 +244,9 @@ struct TransferReport {
     std::size_t chunks_sent = 0;
     std::uint64_t bytes_planned = 0;
     std::uint64_t bytes_transferred = 0;
+    double elapsed_seconds = 0.0;
+    double bytes_per_second = 0.0;
+    std::string pipeline_description;
     std::string diff_csv;
     std::vector<FileSnapshot> source_scan_rows;
     std::vector<FileSnapshot> target_scan_rows;

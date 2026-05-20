@@ -16046,6 +16046,384 @@ void TransferEngine::run_distributed_diff_target(const std::filesystem::path& ta
     }
 }
 
+TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::path& source_root,
+                                                        const std::string& target_host,
+                                                        std::uint16_t base_port,
+                                                        std::size_t lanes,
+                                                        bool recursive,
+                                                        std::size_t meta_reader_threads,
+                                                        std::size_t metadata_async_depth,
+                                                        std::size_t data_reader_threads,
+                                                        std::size_t data_outstanding_requests,
+                                                        std::size_t data_buffer_slots,
+                                                        std::size_t lane_queue_depth,
+                                                        bool pack_small_files,
+                                                        double max_duration_seconds,
+                                                        std::uint32_t stats_interval_seconds) const {
+    if (source_root.empty()) {
+        throw std::runtime_error("--source is required");
+    }
+    if (target_host.empty()) {
+        throw std::runtime_error("--host is required");
+    }
+    lanes = std::max<std::size_t>(1U, lanes);
+
+    NfsMetaReaderConfig meta_config = load_nfs_meta_reader_config(config_store_);
+    meta_config.source_root = source_root.string();
+    meta_config.recursive = recursive;
+    if (meta_reader_threads != 0U) {
+        meta_config.worker_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0U) {
+        meta_config.async_directory_depth = metadata_async_depth;
+    }
+
+    NfsDataReaderConfig data_config = load_nfs_data_reader_config(config_store_);
+    data_config.source_root = source_root.string();
+    data_config.copy_data_from_nfs = true;
+    data_config.pack_small_files = pack_small_files;
+    data_config.small_file_threshold = config_.small_file_threshold;
+    data_config.large_chunk_bytes = config_.large_chunk_bytes;
+    if (data_reader_threads != 0U) {
+        data_config.data_reader_worker_count = data_reader_threads;
+    }
+    if (data_outstanding_requests != 0U) {
+        data_config.outstanding_requests = data_outstanding_requests;
+    }
+
+    const std::size_t effective_data_threads = std::max<std::size_t>(1U, data_config.data_reader_worker_count);
+    const std::size_t effective_outstanding = std::max<std::size_t>(1U, data_config.outstanding_requests);
+    lane_queue_depth = std::max<std::size_t>(1U, lane_queue_depth == 0U ? 1024U : lane_queue_depth);
+    const std::size_t minimum_pool_slots =
+        effective_data_threads * effective_outstanding + lanes * lane_queue_depth + lanes + 1U;
+    const std::size_t pool_slots =
+        std::max<std::size_t>(minimum_pool_slots,
+                              data_buffer_slots == 0U ? minimum_pool_slots * 2U : data_buffer_slots);
+
+    FlatMetadataWorkQueue folder_queue;
+    folder_queue.folders.push_back(FileSpec{});
+    DataReadFileQueue file_queue;
+    file_queue.max_entries = std::max<std::size_t>(65536U, effective_data_threads * effective_outstanding * 8U);
+
+    DataReadBenchmarkStats stats;
+    stats.print_interval_seconds = std::max<std::uint32_t>(1U, stats_interval_seconds);
+    stats.folders_found.store(1U, std::memory_order_relaxed);
+    reset_nfs_async_read_latency_metrics();
+
+    RawBufferPool data_pool = make_data_buffer_pool(pool_slots);
+    BufferPoolRegistry registry;
+    registry.register_pool(data_pool);
+    std::vector<std::unique_ptr<BufQueue>> lane_queues;
+    std::vector<std::unique_ptr<BufferSenderJob>> senders;
+    lane_queues.reserve(lanes);
+    senders.reserve(lanes);
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        lane_queues.push_back(std::make_unique<BufQueue>(lane_queue_depth));
+        senders.push_back(std::make_unique<BufferSenderJob>(
+            1U,
+            *lane_queues.back(),
+            registry,
+            BufferTransportEndpoint::tcp(target_host, static_cast<std::uint16_t>(base_port + lane))));
+    }
+
+    const auto file_provider = [&file_queue]() {
+        thread_local std::deque<FileSpec> worker_file_batch;
+        if (worker_file_batch.empty()) {
+            std::vector<FileSpec> next_batch = take_data_file_work_batch(file_queue, 128);
+            for (auto& file : next_batch) {
+                worker_file_batch.push_back(std::move(file));
+            }
+        }
+        if (worker_file_batch.empty()) {
+            return std::optional<FileSpec> {};
+        }
+        FileSpec file = std::move(worker_file_batch.front());
+        worker_file_batch.pop_front();
+        return std::optional<FileSpec> {std::move(file)};
+    };
+    const auto stop_predicate = [&file_queue]() {
+        return data_read_timer_expired(file_queue);
+    };
+    const auto direct_send = [&](std::size_t, const BufferHandle& handle) {
+        const DataBuffer& buffer = data_buffer(data_pool, handle);
+        const std::uint64_t key = is_packed_small_file_buffer(buffer) && buffer.trailer.folder_hash != 0U
+                                      ? buffer.trailer.folder_hash
+                                      : buffer.trailer.file_id;
+        const std::size_t lane = static_cast<std::size_t>(key % lanes);
+        if (lane_queues[lane]->try_push(handle)) {
+            return true;
+        }
+        return lane_queues[lane]->push_wait(handle);
+    };
+
+    NfsDataBufferReaderJob data_reader_job(data_config,
+                                           data_pool,
+                                           NfsDataBufferReaderJob::BufferConsumer(direct_send),
+                                           file_provider,
+                                           stop_predicate);
+    data_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
+        record_data_read_bytes(stats, bytes_read);
+    });
+    data_reader_job.set_file_read_callback([&stats]() {
+        record_data_read_file(stats);
+    });
+    data_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
+        stats.files_failed.fetch_add(1U, std::memory_order_relaxed);
+    });
+
+    const auto started_at = std::chrono::steady_clock::now();
+    stats.started_at = started_at;
+    stats.last_print_at = started_at;
+    if (max_duration_seconds > 0.0) {
+        const auto stop_at = started_at +
+                             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                 std::chrono::duration<double>(max_duration_seconds));
+        folder_queue.stop_at = stop_at;
+        file_queue.stop_at = stop_at;
+    }
+
+    std::thread stats_printer([&]() {
+        std::uint64_t last_bytes = 0;
+        std::uint64_t last_files = 0;
+        auto last = started_at;
+        while (!stats.printer_done.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lock(stats.printer_mutex);
+            stats.printer_cv.wait_for(lock, std::chrono::seconds(stats.print_interval_seconds), [&]() {
+                return stats.printer_done.load(std::memory_order_acquire);
+            });
+            const auto now = std::chrono::steady_clock::now();
+            const double interval = std::chrono::duration<double>(now - last).count();
+            if (interval <= 0.0) {
+                continue;
+            }
+            const auto reader_snapshot = data_reader_job.stats();
+            std::uint64_t sent_buffers = 0;
+            std::uint64_t sent_bytes = 0;
+            for (const auto& sender : senders) {
+                const BufferTransportStats sender_stats = sender->stats();
+                sent_buffers += sender_stats.buffers;
+                sent_bytes += sender_stats.payload_bytes;
+            }
+            std::cerr << "copy_source_progress"
+                      << " files_found=" << stats.files_found.load(std::memory_order_relaxed)
+                      << " files_read=" << reader_snapshot.files_read
+                      << " files_failed=" << reader_snapshot.files_failed
+                      << " read_gbit_s=" << (static_cast<double>(reader_snapshot.bytes_read - last_bytes) * 8.0 / interval / 1e9)
+                      << " read_files_s=" << (static_cast<double>(reader_snapshot.files_read - last_files) / interval)
+                      << " sent_buffers=" << sent_buffers
+                      << " sent_gbit_total=" << (static_cast<double>(sent_bytes) * 8.0 / 1e9)
+                      << '\n';
+            last = now;
+            last_bytes = reader_snapshot.bytes_read;
+            last_files = reader_snapshot.files_read;
+        }
+    });
+
+    std::mutex stop_timer_mutex;
+    std::condition_variable stop_timer_cv;
+    bool cancel_stop_timer = false;
+    std::thread stop_timer;
+    if (folder_queue.stop_at.has_value()) {
+        const auto stop_at = *folder_queue.stop_at;
+        stop_timer = std::thread([&]() {
+            std::unique_lock<std::mutex> lock(stop_timer_mutex);
+            const bool cancelled = stop_timer_cv.wait_until(lock, stop_at, [&]() {
+                return cancel_stop_timer;
+            });
+            if (!cancelled) {
+                request_flat_folder_stop(folder_queue);
+                request_data_file_stop(file_queue);
+            }
+        });
+    }
+
+    for (auto& sender : senders) {
+        sender->start();
+    }
+    data_reader_job.start();
+
+    std::vector<std::thread> metadata_workers;
+    const std::size_t metadata_threads = std::max<std::size_t>(1U, meta_config.worker_count);
+    metadata_workers.reserve(metadata_threads);
+    for (std::size_t index = 0; index < metadata_threads; ++index) {
+        metadata_workers.emplace_back(scan_data_read_metadata_worker,
+                                      meta_config.source_root,
+                                      meta_config.recursive,
+                                      std::max<std::size_t>(1U, meta_config.async_directory_depth),
+                                      meta_config.readdirplus_page_bytes,
+                                      0,
+                                      0,
+                                      std::ref(folder_queue),
+                                      std::ref(file_queue),
+                                      std::ref(stats),
+                                      nullptr,
+                                      nullptr);
+    }
+    for (auto& worker : metadata_workers) {
+        worker.join();
+    }
+    mark_data_file_input_done(file_queue);
+
+    std::exception_ptr pipeline_error;
+    try {
+        data_reader_job.wait();
+        for (auto& queue : lane_queues) {
+            queue->close();
+        }
+        for (auto& sender : senders) {
+            sender->wait();
+        }
+    } catch (...) {
+        pipeline_error = std::current_exception();
+        data_reader_job.stop();
+        for (auto& sender : senders) {
+            sender->stop();
+        }
+    }
+
+    stats.printer_done.store(true, std::memory_order_release);
+    stats.printer_cv.notify_all();
+    if (stats_printer.joinable()) {
+        stats_printer.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(stop_timer_mutex);
+        cancel_stop_timer = true;
+    }
+    stop_timer_cv.notify_all();
+    if (stop_timer.joinable()) {
+        stop_timer.join();
+    }
+    if (folder_queue.error) {
+        std::rethrow_exception(folder_queue.error);
+    }
+    if (file_queue.error) {
+        std::rethrow_exception(file_queue.error);
+    }
+    if (pipeline_error) {
+        std::rethrow_exception(pipeline_error);
+    }
+
+    std::uint64_t sent_buffers = 0;
+    for (const auto& sender : senders) {
+        sent_buffers += sender->stats().buffers;
+    }
+    const NfsDataBufferReaderStats reader_stats = data_reader_job.stats();
+    TransferReport report;
+    report.files_total = stats.files_found.load(std::memory_order_relaxed);
+    report.files_transferred = reader_stats.files_read;
+    report.files_failed = reader_stats.files_failed;
+    report.bytes_transferred = reader_stats.bytes_read;
+    report.chunks_sent = sent_buffers;
+    report.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    report.bytes_per_second =
+        report.elapsed_seconds > 0.0 ? static_cast<double>(reader_stats.bytes_read) / report.elapsed_seconds : 0.0;
+    report.pipeline_description = "[MetaReader-NFS-" + std::to_string(metadata_threads) +
+                                  "]->(FileQueue)->[DataReader-NFS-" +
+                                  std::to_string(effective_data_threads) +
+                                  "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
+                                  " x" + std::to_string(lanes) + ")->[BufferSender-1 x" +
+                                  std::to_string(lanes) + "]";
+    return report;
+}
+
+TransferReport TransferEngine::run_copy_target_pipeline(const std::string& target_root,
+                                                        const std::string& bind_host,
+                                                        std::uint16_t base_port,
+                                                        std::size_t lanes,
+                                                        std::size_t data_buffer_slots_per_lane,
+                                                        std::size_t lane_queue_depth,
+                                                        bool verify_hash,
+                                                        bool preserve_metadata,
+                                                        bool target_fsync,
+                                                        bool ensure_target_directories,
+                                                        std::size_t writer_async_window,
+                                                        std::size_t writer_file_window) const {
+    if (target_root.empty()) {
+        throw std::runtime_error("--target is required");
+    }
+    lanes = std::max<std::size_t>(1U, lanes);
+    lane_queue_depth = std::max<std::size_t>(1U, lane_queue_depth == 0U ? 1024U : lane_queue_depth);
+    data_buffer_slots_per_lane = std::max<std::size_t>(lane_queue_depth + 2U,
+                                                       data_buffer_slots_per_lane == 0U
+                                                           ? lane_queue_depth * 2U + 2U
+                                                           : data_buffer_slots_per_lane);
+
+    struct CopyTargetLane {
+        RawBufferPool pool;
+        BufferPoolRegistry registry;
+        BufQueue queue;
+        std::unique_ptr<BufferReceiverJob> receiver;
+        std::unique_ptr<TargetDataWriterJob> writer;
+
+        CopyTargetLane(std::size_t pool_slots, std::size_t queue_depth)
+            : pool(make_data_buffer_pool(pool_slots)),
+              queue(queue_depth) {
+            registry.register_pool(pool);
+        }
+    };
+
+    std::vector<std::unique_ptr<CopyTargetLane>> target_lanes;
+    target_lanes.reserve(lanes);
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        auto target_lane = std::make_unique<CopyTargetLane>(data_buffer_slots_per_lane, lane_queue_depth);
+        TargetDataWriterConfig writer_config = load_target_data_writer_config(config_store_);
+        writer_config.worker_count = 1U;
+        writer_config.target_root = target_root;
+        writer_config.verify_hash = verify_hash;
+        writer_config.preserve_metadata = preserve_metadata;
+        writer_config.fsync_on_finish = target_fsync;
+        writer_config.ensure_parent_directories = ensure_target_directories;
+        if (writer_async_window != 0U) {
+            writer_config.async_window = writer_async_window;
+        }
+        if (writer_file_window != 0U) {
+            writer_config.max_concurrent_file_transactions = writer_file_window;
+        }
+        target_lane->receiver = std::make_unique<BufferReceiverJob>(
+            1U,
+            target_lane->pool,
+            target_lane->queue,
+            BufferTransportEndpoint::tcp(bind_host.empty() ? std::string("0.0.0.0") : bind_host,
+                                         static_cast<std::uint16_t>(base_port + lane)));
+        target_lane->writer = std::make_unique<TargetDataWriterJob>(writer_config,
+                                                                    target_lane->pool,
+                                                                    target_lane->queue);
+        target_lanes.push_back(std::move(target_lane));
+    }
+
+    const auto started_at = std::chrono::steady_clock::now();
+    for (auto& lane : target_lanes) {
+        lane->writer->start();
+        lane->receiver->start();
+    }
+    for (auto& lane : target_lanes) {
+        lane->receiver->wait();
+    }
+    for (auto& lane : target_lanes) {
+        lane->writer->wait();
+    }
+
+    TransferReport report;
+    for (const auto& lane : target_lanes) {
+        const BufferTransportStats rx = lane->receiver->stats();
+        const TargetWriterStats writer = lane->writer->stats();
+        report.chunks_sent += rx.buffers;
+        report.bytes_transferred += writer.bytes_written;
+        report.files_transferred += writer.files_written;
+        report.files_failed += writer.files_failed;
+    }
+    report.files_total = report.files_transferred + report.files_failed;
+    report.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    report.bytes_per_second =
+        report.elapsed_seconds > 0.0 ? static_cast<double>(report.bytes_transferred) / report.elapsed_seconds : 0.0;
+    report.pipeline_description = "[BufferReceiver-1 x" + std::to_string(lanes) +
+                                  "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
+                                  " x" + std::to_string(lanes) + ")->[DataWriter-NFS-1 x" +
+                                  std::to_string(lanes) + "]";
+    return report;
+}
+
 TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& runtime) const {
     auto files = scan_directory_with_config(runtime.source_root, runtime.recursive);
     auto directories = scan_directories_for_transfer(runtime.source_root, runtime.recursive);

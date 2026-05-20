@@ -1717,3 +1717,15 @@ logical size: 335.99 TB
   - Interpretation:
     - Governor improved hot small-file rate from the non-governed spillway baseline (`~48K/s`) to about `66K/s` while preserving about `189G`.
     - It did not reach the `75K/s` floor. Because the governor was pegged and the small queue was usually empty, bulk reader pacing is not the whole bottleneck. The integrated path is not supplying the small writer continuously enough; likely next target is folder-ready/classifier/source ordering or a true independent small-discovery lane inside the integrated mode.
+
+- 2026-05-20 PDT async copy architecture correction:
+  - The legacy `copy` runtime is not the performance target. It pre-scans and uses a synchronous/monolithic transfer shape that measured only about `2.6 Gbit/s` on the 13.96 GB NFS-to-NFS probe.
+  - Added queue-native commands:
+    - Source: `copy-source`
+      - Pipeline: `[MetaReader-NFS-N]->(FileQueue)->[DataReader-NFS-N]->(DataBufQueue-D x lanes)->[BufferSender-1 x lanes]`
+      - Reads NFS data with `NfsDataBufferReaderJob` and sends owned `DataBuffer` handles through the generic buffer transport.
+    - Target: `copy-target`
+      - Pipeline: `[BufferReceiver-1 x lanes]->(DataBufQueue-D x lanes)->[DataWriter-NFS-1 x lanes]`
+      - Receives opaque `DataBuffer` frames and writes them through the existing `TargetDataWriterJob`.
+  - The TCP sockets are now only queue bridges. Data movement stays in the established job/queue architecture.
+  - This first correction handles the data plane. Metadata/folder transport is still expected to evolve into a separate queue-native lane; for the first performance pass, target writers can still use parent-directory creation or precreated folders depending on the test.
