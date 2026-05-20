@@ -11762,6 +11762,79 @@ std::uint64_t send_local_file_slots(int data_fd,
         .data_hash;
 }
 
+std::uint64_t send_remote_nfs_file_slots(int data_fd,
+                                         DataSlotPool& slot_pool,
+                                         NfsDataReader& data_reader,
+                                         const FileSpec& file,
+                                         const EngineConfig& config,
+                                         int priority_fd,
+                                         bool& paused,
+                                         std::deque<FileAckMessage>& pending_acks,
+                                         TransferReport& report) {
+    const RecBuf record = make_recbuf(file);
+    const bool is_small = record.size <= config.small_file_threshold;
+    Hash64State hasher;
+    std::size_t chunk_count = 0;
+    std::uint64_t logical_offset = 0;
+
+    (void)data_reader.stream_file_pooled_chunks(file, slot_pool, [&](PooledFileChunk&& chunk) {
+        DataSlotHandle handle = chunk.handle;
+        try {
+            DataBufTrailer& trailer = slot_pool.trailer(handle);
+            const std::size_t len = trailer.data_len;
+            if (chunk.offset != logical_offset || trailer.data_offset != logical_offset) {
+                throw std::runtime_error("remote NFS source chunk offset mismatch for " + file.rel_path);
+            }
+            if (len != 0U) {
+                hasher.update(std::string_view(slot_pool.data(handle), len));
+            }
+            logical_offset += len;
+            const bool is_last = logical_offset >= record.size;
+            populate_slot_for_chunk(slot_pool,
+                                    handle,
+                                    record,
+                                    chunk.offset,
+                                    std::string_view(slot_pool.data(handle), len),
+                                    is_small,
+                                    is_last,
+                                    hasher.value());
+
+            drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
+            wait_for_sender_resume(priority_fd, paused, pending_acks);
+            send_data_slot(data_fd, slot_pool, handle);
+            ++report.chunks_sent;
+            ++chunk_count;
+            slot_pool.release(handle);
+        } catch (...) {
+            slot_pool.release(handle);
+            throw;
+        }
+    });
+
+    if (record.size == 0 && chunk_count == 0) {
+        DataSlotHandle handle = slot_pool.acquire_or_throw(DataSlotClass::small, 0);
+        populate_slot_for_chunk(slot_pool,
+                                handle,
+                                record,
+                                0,
+                                std::string_view(slot_pool.data(handle), 0),
+                                true,
+                                true,
+                                hasher.value());
+        drain_sender_priority_events(priority_fd, 0, paused, pending_acks);
+        wait_for_sender_resume(priority_fd, paused, pending_acks);
+        send_data_slot(data_fd, slot_pool, handle);
+        ++report.chunks_sent;
+        slot_pool.release(handle);
+        ++chunk_count;
+    }
+
+    if (logical_offset != record.size) {
+        throw std::runtime_error("remote NFS source size mismatch for " + file.rel_path);
+    }
+    return hasher.value();
+}
+
 std::uint64_t write_packed_small_file_entry(char* payload,
                                             std::size_t& offset,
                                             const PreparedTransfer& prepared) {
@@ -11969,10 +12042,10 @@ PreparedTransfer prepare_transfer_file(const PendingTransferFile& pending,
         return prepared;
     }
 
-    if (remote_source) {
+    if (remote_source && prepared.record.size <= config.small_file_threshold) {
         prepared.file = data_reader.load_file(prepared.file.rel_path);
         prepared.content_loaded = true;
-    } else {
+    } else if (!remote_source) {
         prepared.source_path = source_root / prepared.file.rel_path;
     }
 
@@ -16008,6 +16081,9 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
     data_reader_config.small_file_threshold = config_.small_file_threshold;
     data_reader_config.large_chunk_bytes = config_.large_chunk_bytes;
     data_reader_config.source_root = runtime.source_root.string();
+    data_reader_config.outstanding_requests =
+        std::min<std::size_t>(std::max<std::size_t>(1, config_.large_pool_slots),
+                              std::max<std::size_t>(1, data_reader_config.outstanding_requests));
     NfsDataReader data_reader(data_reader_config);
     const bool enable_cache = !runtime.cache_root.empty();
     DataCacherConfig cache_config = load_data_cacher_config(config_store_);
@@ -16018,6 +16094,7 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
     DataCacher cacher(cache_config);
     DataSlotPool sender_slots(config_.small_pool_slots, config_.large_pool_slots);
     DataSlotPool cache_slots(config_.small_pool_slots, config_.large_pool_slots);
+    NfsDataReader stream_data_reader(data_reader_config);
     bool paused = false;
     std::deque<FileAckMessage> pending_acks;
     std::vector<PendingTransferFile> decision_files;
@@ -16150,6 +16227,16 @@ TransferReport TransferEngine::transfer_directory(const SenderRuntimeConfig& run
                                         paused,
                                         pending_acks,
                                         report);
+            } else if (remote_source) {
+                prepared.data_hash = send_remote_nfs_file_slots(data_fd.get(),
+                                                                sender_slots,
+                                                                stream_data_reader,
+                                                                prepared.file,
+                                                                config_,
+                                                                priority_fd.get(),
+                                                                paused,
+                                                                pending_acks,
+                                                                report);
             } else {
                 prepared.data_hash = send_local_file_slots(data_fd.get(),
                                                            sender_slots,
