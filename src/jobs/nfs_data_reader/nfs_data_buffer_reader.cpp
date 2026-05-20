@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "common/hash_utils.hpp"
+#include "common/path_utils.hpp"
 #include "common/records.hpp"
 #include "core/data_buffer_codec.hpp"
 #include "core/nfs_backend.hpp"
@@ -133,6 +134,10 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
         }
         if (!file.has_value()) {
             break;
+        }
+        if (normalize_path(file->rel_path).empty()) {
+            record_file_failed(*file);
+            continue;
         }
 
         try {
