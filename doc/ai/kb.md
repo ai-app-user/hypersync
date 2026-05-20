@@ -1740,3 +1740,15 @@ logical size: 335.99 TB
   - Bumped release version to `hypersync 0.0.4`.
   - High-level result: saved-profile integrated mixed replay wrote `4,134,954` files and `1.479 TB` in `60s` with zero failures, averaging `189.47 Gbit/s` and ending at `193.61 Gbit/s`.
   - Remaining gap to `200 Gbit/s` still appears to be integrated supply/orchestration rather than raw small-file writer capacity.
+
+## 2026-05-20 - Async Copy Pipeline Smoke
+
+- Implemented NFS target export-prefix handling: target URLs under `/volumes/<uuid>/<share>/<subdir>` now mount `/volumes/<uuid>/<share>` and write under `<subdir>` instead of attempting to mount the subdir as an export.
+- `copy-target` lanes now keep the full VIP expression and vary endpoint offsets, so each lane can fail over across the VIP list instead of being pinned to one exact IP.
+- Target data writer now discards pathless regular transport frames; packed-small-file detection now trusts the payload magic/version so transported packed buffers remain decodable even if trailer flags are not preserved.
+- Smoke run using source `nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/HaWoR/video/path/0/175593000` to target `nfs://172.27.255.2-172.27.255.17/volumes/dfb990b1-bf40-4378-85f1-26f9dfd0cd2c/data/async-copy-smoke-root-beddb70-20260520T160756Z` passed functionally:
+  - Source pipeline: `[MetaReader-NFS-16]->(FileQueue)->[DataReader-NFS-32]->(DataBufQueue-256 x4)->[BufferSender-1 x4]`
+  - Target pipeline: `[BufferReceiver-1 x4]->(DataBufQueue-256 x4)->[DataWriter-NFS-1 x4]`
+  - Source: `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`.
+  - Target: `files_written=505`, `failed=0`, `bytes=9335989`, `buffers_received=39`; verified 505 files on target.
+  - Performance was poor (`elapsed_s=160.611`, `gbit_s=0.000465`) because TCP sender/receiver startup or target acceptance delayed buffer movement; next work should instrument lane connection/accept timing and start listeners before any target-side NFS writer activity.
