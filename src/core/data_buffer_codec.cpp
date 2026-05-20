@@ -136,8 +136,7 @@ bool append_packed_small_file(DataBuffer& buffer, const FileSpec& file, std::str
 
 bool is_packed_small_file_buffer(const DataBuffer& buffer) noexcept {
     const std::byte* const bytes = buffer.bytes.data();
-    return (buffer.trailer.flags & kFlagPackedSmallFiles) != 0U &&
-           detail::read_u32(bytes) == detail::kPackedSmallFileMagic &&
+    return detail::read_u32(bytes) == detail::kPackedSmallFileMagic &&
            detail::read_u16(bytes + 4U) == detail::kPackedSmallFileVersion;
 }
 
