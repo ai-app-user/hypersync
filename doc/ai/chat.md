@@ -1235,3 +1235,13 @@ Validation, `10000us` ceiling (`2ff3c8d`):
 - Worse than the `2000us` ceiling, so the ceiling was restored to `2000us` in `2042c05`.
 
 Conclusion: the governor improves integrated true-small IOPS materially versus the non-governed spillway run (`~48K/s` hot small) while preserving about `189G` total, but it does not achieve the requested stable `75K/s` floor. Since the governor stayed pegged yet small stayed below target, the bottleneck is not just bulk reader overrun. The likely remaining limiter is the integrated folder-ready/classifier/source ordering path: the small queue is usually empty, meaning the small writer is not continuously supplied like it is in the two-independent-pipeline proof.
+## 2026-05-19 21:40 PDT
+
+**User:** Asked to try the final complex copy/sync pipeline, starting with a simple copy-all from transfer1 to nopo, then later moving to sync/diff-driven copy.
+
+**Codex:** Used the normal deployment model. Built a clean package on transfer1 from Git `dev` instead of copying source files to nopo. Deployed only the package artifact to nopo1. Ran receiver on nopo against `nfs://172.27.255.2-172.27.255.17/volumes/dfb990b1-bf40-4378-85f1-26f9dfd0cd2c/data/copy-accept-20260520T043642Z` and sender on transfer1 against `/mnt/local-nvme/wsync-codex/copy-source-20260520T043626Z`.
+
+Pipeline:
+`[SourceMetaReader-FS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-FS]->(DataSocket)->[ReceiverDataWriter-NFS]`
+
+Result: copy-all acceptance passed. Sender reported `files_total=1016 transferred=1016 skipped=0 failed=0 bytes=280723456 chunks_sent=322`, elapsed `9.80s`. Target verification found `1016` files and `280723456` bytes, and sampled hashes matched source.

@@ -79,11 +79,15 @@ use_cases:
       - "Independent small and large generator lanes proved higher aggregate hardware headroom, but integrated mixed mode remains the production-realistic target."
 
   copy:
-    status: "not fully done"
+    status: "copy-all acceptance passed; sync/diff copy still in progress"
     purpose: "Copy, sync, or merge source filesystem content into a target filesystem."
+    copy_all_acceptance_pipeline: "[SourceMetaReader-FS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-FS]->(DataSocket)->[ReceiverDataWriter-NFS]"
     intended_pipeline: "[SourceMetaReader-<backend>-N]->(FileQueue)->[DataReader-<backend>-N]->(DataBufQueue-sharded-by-file)->[DataWriter-<backend>-N] + [SourceMetaReader-<backend>-N]->(MetadataBufQueue)->[MetaWriter-<backend>-N]"
     mixed_future: "[SourceMetaReader-<backend>-N]->(FolderReadyQueue)->[FolderCreation-<backend>-N]->[ReadyClassifier+Governor]->(SmallReadyFileQueue)->[DataReader-<backend>/direct-submit]->[DataWriter-<backend>/reactors] + (LargeReadyFileQueue)->[DataReader-<backend>-N]->(DataQueue-sharded-by-file)->[DataWriter-<backend>-N]"
     hash_option: "Optional hash recording or comparison is enabled per source/target policy before or after write."
+    notes:
+      - "The current copy-all path is a packaged source-to-target runtime acceptance path, not yet the final optimized in-process copy/sync pipeline."
+      - "Sync should reuse diff results to copy only source-only or changed files, with optional hash comparison when metadata is insufficient."
 
 test_pipelines:
   metadata_generator_discard:
