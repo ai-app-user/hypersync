@@ -46,10 +46,9 @@ namespace {
     return path;
 }
 
-[[nodiscard]] bool is_empty_regular_data_buffer(const DataBuffer& buffer) {
+[[nodiscard]] bool is_pathless_regular_data_buffer(const DataBuffer& buffer) {
     return !is_packed_small_file_buffer(buffer) &&
-           buffer.trailer.rel_path.view().empty() &&
-           buffer.trailer.data_len == 0U;
+           buffer.trailer.rel_path.view().empty();
 }
 
 [[nodiscard]] std::string describe_data_buffer_trailer(const DataBuffer& buffer) {
@@ -573,8 +572,8 @@ void TargetDataWriterJob::process_regular_batch(TargetWriterBackend& backend,
     chunks.reserve(handles.size());
     for (const BufferHandle& handle : handles) {
         const DataBuffer& buffer = data_buffer(data_pool_, handle);
-        if (is_empty_regular_data_buffer(buffer)) {
-            record_buffer(0);
+        if (is_pathless_regular_data_buffer(buffer)) {
+            record_buffer(buffer.trailer.data_len);
             continue;
         }
         if (is_packed_small_file_buffer(buffer)) {
@@ -659,8 +658,8 @@ void TargetDataWriterJob::process_packed_small_file_batch(TargetWriterBackend& b
 }
 
 void TargetDataWriterJob::write_regular_buffer(TargetWriterBackend& backend, const DataBuffer& buffer) {
-    if (is_empty_regular_data_buffer(buffer)) {
-        record_buffer(0);
+    if (is_pathless_regular_data_buffer(buffer)) {
+        record_buffer(buffer.trailer.data_len);
         return;
     }
     const FileSpec file = file_spec_from_trailer(buffer.trailer);
