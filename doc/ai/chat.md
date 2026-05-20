@@ -169,6 +169,12 @@ logical size: 335.99 TB
 `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`
 against `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/profile-replay-small-20260520T014149Z`. Result after 10s: `858,040` files written, `53.71 GB`, zero failures, final sample `84,843.9 files/s`, full-run average `83,527.2 files/s`.
 
+**User:** Asked to run the profile-backed generator longer and check whether it gets close to `200 Gbit/s`.
+
+**Codex:** Ran the saved-profile integrated mixed generator pipeline for `60s` on agnopo against `profile-replay-mixed-60s-20260520T014505Z`. Pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway+Governor]->(SmallReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000+MediumSpillway)->[DataReader-SYN-64 governed]->(DataQueue-64x512)->[DataWriter-NFS-64] + (LargeReadyFileQueue-500000+LargeSpillway)->[DataReader-SYN-112 governed]->(DataQueue-112x512)->[DataWriter-NFS-112]`.
+Result: zero failures, `4,134,954` files written, `1.479 TB`, full-run average `189.47 Gbit/s`, final sample `193.61 Gbit/s`, small `61,767 files/s`, medium `31.50 Gbit/s`, large `131.16 Gbit/s`. It improved with time but did not hit `200 Gbit/s` inside the integrated mode.
+
 ### 2026-05-12 22:45 PDT
 
 **User:** Asked to execute the checker/diff plan, then when checker was done to test it on transfer/nopo with bounded time, add efficient data read/data transfer for files with attention to many small files, verify regressions, and keep working autonomously overnight.
