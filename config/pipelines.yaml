@@ -58,6 +58,8 @@ use_cases:
   generator:
     status: "active performance target"
     purpose: "Create synthetic filesystems, optionally replaying a recorded profile, and use this for writer and pipeline validation."
+    saved_replay_profile: "doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt"
+    saved_replay_source_url: "synthetic-profile://doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt?payload=prng&files-per-batch=1024"
     small_file_hot_pipeline: "[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]"
     mixed_pipeline_current: "[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN/NFS-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway+Governor]->(SmallReadyFileQueue-500000)->[DataReader-SYN/NFS-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN/NFS-64 governed]->(DataQueue-64x512)->[DataWriter-NFS-64] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN/NFS-112 governed]->(DataQueue-112x512)->[DataWriter-NFS-112]"
     classifier:
@@ -73,6 +75,7 @@ use_cases:
       large_data_reader_threads: 112
     notes:
       - "The small hot path is the current known-good generator pipeline."
+      - "Use saved_replay_source_url when testing the generator against the captured whole-source profile, rather than the default synthetic distribution."
       - "Independent small and large generator lanes proved higher aggregate hardware headroom, but integrated mixed mode remains the production-realistic target."
 
   copy:

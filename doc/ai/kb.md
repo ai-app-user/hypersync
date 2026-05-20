@@ -145,6 +145,9 @@ hypersync/deploy/package-linux.sh
 - Current generator small-file hot path:
   `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
 - Use-case hashing is an option inside each pipeline, either to record hashes or compare hashes. It should be represented as normal pipeline work, not as a side-channel bypass.
+- Saved profile-backed generator source:
+  `synthetic-profile://doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt?payload=prng&files-per-batch=1024`.
+- 2026-05-19 PDT agnopo replay validation at commit `7bacf62`: source was the saved data-sampled 100M-phase profile, target was `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/profile-replay-small-20260520T014149Z`, pipeline was `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`, small filter was `--max-file-size-bytes 131072`, duration `10s`. Result: `858,040` files written, `53.71 GB`, zero read/write failures, final sample `84,843.9 files/s` and `42.48 Gbit/s`, full-run average `83,527.2 files/s` and `41.82 Gbit/s`.
 
 ## Key Hosts
 

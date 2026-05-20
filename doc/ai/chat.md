@@ -163,6 +163,12 @@ logical size: 335.99 TB
 
 **Codex:** Added `hypersync/config/pipelines.yaml` as the canonical registry for use-case pipeline shapes and major knobs. Recorded the generator small-file hot path `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`, the current mixed generator pipeline, scan/diff/profile/copy intended shapes, and job-isolation test pipelines. Updated design docs and AI knowledge notes to point to this registry.
 
+**User:** Asked to try that generator pipeline using the saved replay profile rather than generic synthetic defaults.
+
+**Codex:** Deployed commit `7bacf62` to agnopo via git and rebuilt from the workspace root. Verified the saved profile `source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt` with `benchmark-synthetic-replay`: 1M records at `7.75M files/s`. The first direct smoke with full folder-ready write to `null://` exposed a bad memory/timer interaction and was killed. A replay-to-discard folder-ready run succeeded for 5s, reaching about `158K` filtered files/s. Then ran the real NFS generator pipeline:
+`[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`
+against `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/profile-replay-small-20260520T014149Z`. Result after 10s: `858,040` files written, `53.71 GB`, zero failures, final sample `84,843.9 files/s`, full-run average `83,527.2 files/s`.
+
 ### 2026-05-12 22:45 PDT
 
 **User:** Asked to execute the checker/diff plan, then when checker was done to test it on transfer/nopo with bounded time, add efficient data read/data transfer for files with attention to many small files, verify regressions, and keep working autonomously overnight.
