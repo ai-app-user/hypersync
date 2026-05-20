@@ -1245,3 +1245,14 @@ Pipeline:
 `[SourceMetaReader-FS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-FS]->(DataSocket)->[ReceiverDataWriter-NFS]`
 
 Result: copy-all acceptance passed. Sender reported `files_total=1016 transferred=1016 skipped=0 failed=0 bytes=280723456 chunks_sent=322`, elapsed `9.80s`. Target verification found `1016` files and `280723456` bytes, and sampled hashes matched source.
+
+## 2026-05-19 22:39 PDT
+
+**User:** Clarified that copy testing must read from NFS on transfer1, transfer over TCP to nopo, and write to NFS on nopo.
+
+**Codex:** Corrected the test topology. Started a packaged receiver on nopo targeting `nfs://172.27.255.2-172.27.255.17/volumes/dfb990b1-bf40-4378-85f1-26f9dfd0cd2c/data/nfs2nfs-copy-20260520T053403Z`, then ran sender on transfer1 with source `nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/HaWoR/video/path/0/175593000`.
+
+Pipeline:
+`[SourceMetaReader-NFS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-NFS]->(DataSocket)->[ReceiverDataWriter-NFS]`
+
+Result: NFS-to-NFS copy-all acceptance passed. Sender reported `files_total=506 transferred=506 skipped=0 failed=0 bytes=9564146 chunks_sent=509`, elapsed `35.84s`. Source count/bytes were `506` files and `9564146` bytes. Sampled target file hashes matched source. Recursive kernel-mounted target verification can stall on this nopo tree, so use bounded direct file checks or libnfs verification rather than broad `find`/`du` over the target mount.
