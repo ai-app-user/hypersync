@@ -16365,11 +16365,14 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
 
     std::vector<std::unique_ptr<CopyTargetLane>> target_lanes;
     target_lanes.reserve(lanes);
+    const std::vector<std::string> target_candidates =
+        is_nfs_url(target_root) ? expand_nfs_url_server_candidates(target_root) : std::vector<std::string> {};
     for (std::size_t lane = 0; lane < lanes; ++lane) {
         auto target_lane = std::make_unique<CopyTargetLane>(data_buffer_slots_per_lane, lane_queue_depth);
         TargetDataWriterConfig writer_config = load_target_data_writer_config(config_store_);
         writer_config.worker_count = 1U;
-        writer_config.target_root = target_root;
+        writer_config.target_root =
+            target_candidates.empty() ? target_root : target_candidates[lane % target_candidates.size()];
         writer_config.verify_hash = verify_hash;
         writer_config.preserve_metadata = preserve_metadata;
         writer_config.fsync_on_finish = target_fsync;
