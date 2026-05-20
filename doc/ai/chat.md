@@ -14,6 +14,18 @@ This file is the persistent conversation log for this Codex session. Entries are
 
 **Codex:** Created local project infrastructure repo at `/Users/agavrilov/src/project-infra`, added token-safe GitHub setup scripts and common docs, then published it as private GitHub repo `https://github.com/ai-app-user/project-infra`.
 
+## 2026-05-20 09:30 PDT
+
+**User:** Asked to push the `16e81ad` profile replay result to `main`, add a high-level summary, and bump the `0.0.x` version.
+
+**Codex:** Promoted the saved-profile mixed generator result to the `main` docs and bumped the release version to `0.0.4`.
+
+High-level summary: saved-profile integrated mixed replay wrote `4,134,954`
+files and `1.479 TB` in `60s` with zero failures, averaging `189.47 Gbit/s`
+and ending at `193.61 Gbit/s`. The result is close to the `200 Gbit/s` target,
+but the remaining gap is likely integrated supply/orchestration because the
+governor was capped and the small queue was mostly empty.
+
 ## Backfilled Session History
 
 ### 2026-05-12 12:32 PDT

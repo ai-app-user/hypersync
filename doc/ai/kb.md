@@ -1,6 +1,6 @@
 # WSync Codex Session Knowledge Base
 
-Last updated: 2026-05-12 21:00 PDT
+Last updated: 2026-05-20 09:30 PDT
 
 ## Persistent Context Rules
 
@@ -22,7 +22,7 @@ Last updated: 2026-05-12 21:00 PDT
   - `piper/`: reusable asynchronous pipeline infrastructure.
   - `hypersync/`: WSync app-specific implementation.
 - The IDE may still show stale `aspipe/` paths; the intended reusable library name is `piper`.
-- Version reported by current release builds: `hypersync 0.0.3`.
+- Version reported by current release builds: `hypersync 0.0.4`.
 
 ## Workspace GitHub Projects
 
@@ -58,6 +58,19 @@ Last updated: 2026-05-12 21:00 PDT
 - `deploy/package-linux.sh` builds or stages a Linux release binary and creates
   a flat deploy folder. The user-facing bundle contains no `bin/`, `lib/`,
   `config/`, or `doc/` subfolders.
+
+## 0.0.4 High-Level Summary
+
+- Promotes the profile-backed generator replay validation recorded in `16e81ad`.
+- Saved-profile mixed replay on agnopo wrote `4,134,954` files and `1.479 TB`
+  in `60s` with zero failures.
+- Sustained average was `189.47 Gbit/s`; final sample was `193.61 Gbit/s`.
+- Final bucket rates were small `61,767 files/s`, medium `31.50 Gbit/s`, and
+  large `131.16 Gbit/s`.
+- The remaining gap to `200 Gbit/s` in integrated mode appears to be
+  supply/orchestration: the governor stayed capped and the small queue remained
+  mostly empty, while isolated small writer capacity had already been proven
+  higher.
 - Flat bundle layout:
   - `hypersync`: launcher script users run.
   - `hypersync.bin`: compiled executable.
