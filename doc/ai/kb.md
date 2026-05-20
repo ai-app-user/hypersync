@@ -1,6 +1,6 @@
 # WSync Codex Session Knowledge Base
 
-Last updated: 2026-05-12 21:00 PDT
+Last updated: 2026-05-20 09:30 PDT
 
 ## Persistent Context Rules
 
@@ -22,7 +22,7 @@ Last updated: 2026-05-12 21:00 PDT
   - `piper/`: reusable asynchronous pipeline infrastructure.
   - `hypersync/`: WSync app-specific implementation.
 - The IDE may still show stale `aspipe/` paths; the intended reusable library name is `piper`.
-- Version reported by current release builds: `hypersync 0.0.3`.
+- Version reported by current release builds: `hypersync 0.0.4`.
 
 ## Workspace GitHub Projects
 
@@ -1734,3 +1734,9 @@ logical size: 335.99 TB
     - Pipeline: `[MetaReader-NFS-16]->(FileQueue)->[DataReader-NFS-32]->(DataBufQueue-256 x4)->[BufferSender-1 x4]`
     - Result: `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`.
   - Target-side smoke exposed a remaining NFS URL/export limitation: `DataWriter-NFS` currently mounts the full target URL path as the export. New per-run subdirectories under the export fail at `nfs_mount_async` (`MNT3ERR_NOENT` or timeout). Before a full NFS-to-NFS copy perf run, add export-root plus target-prefix handling so the backend mounts `/volumes/.../data` and writes under a safe relative prefix.
+
+- 2026-05-20 PDT 0.0.4 release summary:
+  - Promoted the profile-backed generator replay validation recorded in `16e81ad` to `main`.
+  - Bumped release version to `hypersync 0.0.4`.
+  - High-level result: saved-profile integrated mixed replay wrote `4,134,954` files and `1.479 TB` in `60s` with zero failures, averaging `189.47 Gbit/s` and ending at `193.61 Gbit/s`.
+  - Remaining gap to `200 Gbit/s` still appears to be integrated supply/orchestration rather than raw small-file writer capacity.

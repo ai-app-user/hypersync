@@ -1293,3 +1293,14 @@ Notes:
   `pipeline=[MetaReader-NFS-16]->(FileQueue)->[DataReader-NFS-32]->(DataBufQueue-256 x4)->[BufferSender-1 x4]`,
   `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`.
 - Target-side smoke found an existing NFS backend limitation: `DataWriter-NFS` mounts the full NFS URL as an export, so a target URL with a new subdirectory under the export fails or times out at `nfs_mount_async`. The next fix is to split NFS URLs into export root plus target-relative prefix, or add an explicit target-prefix rewrite lane, so copy can safely write under a unique subdirectory while mounting the existing export.
+
+## 2026-05-20 09:30 PDT
+
+**User:** Asked to push the `16e81ad` profile replay result to `main`, add a high-level summary, and bump the `0.0.x` version.
+
+**Codex:** Promoted the saved-profile mixed generator result to `main`, bumped the release version to `0.0.4`, and mirrored the version/summary back to `dev`.
+
+High-level summary: saved-profile integrated mixed replay wrote `4,134,954`
+files and `1.479 TB` in `60s` with zero failures, averaging `189.47 Gbit/s`
+and ending at `193.61 Gbit/s`. The remaining gap to `200 Gbit/s` is still
+likely integrated supply/orchestration rather than raw writer capacity.

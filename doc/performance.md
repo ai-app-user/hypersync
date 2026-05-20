@@ -5,6 +5,20 @@ pipelines. These numbers are expectations for engineering work, not portable CI
 thresholds. Automated performance tests use small smoke workloads and only check
 that benchmark commands run and report sane metrics.
 
+## Release 0.0.4 Summary
+
+Release `0.0.4` promotes the saved-profile mixed generator replay result from
+commit `16e81ad`. On agnopo, the profile-backed integrated mixed writer ran for
+`60s`, wrote `4,134,954` files and `1.479 TB`, and completed with zero failures.
+The full-run average was `189.47 Gbit/s`; the final sample reached
+`193.61 Gbit/s` with small files at `61,767 files/s`, medium at `31.50 Gbit/s`,
+and large at `131.16 Gbit/s`.
+
+The run improved over time but did not reach `200 Gbit/s` in the integrated
+mode. The governor stayed capped at `bulk_pacing_us=2000` and the small queue
+remained mostly empty, so the remaining gap is most likely integrated
+supply/orchestration rather than raw small-file writer capacity.
+
 ## Test Host
 
 Current remote baseline host:
