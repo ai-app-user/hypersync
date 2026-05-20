@@ -468,7 +468,9 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     if (options.direct_reactor_lane) {
         pin_current_thread_to_cpu(worker_index);
     }
-    auto backend = make_target_writer_backend(config_.target_root, worker_index, options);
+    auto backend = make_target_writer_backend(config_.target_root,
+                                              config_.endpoint_index_offset + worker_index,
+                                              options);
     BufferHandle handle;
     while (!stop_requested() && pop_input(worker_index, handle)) {
         std::vector<BufferHandle> batch;

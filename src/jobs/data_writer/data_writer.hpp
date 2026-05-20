@@ -76,6 +76,7 @@ struct TargetDataWriterConfig {
     std::size_t reactors_per_ip = 1;
     std::size_t reactor_count = 0;
     std::size_t max_concurrent_file_transactions = 64;
+    std::size_t endpoint_index_offset = 0;
 
     TargetDataWriterConfig();
     TargetDataWriterConfig(std::size_t worker_count,
