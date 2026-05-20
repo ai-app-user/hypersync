@@ -141,6 +141,10 @@ hypersync/deploy/package-linux.sh
 - Sharded queues are preferred/default for development/testing.
 - For Hark scans going forward: never scan through kernel-mounted NFS. Use libnfs only, with DuckDB parquet output.
 - For Hark runtime packaging: both DuckDB and libnfs shared libraries must be shipped/staged beside the executable; do not install system packages.
+- Canonical use-case pipeline profiles now live in `hypersync/config/pipelines.yaml`. Use this file to remember scan, diff, profile, generator, copy, and isolation-test pipeline shapes and major knobs.
+- Current generator small-file hot path:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
+- Use-case hashing is an option inside each pipeline, either to record hashes or compare hashes. It should be represented as normal pipeline work, not as a side-channel bypass.
 
 ## Key Hosts
 

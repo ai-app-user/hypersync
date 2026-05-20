@@ -1762,6 +1762,28 @@ reader side: small-file writers optimize file completion rate, large-file writer
 consume remaining bandwidth, and the controller shifts capacity according to ETA
 tension while preserving per-file queue affinity.
 
+### Use-Case Pipeline Profiles
+
+Canonical pipeline shapes and important knobs are recorded in
+`config/pipelines.yaml`. That file is the shared memory for use-case topology:
+
+- `scan`: filesystem metadata scan, summary reporting, and optional DB/parquet
+  persistence.
+- `diff`: source/target comparison, optionally using recorded indexes and
+  content hashes.
+- `profile`: compact workload capture with phases, folder topology, size
+  distributions, and optional sampled data-read latency.
+- `generator`: synthetic/profile-based filesystem creation. The current
+  small-file generator hot path is:
+  `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
+- `copy`: source-to-target copy/sync/merge. This is still under active
+  implementation and must reuse the same `MetaReader`, `DataReader`,
+  `MetaWriter`, and `DataWriter` job contracts.
+
+Hashing is a per-use-case option, not a separate mode that bypasses the
+pipeline. When enabled, it is inserted as a normal job or backend operation in
+the configured topology.
+
 ### Phase 2 — NVMe Cache
 
 Goal: decouple reader and writer. Enable transfers larger than RAM.

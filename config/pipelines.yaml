@@ -1,0 +1,102 @@
+# Canonical Hypersync pipeline profiles by use case.
+#
+# This file is the durable registry for pipeline shapes and important knobs.
+# It is design/ops memory first; not every field is necessarily wired into the
+# runtime CLI yet. When a pipeline becomes the default for a use case, record it
+# here before relying on it in benchmark notes.
+#
+# Display convention:
+#   [Job-threads/options]->(Queue-shards/depth)->[Job-threads/options]
+#
+# Backend suffixes:
+#   NFS: libnfs-backed remote filesystem
+#   SYN: synthetic/profile replay backend
+#   FS: local filesystem backend, not fully implemented yet
+
+version: 1
+
+global_options:
+  hashing:
+    modes:
+      - none
+      - record
+      - compare
+    placement:
+      scan: "Optional [DataReader-<backend>]->[DataHasher] side path when scan must record content hashes."
+      diff: "Optional [DataReader-<backend>]->[DataHasher] on compare candidates when metadata is insufficient."
+      copy: "Optional [DataHasher] before write, or post-write verify path, depending on correctness policy."
+      profile: "Optional sampled [DataReader-<backend>]->[LatencyAccumulator] plus hash sampling if requested."
+      generator: "Usually none; can generate deterministic payload hashes for verification tests."
+
+use_cases:
+  scan:
+    status: "supported"
+    purpose: "Scan filesystem metadata; report files, folders, bytes, rates, and optionally persist records in DB/parquet."
+    primary_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(MetadataBufQueue)->[MetadataRecordWriter-32]"
+    stats_only_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(MetadataBufQueue)->[MetadataStatsDiscarder-1]"
+    output_options:
+      - "live progress"
+      - "summary"
+      - "csv/parquet/db"
+    hash_option: "If hashes are requested, scan adds a data-read/hash side path and records hash columns with metadata."
+
+  diff:
+    status: "supported, still performance-tuned by scenario"
+    purpose: "Compare local and remote filesystems; optionally persist same/changed/source-only/target-only results."
+    live_pipeline: "[SourceMetaReader-<backend>-N]->(SourceMetadataQueue)->[DiffChecker-N]<-(TargetMetadataQueue)<-[TargetMetaReader-<backend>-N]->(DiffResultQueue)->[DiffWriter-1]"
+    indexed_pipeline: "[SourceIndexReader-1]+[TargetIndexReader-1]->[DiffChecker-N]->(DiffResultQueue)->[DiffWriter-1]"
+    hash_option: "Hash compare inserts [DataReader-<backend>]->[DataHasher] for files requiring content verification."
+
+  profile:
+    status: "supported for metadata; sampled data profiling added"
+    purpose: "Create compact profiles summarizing phases, folder topology, sizes, metadata latency, and sampled read latency."
+    metadata_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(ProfileAccumulator-1)->(ProfileOutput)"
+    data_sampling_pipeline: "[ProfileSampler-1]->(SampleFileQueue)->[DataReader-<backend>-N]->[LatencyAccumulator-1]"
+    phase_rule: "Default phase boundary is one phase per configured file-count block; production profiles commonly use 100M files per phase."
+    hash_option: "Optional sampled hashes may be recorded, but profiles should stay compact and reproducible."
+
+  generator:
+    status: "active performance target"
+    purpose: "Create synthetic filesystems, optionally replaying a recorded profile, and use this for writer and pipeline validation."
+    small_file_hot_pipeline: "[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]"
+    mixed_pipeline_current: "[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN/NFS-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway+Governor]->(SmallReadyFileQueue-500000)->[DataReader-SYN/NFS-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + (MediumReadyFileQueue-500000 + MediumSpillway)->[DataReader-SYN/NFS-64 governed]->(DataQueue-64x512)->[DataWriter-NFS-64] + (LargeReadyFileQueue-500000 + LargeSpillway)->[DataReader-SYN/NFS-112 governed]->(DataQueue-112x512)->[DataWriter-NFS-112]"
+    classifier:
+      small: "size <= 128 KiB"
+      medium: "128 KiB < size <= 1 MiB"
+      large: "size > 1 MiB"
+    current_defaults:
+      small_reactors: 64
+      small_reactor_window: 64
+      folder_creation_threads: 8
+      small_data_reader_threads: 768
+      medium_data_reader_threads: 64
+      large_data_reader_threads: 112
+    notes:
+      - "The small hot path is the current known-good generator pipeline."
+      - "Independent small and large generator lanes proved higher aggregate hardware headroom, but integrated mixed mode remains the production-realistic target."
+
+  copy:
+    status: "not fully done"
+    purpose: "Copy, sync, or merge source filesystem content into a target filesystem."
+    intended_pipeline: "[SourceMetaReader-<backend>-N]->(FileQueue)->[DataReader-<backend>-N]->(DataBufQueue-sharded-by-file)->[DataWriter-<backend>-N] + [SourceMetaReader-<backend>-N]->(MetadataBufQueue)->[MetaWriter-<backend>-N]"
+    mixed_future: "[SourceMetaReader-<backend>-N]->(FolderReadyQueue)->[FolderCreation-<backend>-N]->[ReadyClassifier+Governor]->(SmallReadyFileQueue)->[DataReader-<backend>/direct-submit]->[DataWriter-<backend>/reactors] + (LargeReadyFileQueue)->[DataReader-<backend>-N]->(DataQueue-sharded-by-file)->[DataWriter-<backend>-N]"
+    hash_option: "Optional hash recording or comparison is enabled per source/target policy before or after write."
+
+test_pipelines:
+  metadata_generator_discard:
+    purpose: "Measure MetaReader-SYN and queue/discard overhead."
+    pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-SYN-8]->(MetadataBufQueue)->[BufferDiscarder-1]"
+
+  data_reader_null_writer:
+    purpose: "Measure data generation and data queue overhead without network I/O."
+    pipeline: "[DataReader-SYN-N]->(DataQueue)->[DataWriter-NULL-N]"
+
+  nfs_scan_discard:
+    purpose: "Measure real NFS metadata scan without writer cost."
+    pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-NFS-N]->(MetadataBufQueue)->[BufferDiscarder-N]"
+
+  writer_isolation:
+    purpose: "Isolate writer or transport bottlenecks by replacing the next stage with a discarder."
+    examples:
+      - "[MetaReader-NFS-96]->(MetadataBufQueue-64xD)->[BufferDiscarder-64]"
+      - "[MetaReader-NFS-96]->(MetadataBufQueue-64xD)->[SocketTransport]->(RemoteBufQueue)->[BufferDiscarder-32]"

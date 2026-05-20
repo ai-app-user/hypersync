@@ -157,6 +157,12 @@ logical size: 335.99 TB
 
 **Codex:** Updated `hypersync/deploy/README.md`, `hypersync/doc/ux.md`, and `hypersync/doc/requirement.md` to describe the practical mostly-static release bundle: `hypersync`, `hypersync.bin`, `default.yaml`, bundled `libduckdb.so`, optional bundled `libstdc++`/`libgcc_s` only if DuckDB needs them, plus README/manifest/checksums. Added the measured transfer1 sizes and the static DuckDB release goal. Committed and pushed as `d0414af Update deploy README for mostly static bundle`.
 
+### 2026-05-19 PDT
+
+**User:** Asked to record the current generator pipeline as a use-case profile and suggested a config file for remembering pipelines for scan, diff, profile, generator, copy, hashing options, and partial/job tests.
+
+**Codex:** Added `hypersync/config/pipelines.yaml` as the canonical registry for use-case pipeline shapes and major knobs. Recorded the generator small-file hot path `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`, the current mixed generator pipeline, scan/diff/profile/copy intended shapes, and job-isolation test pipelines. Updated design docs and AI knowledge notes to point to this registry.
+
 ### 2026-05-12 22:45 PDT
 
 **User:** Asked to execute the checker/diff plan, then when checker was done to test it on transfer/nopo with bounded time, add efficient data read/data transfer for files with attention to many small files, verify regressions, and keep working autonomously overnight.
