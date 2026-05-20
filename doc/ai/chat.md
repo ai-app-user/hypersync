@@ -1288,3 +1288,8 @@ Notes:
 - `copy-target` receives opaque `DataBuffer` frames and writes them with `TargetDataWriterJob`.
 - The generic buffer transport is now used strictly as a queue bridge across TCP.
 - Local compile passed with `make -j8 build/hypersync`.
+- Linux/libnfs release compile passed on transfer1 and was deployed to nopo via package artifact.
+- First source-side smoke against `nfs://.../HaWoR/video/path/0/175593000` proved the new source bridge can scan/read/send:
+  `pipeline=[MetaReader-NFS-16]->(FileQueue)->[DataReader-NFS-32]->(DataBufQueue-256 x4)->[BufferSender-1 x4]`,
+  `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`.
+- Target-side smoke found an existing NFS backend limitation: `DataWriter-NFS` mounts the full NFS URL as an export, so a target URL with a new subdirectory under the export fails or times out at `nfs_mount_async`. The next fix is to split NFS URLs into export root plus target-relative prefix, or add an explicit target-prefix rewrite lane, so copy can safely write under a unique subdirectory while mounting the existing export.

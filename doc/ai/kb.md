@@ -1729,3 +1729,8 @@ logical size: 335.99 TB
       - Receives opaque `DataBuffer` frames and writes them through the existing `TargetDataWriterJob`.
   - The TCP sockets are now only queue bridges. Data movement stays in the established job/queue architecture.
   - This first correction handles the data plane. Metadata/folder transport is still expected to evolve into a separate queue-native lane; for the first performance pass, target writers can still use parent-directory creation or precreated folders depending on the test.
+  - Transfer1 release build with libnfs passed and was deployed to nopo by package artifact.
+  - 4-lane source smoke succeeded through the source-side bridge:
+    - Pipeline: `[MetaReader-NFS-16]->(FileQueue)->[DataReader-NFS-32]->(DataBufQueue-256 x4)->[BufferSender-1 x4]`
+    - Result: `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`.
+  - Target-side smoke exposed a remaining NFS URL/export limitation: `DataWriter-NFS` currently mounts the full target URL path as the export. New per-run subdirectories under the export fail at `nfs_mount_async` (`MNT3ERR_NOENT` or timeout). Before a full NFS-to-NFS copy perf run, add export-root plus target-prefix handling so the backend mounts `/volumes/.../data` and writes under a safe relative prefix.
