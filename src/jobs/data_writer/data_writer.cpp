@@ -45,6 +45,14 @@ namespace {
     return path;
 }
 
+[[nodiscard]] bool is_empty_regular_data_buffer(const DataBuffer& buffer) {
+    return !is_packed_small_file_buffer(buffer) &&
+           buffer.trailer.rel_path.view().empty() &&
+           buffer.trailer.data_len == 0U &&
+           buffer.trailer.file_size == 0U &&
+           buffer.trailer.flags == 0U;
+}
+
 void pin_current_thread_to_cpu(std::size_t cpu_index) noexcept {
 #if defined(__linux__)
     const unsigned int cpu_count = std::thread::hardware_concurrency();
@@ -553,6 +561,10 @@ void TargetDataWriterJob::process_regular_batch(TargetWriterBackend& backend,
     chunks.reserve(handles.size());
     for (const BufferHandle& handle : handles) {
         const DataBuffer& buffer = data_buffer(data_pool_, handle);
+        if (is_empty_regular_data_buffer(buffer)) {
+            record_buffer(0);
+            continue;
+        }
         if (is_packed_small_file_buffer(buffer)) {
             throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
                                      " cannot batch packed-small-file buffers");
@@ -565,6 +577,11 @@ void TargetDataWriterJob::process_regular_batch(TargetWriterBackend& backend,
         }
         TargetWriterBackend::WriteChunk chunk;
         chunk.spec = file_spec_from_trailer(buffer.trailer);
+        if (chunk.spec.rel_path.empty()) {
+            record_file_failed();
+            throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
+                                     " received a regular data buffer without a relative path");
+        }
         chunk.data = std::string_view(reinterpret_cast<const char*>(buffer.bytes.data()), data_len);
         chunk.offset = buffer.trailer.data_offset;
         chunk.last_chunk = (buffer.trailer.flags & kFlagLastChunk) != 0U;
@@ -629,7 +646,16 @@ void TargetDataWriterJob::process_packed_small_file_batch(TargetWriterBackend& b
 }
 
 void TargetDataWriterJob::write_regular_buffer(TargetWriterBackend& backend, const DataBuffer& buffer) {
+    if (is_empty_regular_data_buffer(buffer)) {
+        record_buffer(0);
+        return;
+    }
     const FileSpec file = file_spec_from_trailer(buffer.trailer);
+    if (file.rel_path.empty()) {
+        record_file_failed();
+        throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
+                                 " received a regular data buffer without a relative path");
+    }
     const std::size_t data_len = static_cast<std::size_t>(buffer.trailer.data_len);
     if (data_len > buffer.bytes.size()) {
         record_file_failed();
