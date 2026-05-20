@@ -224,6 +224,7 @@ public:
         std::size_t reactors_per_ip = 1;
         std::size_t reactor_count = 0;
         std::size_t max_concurrent_file_transactions = 64;
+        std::string target_prefix;
     };
 
     virtual ~TargetWriterBackend() = default;

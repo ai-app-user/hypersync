@@ -111,6 +111,18 @@ struct NfsAsyncCommandLatencyMetrics {
     std::atomic<std::uint64_t> close_max_latency_ns {0};
 };
 
+std::string join_normalized_path(std::string_view prefix, std::string_view rel_path) {
+    const std::string normalized_prefix = normalize_path(prefix);
+    const std::string normalized_path = normalize_path(rel_path);
+    if (normalized_prefix.empty()) {
+        return normalized_path;
+    }
+    if (normalized_path.empty()) {
+        return normalized_prefix;
+    }
+    return normalized_prefix + "/" + normalized_path;
+}
+
 struct NfsReaddirplusPageMetrics {
     std::atomic<std::uint64_t> pages {0};
     std::atomic<std::uint64_t> failed_pages {0};
@@ -1752,7 +1764,7 @@ public:
     ~LocalTargetWriterBackend() override = default;
 
     void ensure_directory(const FileSpec& spec) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         if (rel_path.empty()) {
             return;
         }
@@ -1766,7 +1778,7 @@ public:
     }
 
     void apply_directory_metadata(const FileSpec& spec) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         if (rel_path.empty()) {
             return;
         }
@@ -1781,7 +1793,7 @@ public:
     }
 
     void write_chunk(const FileSpec& spec, std::string_view data, std::uint64_t offset) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         ScopedFd& handle = open_handles_[rel_path];
         if (!handle.valid()) {
             const std::filesystem::path absolute_path = std::filesystem::path(root_) / rel_path;
@@ -1799,7 +1811,7 @@ public:
     }
 
     void finish_file(const FileSpec& spec) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         auto it = open_handles_.find(rel_path);
         if (it != open_handles_.end()) {
             it->second.reset();
@@ -1814,7 +1826,7 @@ public:
     }
 
     void abort_file(std::string_view rel_path) noexcept override {
-        const std::string normalized = normalize_path(rel_path);
+        const std::string normalized = target_rel_path(rel_path);
         open_handles_.erase(normalized);
         try {
             std::filesystem::remove(std::filesystem::path(root_) / normalized);
@@ -1822,7 +1834,7 @@ public:
     }
 
     [[nodiscard]] std::uint64_t file_hash(std::string_view rel_path) const override {
-        return file_hash64(std::filesystem::path(root_) / normalize_path(rel_path));
+        return file_hash64(std::filesystem::path(root_) / target_rel_path(rel_path));
     }
 
     [[nodiscard]] bool uses_async_api() const override {
@@ -1830,6 +1842,10 @@ public:
     }
 
 private:
+    [[nodiscard]] std::string target_rel_path(std::string_view rel_path) const {
+        return join_normalized_path(options_.target_prefix, rel_path);
+    }
+
     std::filesystem::path root_;
     Options options_;
     std::unordered_map<std::string, ScopedFd> open_handles_;
@@ -5276,7 +5292,7 @@ public:
             auto transaction = std::make_shared<FileTransaction>();
             transaction->completion = completion;
             transaction->spec = file.spec;
-            transaction->spec.rel_path = normalize_path(transaction->spec.rel_path);
+            transaction->spec.rel_path = join_normalized_path(options_.target_prefix, transaction->spec.rel_path);
             transaction->remote_path = "/" + transaction->spec.rel_path;
             transaction->offset = file.offset;
             transaction->data = file.data;
@@ -5806,6 +5822,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
         std::size_t reactors_per_ip = 1;
         std::size_t reactor_count = 0;
         std::size_t max_concurrent_file_transactions = 64;
+        std::string target_prefix;
 
         [[nodiscard]] std::string string() const {
             std::ostringstream out;
@@ -5813,7 +5830,8 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
                 << "|ep=" << ensure_parent_directories << "|sw=" << stable_small_file_writes
                 << "|tc=" << tcp_cork_small_file_writes
                 << "|rpi=" << reactors_per_ip << "|rc=" << reactor_count
-                << "|fw=" << max_concurrent_file_transactions;
+                << "|fw=" << max_concurrent_file_transactions
+                << "|tp=" << target_prefix;
             return out.str();
         }
     };
@@ -5831,6 +5849,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
     key.reactors_per_ip = std::max<std::size_t>(1U, options.reactors_per_ip);
     key.reactor_count = options.reactor_count;
     key.max_concurrent_file_transactions = options.max_concurrent_file_transactions;
+    key.target_prefix = normalize_path(options.target_prefix);
     const std::string key_text = key.string();
 
     std::lock_guard<std::mutex> lock(mutex);
@@ -5867,7 +5886,7 @@ public:
     }
 
     void ensure_directory(const FileSpec& spec) override {
-        ensure_directory_chain(spec.rel_path);
+        ensure_directory_chain(target_rel_path(spec.rel_path));
     }
 
     void ensure_directories(const std::vector<FileSpec>& specs) override {
@@ -5878,7 +5897,7 @@ public:
 
         std::vector<std::vector<std::string>> paths_by_depth;
         for (const FileSpec& spec : specs) {
-            const std::string normalized = normalize_path(spec.rel_path);
+            const std::string normalized = target_rel_path(spec.rel_path);
             if (normalized.empty()) {
                 continue;
             }
@@ -5963,7 +5982,7 @@ public:
     }
 
     void apply_directory_metadata(const FileSpec& spec) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         if (rel_path.empty()) {
             return;
         }
@@ -5975,7 +5994,7 @@ public:
     }
 
     void write_chunk(const FileSpec& spec, std::string_view data, std::uint64_t offset) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         if (options_.ensure_parent_directories) {
             ensure_directory_chain(parent_path(rel_path));
         }
@@ -6021,7 +6040,7 @@ public:
                 }
                 continue;
             }
-            const std::string rel_path = normalize_path(chunk.spec.rel_path);
+            const std::string rel_path = target_rel_path(chunk.spec.rel_path);
             if (options_.ensure_parent_directories) {
                 ensure_directory_chain(parent_path(rel_path));
             }
@@ -6080,7 +6099,7 @@ public:
     }
 
     void finish_file(const FileSpec& spec) override {
-        const std::string rel_path = normalize_path(spec.rel_path);
+        const std::string rel_path = target_rel_path(spec.rel_path);
         const std::string remote_path = "/" + rel_path;
         auto it = open_handles_.find(rel_path);
         if (it == open_handles_.end()) {
@@ -6109,7 +6128,7 @@ public:
     }
 
     void abort_file(std::string_view rel_path) noexcept override {
-        const std::string normalized = normalize_path(rel_path);
+        const std::string normalized = target_rel_path(rel_path);
         auto it = open_handles_.find(normalized);
         if (it == open_handles_.end()) {
             return;
@@ -6125,7 +6144,7 @@ public:
     }
 
     [[nodiscard]] std::uint64_t file_hash(std::string_view rel_path) const override {
-        const std::string normalized_path = normalize_path(rel_path);
+        const std::string normalized_path = target_rel_path(rel_path);
         if (normalized_path.empty()) {
             throw std::runtime_error("relative path must not be empty");
         }
@@ -6142,6 +6161,10 @@ private:
             legacy_session_ = std::make_unique<LibNfsSession>(root_url_, endpoint_index_);
         }
         return *legacy_session_;
+    }
+
+    [[nodiscard]] std::string target_rel_path(std::string_view rel_path) const {
+        return join_normalized_path(options_.target_prefix, rel_path);
     }
 
     void apply_remote_metadata(const std::string& remote_path, const FileSpec& spec) {
@@ -6387,7 +6410,7 @@ private:
                 backlog.pop_front();
                 auto transaction = std::make_unique<InlineFileTransaction>();
                 transaction->file = file;
-                transaction->rel_path = normalize_path(file->spec.rel_path);
+                transaction->rel_path = target_rel_path(file->spec.rel_path);
                 transaction->remote_path = "/" + transaction->rel_path;
                 if (options_.ensure_parent_directories) {
                     ensure_directory_chain(parent_path(transaction->rel_path));
@@ -6494,6 +6517,61 @@ private:
 };
 
 #endif
+
+struct TargetNfsMountPlan {
+    std::string mount_url;
+    std::string target_prefix;
+};
+
+TargetNfsMountPlan plan_target_nfs_mount(std::string_view root_url) {
+    TargetNfsMountPlan plan;
+    plan.mount_url = std::string(root_url);
+
+    constexpr std::string_view kPrefix = "nfs://";
+    if (root_url.rfind(kPrefix, 0) != 0) {
+        return plan;
+    }
+
+    const std::size_t server_begin = kPrefix.size();
+    const std::size_t path_begin = root_url.find('/', server_begin);
+    if (path_begin == std::string_view::npos) {
+        return plan;
+    }
+
+    const std::string normalized_path = normalize_path(root_url.substr(path_begin));
+    std::vector<std::string> components;
+    std::string component;
+    for (char ch : normalized_path) {
+        if (ch == '/') {
+            if (!component.empty()) {
+                components.push_back(std::move(component));
+                component.clear();
+            }
+            continue;
+        }
+        component.push_back(ch);
+    }
+    if (!component.empty()) {
+        components.push_back(std::move(component));
+    }
+
+    if (components.size() <= 3U || components[0] != "volumes") {
+        return plan;
+    }
+
+    std::string mount_path = "/" + components[0] + "/" + components[1] + "/" + components[2];
+    std::string prefix_path;
+    for (std::size_t index = 3U; index < components.size(); ++index) {
+        if (!prefix_path.empty()) {
+            prefix_path.push_back('/');
+        }
+        prefix_path += components[index];
+    }
+
+    plan.mount_url = std::string(root_url.substr(0, path_begin)) + mount_path;
+    plan.target_prefix = std::move(prefix_path);
+    return plan;
+}
 
 }  // namespace
 
@@ -6985,7 +7063,9 @@ std::unique_ptr<TargetWriterBackend> make_target_writer_backend(std::string root
     }
     if (is_nfs_url(root)) {
 #if HYPERSYNC_HAS_LIBNFS
-        return std::make_unique<LibNfsTargetWriterBackend>(std::move(root), endpoint_index, options);
+        const TargetNfsMountPlan mount_plan = plan_target_nfs_mount(root);
+        options.target_prefix = join_normalized_path(mount_plan.target_prefix, options.target_prefix);
+        return std::make_unique<LibNfsTargetWriterBackend>(mount_plan.mount_url, endpoint_index, options);
 #else
         (void)endpoint_index;
         (void)options;
