@@ -48,9 +48,7 @@ namespace {
 [[nodiscard]] bool is_empty_regular_data_buffer(const DataBuffer& buffer) {
     return !is_packed_small_file_buffer(buffer) &&
            buffer.trailer.rel_path.view().empty() &&
-           buffer.trailer.data_len == 0U &&
-           buffer.trailer.file_size == 0U &&
-           buffer.trailer.flags == 0U;
+           buffer.trailer.data_len == 0U;
 }
 
 void pin_current_thread_to_cpu(std::size_t cpu_index) noexcept {
