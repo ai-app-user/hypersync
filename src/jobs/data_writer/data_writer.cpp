@@ -1,6 +1,7 @@
 #include "jobs/data_writer/data_writer.hpp"
 
 #include <algorithm>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -49,6 +50,17 @@ namespace {
     return !is_packed_small_file_buffer(buffer) &&
            buffer.trailer.rel_path.view().empty() &&
            buffer.trailer.data_len == 0U;
+}
+
+[[nodiscard]] std::string describe_data_buffer_trailer(const DataBuffer& buffer) {
+    std::ostringstream out;
+    out << "data_len=" << buffer.trailer.data_len
+        << " file_size=" << buffer.trailer.file_size
+        << " data_offset=" << buffer.trailer.data_offset
+        << " flags=" << buffer.trailer.flags
+        << " file_id=" << buffer.trailer.file_id
+        << " folder_hash=" << buffer.trailer.folder_hash;
+    return out.str();
 }
 
 void pin_current_thread_to_cpu(std::size_t cpu_index) noexcept {
@@ -580,7 +592,8 @@ void TargetDataWriterJob::process_regular_batch(TargetWriterBackend& backend,
         if (chunk.spec.rel_path.empty()) {
             record_file_failed();
             throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
-                                     " received a regular data buffer without a relative path");
+                                     " received a regular data buffer without a relative path (" +
+                                     describe_data_buffer_trailer(buffer) + ")");
         }
         chunk.data = std::string_view(reinterpret_cast<const char*>(buffer.bytes.data()), data_len);
         chunk.offset = buffer.trailer.data_offset;
@@ -654,7 +667,8 @@ void TargetDataWriterJob::write_regular_buffer(TargetWriterBackend& backend, con
     if (file.rel_path.empty()) {
         record_file_failed();
         throw std::runtime_error("DataWriter-" + backend_job_suffix(config_.target_root) +
-                                 " received a regular data buffer without a relative path");
+                                 " received a regular data buffer without a relative path (" +
+                                 describe_data_buffer_trailer(buffer) + ")");
     }
     const std::size_t data_len = static_cast<std::size_t>(buffer.trailer.data_len);
     if (data_len > buffer.bytes.size()) {
