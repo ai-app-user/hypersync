@@ -87,6 +87,8 @@ use_cases:
     hash_option: "Optional hash recording or comparison is enabled per source/target policy before or after write."
     notes:
       - "The current copy-all path is a packaged source-to-target runtime acceptance path, not yet the final optimized in-process copy/sync pipeline."
+      - "2026-05-19 perf probe: legacy runtime copy is still single TCP data stream plus single receiver writer, and measured only ~2.6 Gbit/s on a 13.96 GB NFS-to-NFS copy. Do not treat it as the final 200G copy architecture."
+      - "Remote NFS large-file copy must stream chunks from NFS into transfer buffers; never materialize whole large source files into FileSpec::content."
       - "Sync should reuse diff results to copy only source-only or changed files, with optional hash comparison when metadata is insufficient."
 
 test_pipelines:

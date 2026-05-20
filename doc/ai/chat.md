@@ -1256,3 +1256,17 @@ Pipeline:
 `[SourceMetaReader-NFS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-NFS]->(DataSocket)->[ReceiverDataWriter-NFS]`
 
 Result: NFS-to-NFS copy-all acceptance passed. Sender reported `files_total=506 transferred=506 skipped=0 failed=0 bytes=9564146 chunks_sent=509`, elapsed `35.84s`. Source count/bytes were `506` files and `9564146` bytes. Sampled target file hashes matched source. Recursive kernel-mounted target verification can stall on this nopo tree, so use bounded direct file checks or libnfs verification rather than broad `find`/`du` over the target mount.
+
+## 2026-05-19 23:16 PDT
+
+**User:** Expected the real copy pipeline to approach `~200 Gbit/s` on NFS read, TCP send/receive, and NFS write, and asked to improve if not there.
+
+**Codex:** Fixed two blockers in the legacy runtime copy path. First, remote NFS large files are now streamed through transfer buffers instead of loaded whole into `FileSpec::content`. Second, copy-time NFS read depth is clamped to the available large slot pool, avoiding a deadlock where libnfs tried to queue more async reads than the sender had transfer slots.
+
+Validation:
+- Correctness smoke after streaming fix: 506-file NFS-to-NFS copy passed in `17.11s`, down from `35.84s`.
+- Large-file perf probe after slot clamp and perf config: copied `13,956,200,341` bytes in `42.47s`, `files_total=8`, `failed=0`, `chunks_sent=13315`, about `2.63 Gbit/s` end to end.
+- Transfer1 hot samples: source NFS read up to about `14 Gbit/s`, TCP send up to about `10.6 Gbit/s`.
+- nopo hot samples: TCP receive/NFS write path around `2-3 Gbit/s`.
+
+Conclusion: the legacy `copy` command is still a correctness path: one TCP data stream, one receiver writer thread, and full metadata pre-scan before transfer. It cannot reach the requested `~200 Gbit/s` shape. The next implementation must wire copy onto the sharded job pipeline: `[MetaReader-NFS]->(FileQueue)->[DataReader-NFS-N]->(DataBufQueue-sharded-by-file)->[BufferSender-N x lanes]->TCP->[BufferReceiver-N x lanes]->(DataBufQueue-sharded-by-file)->[DataWriter-NFS/reactors]`.
