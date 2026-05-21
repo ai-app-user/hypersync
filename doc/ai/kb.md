@@ -1800,3 +1800,27 @@ logical size: 335.99 TB
   - The TCP queue bridge is functional now.
   - Source NFS read and transfer-side send are no longer blocked by firewall.
   - Current copy bottleneck is target-side NFS write/create behavior in this generic copy-target shape, especially with inline parent-directory creation. Next performance work should route folder creation through the dedicated folder-ready job path and/or precreate target folders, then reuse the high-performance small-file reactor writer configuration instead of this minimal `DataWriter-NFS-1 x lanes` target shape.
+
+## 2026-05-21 - Async Copy Bridge `/HaWoR` Runs
+
+- Continued transfer1 -> agnopo copy testing after firewall was opened.
+- Current source host: transfer1. Current target host: agnopo. Source root for long tests: `nfs://nfs.crusoecloudcompute.com/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/HaWoR`.
+- Baseline 16-lane run with Hypersync `d61a422` / Piper `1b7f28f`:
+  - Source pipeline: `[MetaReader-NFS-96]->(FileQueue)->[DataReader-NFS-96]->(DataBufQueue-4096 x16)->[BufferStreamSender-1 x16]`.
+  - Target pipeline: `[BufferReceiver-1 x16]->(RecvDataBufQueue-4096 x16)->[FolderCreation-NFS-1 x16]->(ReadyDataBufQueue-4096 x16)->[DataWriter-NFS-1 x16]`.
+  - Source result: `files_found=108745`, `files_read=17333`, `failed=0`, `bytes=945571078595`, `buffers_sent=908971`, `elapsed_s=63.2638`, `119.57 Gbit/s`.
+  - Target result: `files_written=17333`, `failed=0`, `bytes=945571078595`, `buffers_received=908971`, `elapsed_s=91.1321`, `83.01 Gbit/s`.
+  - Target phase timing: receivers done at `83.94s`, folder gates done at `87.45s`, writers done at `91.13s`. This indicates the dominant bottleneck was the TCP receive/bridge duration, not final NFS write or folder creation.
+- 32-lane comparison with the same build regressed:
+  - Source reached multiple active intervals around `184-197 Gbit/s`, but then backpressured and hit the outer source timeout.
+  - Target result: `files_written=74390`, `bytes=587539199361`, `buffers_received=571712`, `elapsed_s=100.438`, `46.80 Gbit/s`.
+  - Interpretation: more TCP lanes are not automatically better in the current target bridge shape; 32 lanes add receiver/thread overhead and can increase shutdown/backpressure behavior.
+- Piper `41bbc22` changed buffer transport frame sends from two writes (`header`, then payload) to one vectored `writev` submission. Local verification: `make -j8 unit-test` passed (`74/74`).
+- A follow-up 16-lane run with Piper `41bbc22` was not comparable because the async metadata traversal sampled a much smaller-file-heavy section of `/HaWoR`:
+  - Source: `files_found=399101`, `files_read=264827`, `bytes=168465239336`, `buffers_sent=164904`, then backpressured until the outer timeout.
+  - Target: `files_written=264827`, `bytes=168465239336`, `buffers_received=164904`, `elapsed_s=133.912`, `10.06 Gbit/s`.
+  - Interpretation: the random 60-second async walk is not stable enough for transport A/B testing. Use a fixed profile replay or a deterministic large-file subtree for future bridge comparisons.
+- Next recommended work:
+  - Add honest source timing for lane preconnect and sender drain time.
+  - Add target-side periodic progress so receiver, folder gate, and writer backlog are visible while the run is active.
+  - Use a stable benchmark input for copy testing; `/HaWoR` with max-duration is too phase-dependent.
