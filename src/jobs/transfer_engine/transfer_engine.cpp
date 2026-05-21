@@ -6863,6 +6863,78 @@ void record_data_read_metadata_batch(bool recursive,
     }
 }
 
+void record_data_read_metadata_batch_laned(bool recursive,
+                                           FlatMetadataWorkQueue& folder_queue,
+                                           std::vector<std::unique_ptr<DataReadFileQueue>>& lane_file_queues,
+                                           DataReadBenchmarkStats& stats,
+                                           FlatFolderScanBatch batch,
+                                           std::uint64_t min_file_size_bytes,
+                                           std::uint64_t max_file_size_bytes) {
+    const auto fail_all_lanes = [&](std::exception_ptr error) {
+        for (auto& queue : lane_file_queues) {
+            fail_data_file_work(*queue, error);
+        }
+    };
+
+    if (batch.failed) {
+        std::cerr << "metadata scan skipped folder '"
+                  << (batch.folder.rel_path.empty() ? "/" : batch.folder.rel_path)
+                  << "': " << (batch.error.empty() ? "unknown error" : batch.error) << '\n';
+        if (batch.folder.rel_path.empty()) {
+            const std::string message =
+                batch.error.empty() ? "failed to scan root metadata folder" : batch.error;
+            const auto error = std::make_exception_ptr(std::runtime_error(message));
+            fail_flat_folder_work(folder_queue, error);
+            fail_all_lanes(error);
+            return;
+        }
+        if (batch.complete) {
+            finish_flat_folder_work(folder_queue);
+        }
+        return;
+    }
+
+    const std::size_t lanes = std::max<std::size_t>(1U, lane_file_queues.size());
+    std::vector<std::vector<FileSpec>> files_by_lane(lanes);
+    std::uint64_t logical_size_bytes = 0;
+    for (auto& file : batch.files) {
+        const std::uint64_t logical_size = file.declared_size != 0 ? file.declared_size : file.content.size();
+        if (min_file_size_bytes != 0U && logical_size < min_file_size_bytes) {
+            continue;
+        }
+        if (max_file_size_bytes != 0U && logical_size > max_file_size_bytes) {
+            continue;
+        }
+        logical_size_bytes += logical_size;
+        const std::string parent = parent_path(file.rel_path);
+        const std::uint64_t key = parent.empty() ? hash64(file.rel_path) : hash64(parent);
+        files_by_lane[static_cast<std::size_t>(key % lanes)].push_back(std::move(file));
+    }
+
+    std::vector<FileSpec> child_work;
+    if (recursive && !flat_metadata_scan_should_stop(folder_queue)) {
+        child_work.reserve(batch.directories.size());
+        for (auto& directory : batch.directories) {
+            directory.rel_path = normalize_path(directory.rel_path);
+            child_work.push_back(directory);
+        }
+    }
+
+    record_data_read_metadata(stats, batch.files.size(), batch.directories.size(), logical_size_bytes);
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        if (!enqueue_data_read_files(*lane_file_queues[lane], std::move(files_by_lane[lane]))) {
+            if (batch.complete) {
+                finish_flat_folder_work(folder_queue);
+            }
+            return;
+        }
+    }
+    enqueue_flat_folder_work(folder_queue, std::move(child_work));
+    if (batch.complete) {
+        finish_flat_folder_work(folder_queue);
+    }
+}
+
 void record_folder_ready_metadata_batch(bool recursive,
                                         FlatMetadataWorkQueue& folder_queue,
                                         FolderReadyBatchQueue& folder_batch_queue,
@@ -7191,6 +7263,45 @@ void scan_data_read_metadata_worker(const std::string& source_root,
         const std::exception_ptr error = std::current_exception();
         fail_flat_folder_work(folder_queue, error);
         fail_data_file_work(file_queue, error);
+    }
+}
+
+void scan_data_read_metadata_worker_laned(const std::string& source_root,
+                                          bool recursive,
+                                          std::size_t async_directory_depth,
+                                          std::size_t readdirplus_page_bytes,
+                                          FlatMetadataWorkQueue& folder_queue,
+                                          std::vector<std::unique_ptr<DataReadFileQueue>>& lane_file_queues,
+                                          DataReadBenchmarkStats& stats) {
+    auto backend = make_nfs_backend(source_root, kNfsEndpointAny, readdirplus_page_bytes);
+    try {
+        backend->scan_flat_folders_streaming(
+            async_directory_depth,
+            [&folder_queue](bool wait_for_work) {
+                return take_flat_folder_work(folder_queue, wait_for_work);
+            },
+            [&folder_queue, &lane_file_queues] {
+                bool expired = false;
+                for (const auto& queue : lane_file_queues) {
+                    expired = expired || data_read_timer_expired(*queue);
+                }
+                return flat_metadata_scan_should_stop(folder_queue) || expired;
+            },
+            [recursive, &folder_queue, &lane_file_queues, &stats](FlatFolderScanBatch batch) {
+                record_data_read_metadata_batch_laned(recursive,
+                                                      folder_queue,
+                                                      lane_file_queues,
+                                                      stats,
+                                                      std::move(batch),
+                                                      0,
+                                                      0);
+            });
+    } catch (...) {
+        const std::exception_ptr error = std::current_exception();
+        fail_flat_folder_work(folder_queue, error);
+        for (auto& queue : lane_file_queues) {
+            fail_data_file_work(*queue, error);
+        }
     }
 }
 
@@ -16717,7 +16828,8 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
                                                         std::size_t lane_queue_depth,
                                                         bool pack_small_files,
                                                         double max_duration_seconds,
-                                                        std::uint32_t stats_interval_seconds) const {
+                                                        std::uint32_t stats_interval_seconds,
+                                                        bool shared_nothing) const {
     if (source_root.empty()) {
         throw std::runtime_error("--source is required");
     }
@@ -16749,6 +16861,9 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
         data_config.outstanding_requests = data_outstanding_requests;
     }
 
+    if (shared_nothing) {
+        data_config.data_reader_worker_count = 1U;
+    }
     const std::size_t effective_data_threads = std::max<std::size_t>(1U, data_config.data_reader_worker_count);
     const std::size_t effective_outstanding = std::max<std::size_t>(1U, data_config.outstanding_requests);
     lane_queue_depth = std::max<std::size_t>(1U, lane_queue_depth == 0U ? 1024U : lane_queue_depth);
@@ -16762,6 +16877,15 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     folder_queue.folders.push_back(FileSpec{});
     DataReadFileQueue file_queue;
     file_queue.max_entries = std::max<std::size_t>(65536U, effective_data_threads * effective_outstanding * 8U);
+    std::vector<std::unique_ptr<DataReadFileQueue>> lane_file_queues;
+    if (shared_nothing) {
+        lane_file_queues.reserve(lanes);
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            auto lane_queue = std::make_unique<DataReadFileQueue>();
+            lane_queue->max_entries = std::max<std::size_t>(lane_queue_depth, 65536U / lanes + 1U);
+            lane_file_queues.push_back(std::move(lane_queue));
+        }
+    }
 
     DataReadBenchmarkStats stats;
     stats.print_interval_seconds = std::max<std::uint32_t>(1U, stats_interval_seconds);
@@ -16795,15 +16919,17 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
 
     std::vector<std::unique_ptr<BufQueue>> lane_queues;
     std::vector<std::unique_ptr<BufferStreamSenderJob>> senders;
-    lane_queues.reserve(lanes);
-    senders.reserve(lanes);
-    for (std::size_t lane = 0; lane < lanes; ++lane) {
-        lane_queues.push_back(std::make_unique<BufQueue>(lane_queue_depth));
-        senders.push_back(std::make_unique<BufferStreamSenderJob>(
-            1U,
-            *lane_queues.back(),
-            registry,
-            lane_fds[lane].release()));
+    if (!shared_nothing) {
+        lane_queues.reserve(lanes);
+        senders.reserve(lanes);
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            lane_queues.push_back(std::make_unique<BufQueue>(lane_queue_depth));
+            senders.push_back(std::make_unique<BufferStreamSenderJob>(
+                1U,
+                *lane_queues.back(),
+                registry,
+                lane_fds[lane].release()));
+        }
     }
 
     const auto file_provider = [&file_queue]() {
@@ -16836,20 +16962,70 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
         return lane_queues[lane]->push_wait(handle);
     };
 
-    NfsDataBufferReaderJob data_reader_job(data_config,
-                                           data_pool,
-                                           NfsDataBufferReaderJob::BufferConsumer(direct_send),
-                                           file_provider,
-                                           stop_predicate);
-    data_reader_job.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
-        record_data_read_bytes(stats, bytes_read);
-    });
-    data_reader_job.set_file_read_callback([&stats]() {
-        record_data_read_file(stats);
-    });
-    data_reader_job.set_file_failed_callback([&stats](const FileSpec&) {
-        stats.files_failed.fetch_add(1U, std::memory_order_relaxed);
-    });
+    const auto attach_reader_callbacks = [&stats](NfsDataBufferReaderJob& reader) {
+        reader.set_bytes_read_callback([&stats](std::uint64_t bytes_read) {
+            record_data_read_bytes(stats, bytes_read);
+        });
+        reader.set_file_read_callback([&stats]() {
+            record_data_read_file(stats);
+        });
+        reader.set_file_failed_callback([&stats](const FileSpec&) {
+            stats.files_failed.fetch_add(1U, std::memory_order_relaxed);
+        });
+    };
+
+    std::unique_ptr<NfsDataBufferReaderJob> data_reader_job;
+    std::vector<std::unique_ptr<NfsDataBufferReaderJob>> lane_readers;
+    std::atomic<std::uint64_t> direct_sent_buffers {0};
+    std::atomic<std::uint64_t> direct_sent_bytes {0};
+    if (shared_nothing) {
+        lane_readers.reserve(lanes);
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            auto lane_provider = [&, lane]() {
+                thread_local std::deque<FileSpec> worker_file_batch;
+                if (worker_file_batch.empty()) {
+                    std::vector<FileSpec> next_batch = take_data_file_work_batch(*lane_file_queues[lane], 128);
+                    for (auto& file : next_batch) {
+                        worker_file_batch.push_back(std::move(file));
+                    }
+                }
+                if (worker_file_batch.empty()) {
+                    return std::optional<FileSpec> {};
+                }
+                FileSpec file = std::move(worker_file_batch.front());
+                worker_file_batch.pop_front();
+                return std::optional<FileSpec> {std::move(file)};
+            };
+            auto lane_stop = [&, lane]() {
+                return data_read_timer_expired(*lane_file_queues[lane]);
+            };
+            auto lane_send = [&, lane](std::size_t, const BufferHandle& handle) {
+                const std::size_t payload_bytes = data_pool.buffer_size_bytes();
+                const std::array<std::byte, 32> header = make_shared_nothing_header(payload_bytes);
+                write_shared_nothing_frame(lane_fds[lane].get(), header, data_pool.data(handle), payload_bytes);
+                data_pool.release(handle);
+                direct_sent_buffers.fetch_add(1U, std::memory_order_relaxed);
+                direct_sent_bytes.fetch_add(payload_bytes, std::memory_order_relaxed);
+                return true;
+            };
+            NfsDataReaderConfig lane_config = data_config;
+            lane_config.endpoint_index = lane;
+            auto reader = std::make_unique<NfsDataBufferReaderJob>(lane_config,
+                                                                   data_pool,
+                                                                   NfsDataBufferReaderJob::BufferConsumer(lane_send),
+                                                                   lane_provider,
+                                                                   lane_stop);
+            attach_reader_callbacks(*reader);
+            lane_readers.push_back(std::move(reader));
+        }
+    } else {
+        data_reader_job = std::make_unique<NfsDataBufferReaderJob>(data_config,
+                                                                   data_pool,
+                                                                   NfsDataBufferReaderJob::BufferConsumer(direct_send),
+                                                                   file_provider,
+                                                                   stop_predicate);
+        attach_reader_callbacks(*data_reader_job);
+    }
 
     const auto started_at = std::chrono::steady_clock::now();
     stats.started_at = started_at;
@@ -16876,13 +17052,30 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
             if (interval <= 0.0) {
                 continue;
             }
-            const auto reader_snapshot = data_reader_job.stats();
+            NfsDataBufferReaderStats reader_snapshot;
+            if (shared_nothing) {
+                reader_snapshot.worker_count = lane_readers.size();
+                for (const auto& reader : lane_readers) {
+                    const auto lane_stats = reader->stats();
+                    reader_snapshot.files_read += lane_stats.files_read;
+                    reader_snapshot.files_failed += lane_stats.files_failed;
+                    reader_snapshot.buffers_read += lane_stats.buffers_read;
+                    reader_snapshot.bytes_read += lane_stats.bytes_read;
+                }
+            } else {
+                reader_snapshot = data_reader_job->stats();
+            }
             std::uint64_t sent_buffers = 0;
             std::uint64_t sent_bytes = 0;
-            for (const auto& sender : senders) {
-                const BufferTransportStats sender_stats = sender->stats();
-                sent_buffers += sender_stats.buffers;
-                sent_bytes += sender_stats.payload_bytes;
+            if (shared_nothing) {
+                sent_buffers = direct_sent_buffers.load(std::memory_order_relaxed);
+                sent_bytes = direct_sent_bytes.load(std::memory_order_relaxed);
+            } else {
+                for (const auto& sender : senders) {
+                    const BufferTransportStats sender_stats = sender->stats();
+                    sent_buffers += sender_stats.buffers;
+                    sent_bytes += sender_stats.payload_bytes;
+                }
             }
             std::cerr << "copy_source_progress"
                       << " files_found=" << stats.files_found.load(std::memory_order_relaxed)
@@ -16913,6 +17106,9 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
             if (!cancelled) {
                 request_flat_folder_stop(folder_queue);
                 request_data_file_stop(file_queue);
+                for (auto& queue : lane_file_queues) {
+                    request_data_file_stop(*queue);
+                }
             }
         });
     }
@@ -16920,33 +17116,64 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     for (auto& sender : senders) {
         sender->start();
     }
-    data_reader_job.start();
+    if (shared_nothing) {
+        for (auto& reader : lane_readers) {
+            reader->start();
+        }
+    } else {
+        data_reader_job->start();
+    }
 
     std::vector<std::thread> metadata_workers;
     const std::size_t metadata_threads = std::max<std::size_t>(1U, meta_config.worker_count);
     metadata_workers.reserve(metadata_threads);
     for (std::size_t index = 0; index < metadata_threads; ++index) {
-        metadata_workers.emplace_back(scan_data_read_metadata_worker,
-                                      meta_config.source_root,
-                                      meta_config.recursive,
-                                      std::max<std::size_t>(1U, meta_config.async_directory_depth),
-                                      meta_config.readdirplus_page_bytes,
-                                      0,
-                                      0,
-                                      std::ref(folder_queue),
-                                      std::ref(file_queue),
-                                      std::ref(stats),
-                                      nullptr,
-                                      nullptr);
+        if (shared_nothing) {
+            metadata_workers.emplace_back(scan_data_read_metadata_worker_laned,
+                                          meta_config.source_root,
+                                          meta_config.recursive,
+                                          std::max<std::size_t>(1U, meta_config.async_directory_depth),
+                                          meta_config.readdirplus_page_bytes,
+                                          std::ref(folder_queue),
+                                          std::ref(lane_file_queues),
+                                          std::ref(stats));
+        } else {
+            metadata_workers.emplace_back(scan_data_read_metadata_worker,
+                                          meta_config.source_root,
+                                          meta_config.recursive,
+                                          std::max<std::size_t>(1U, meta_config.async_directory_depth),
+                                          meta_config.readdirplus_page_bytes,
+                                          0,
+                                          0,
+                                          std::ref(folder_queue),
+                                          std::ref(file_queue),
+                                          std::ref(stats),
+                                          nullptr,
+                                          nullptr);
+        }
     }
     for (auto& worker : metadata_workers) {
         worker.join();
     }
     mark_data_file_input_done(file_queue);
+    for (auto& queue : lane_file_queues) {
+        mark_data_file_input_done(*queue);
+    }
 
     std::exception_ptr pipeline_error;
     try {
-        data_reader_job.wait();
+        if (shared_nothing) {
+            for (auto& reader : lane_readers) {
+                reader->wait();
+            }
+            for (auto& fd : lane_fds) {
+                if (fd.valid()) {
+                    ::shutdown(fd.get(), SHUT_WR);
+                }
+            }
+        } else {
+            data_reader_job->wait();
+        }
         for (auto& queue : lane_queues) {
             queue->close();
         }
@@ -16955,7 +17182,12 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
         }
     } catch (...) {
         pipeline_error = std::current_exception();
-        data_reader_job.stop();
+        if (data_reader_job) {
+            data_reader_job->stop();
+        }
+        for (auto& reader : lane_readers) {
+            reader->stop();
+        }
         for (auto& sender : senders) {
             sender->stop();
         }
@@ -16980,15 +17212,36 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     if (file_queue.error) {
         std::rethrow_exception(file_queue.error);
     }
+    for (const auto& queue : lane_file_queues) {
+        if (queue->error) {
+            std::rethrow_exception(queue->error);
+        }
+    }
     if (pipeline_error) {
         std::rethrow_exception(pipeline_error);
     }
 
     std::uint64_t sent_buffers = 0;
-    for (const auto& sender : senders) {
-        sent_buffers += sender->stats().buffers;
+    if (shared_nothing) {
+        sent_buffers = direct_sent_buffers.load(std::memory_order_relaxed);
+    } else {
+        for (const auto& sender : senders) {
+            sent_buffers += sender->stats().buffers;
+        }
     }
-    const NfsDataBufferReaderStats reader_stats = data_reader_job.stats();
+    NfsDataBufferReaderStats reader_stats;
+    if (shared_nothing) {
+        reader_stats.worker_count = lane_readers.size();
+        for (const auto& reader : lane_readers) {
+            const auto lane_stats = reader->stats();
+            reader_stats.files_read += lane_stats.files_read;
+            reader_stats.files_failed += lane_stats.files_failed;
+            reader_stats.buffers_read += lane_stats.buffers_read;
+            reader_stats.bytes_read += lane_stats.bytes_read;
+        }
+    } else {
+        reader_stats = data_reader_job->stats();
+    }
     TransferReport report;
     report.files_total = stats.files_found.load(std::memory_order_relaxed);
     report.files_transferred = reader_stats.files_read;
@@ -16998,12 +17251,18 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     report.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
     report.bytes_per_second =
         report.elapsed_seconds > 0.0 ? static_cast<double>(reader_stats.bytes_read) / report.elapsed_seconds : 0.0;
-    report.pipeline_description = "[MetaReader-NFS-" + std::to_string(metadata_threads) +
-                                  "]->(FileQueue)->[DataReader-NFS-" +
-                                  std::to_string(effective_data_threads) +
-                                  "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
-                                  " x" + std::to_string(lanes) + ")->[BufferStreamSender-1 x" +
-                                  std::to_string(lanes) + "]";
+    report.pipeline_description =
+        shared_nothing
+            ? "[MetaReader-NFS-" + std::to_string(metadata_threads) +
+                  "]->(FileQueue-parent-hash x" + std::to_string(lanes) +
+                  ")->[DataReader-NFS-1 x" + std::to_string(lanes) +
+                  "]->TCP[DirectSocketSender-1 x" + std::to_string(lanes) + "]"
+            : "[MetaReader-NFS-" + std::to_string(metadata_threads) +
+                  "]->(FileQueue)->[DataReader-NFS-" +
+                  std::to_string(effective_data_threads) +
+                  "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
+                  " x" + std::to_string(lanes) + ")->[BufferStreamSender-1 x" +
+                  std::to_string(lanes) + "]";
     return report;
 }
 
@@ -17021,7 +17280,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                         std::size_t writer_file_window,
                                                         std::size_t writer_reactors,
                                                         std::size_t reactors_per_ip,
-                                                        bool precreate_target_files) const {
+                                                        bool precreate_target_files,
+                                                        bool shared_nothing) const {
     if (target_root.empty()) {
         throw std::runtime_error("--target is required");
     }
@@ -17031,7 +17291,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                        data_buffer_slots_per_lane == 0U
                                                            ? lane_queue_depth * 2U + 2U
                                                            : data_buffer_slots_per_lane);
-    if (ensure_target_directories && is_nfs_url(target_root)) {
+    if (ensure_target_directories && is_nfs_url(target_root) && !shared_nothing) {
         const std::size_t receiver_pool_slots =
             std::max<std::size_t>(lanes * (data_buffer_slots_per_lane + 2U),
                                   lanes * lane_queue_depth + 8192U);
@@ -17668,6 +17928,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         writer_config.ensure_parent_directories = ensure_target_directories;
         writer_config.reactor_count = writer_reactors;
         writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
+        writer_config.direct_reactor_submit = false;
+        writer_config.direct_reactor_writes = false;
         if (writer_async_window != 0U) {
             writer_config.async_window = writer_async_window;
         }
@@ -17710,6 +17972,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
               << " base_port=" << base_port
               << " queue_depth=" << lane_queue_depth
               << " pool_slots_per_lane=" << data_buffer_slots_per_lane
+              << " shared_nothing=" << (shared_nothing ? 1 : 0)
               << std::endl;
     for (auto& lane : target_lanes) {
         lane->receiver->start();
@@ -17764,7 +18027,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         report.elapsed_seconds > 0.0 ? static_cast<double>(report.bytes_transferred) / report.elapsed_seconds : 0.0;
     report.pipeline_description =
         ensure_target_directories
-            ? "[BufferReceiver-1 x" + std::to_string(lanes) +
+            ? std::string(shared_nothing ? "[BufferReceiver-1 x" : "[BufferReceiver-1 x") + std::to_string(lanes) +
                   "]->(RecvDataBufQueue-" + std::to_string(lane_queue_depth) +
                   " x" + std::to_string(lanes) + ")->[FolderCreation-NFS-1 x" +
                   std::to_string(lanes) + "]->(ReadyDataBufQueue-" +

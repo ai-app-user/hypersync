@@ -1511,8 +1511,8 @@ void print_usage() {
     std::cerr
         << "Usage:\n"
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
-        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories] [--target-precreate-files]\n"
-        << "  hypersync [--config <config.yaml>] copy-source --source <nfs-url> --host <host> [--base-port <port>] [--lanes <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--pack-small-files] [--no-pack-small-files] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories] [--target-precreate-files] [--shared-nothing]\n"
+        << "  hypersync [--config <config.yaml>] copy-source --source <nfs-url> --host <host> [--base-port <port>] [--lanes <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--pack-small-files] [--no-pack-small-files] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--shared-nothing]\n"
         << "  hypersync status --socket <path>\n"
         << "  hypersync tuning [--iface <name>] [--cpu-mask <mask>] [--peer <ip>] [--apply]\n"
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
@@ -1935,6 +1935,7 @@ int main(int argc, char** argv) {
             bool pack_small_files = true;
             double max_duration_seconds = 0.0;
             std::uint32_t stats_interval_seconds = 5;
+            bool shared_nothing = false;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--source") {
@@ -1976,6 +1977,8 @@ int main(int argc, char** argv) {
                     stats_interval_seconds = static_cast<std::uint32_t>(
                         parse_size_t_option(require_option(args, i, "--stats-interval-seconds"),
                                             "--stats-interval-seconds"));
+                } else if (args[i] == "--shared-nothing") {
+                    shared_nothing = true;
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -1993,7 +1996,8 @@ int main(int argc, char** argv) {
                                                                 data_queue_depth,
                                                                 pack_small_files,
                                                                 max_duration_seconds,
-                                                                stats_interval_seconds);
+                                                                stats_interval_seconds,
+                                                                shared_nothing);
             std::cout << "pipeline=" << report.pipeline_description << '\n'
                       << "copy_source_result"
                       << " files_found=" << report.files_total
@@ -2023,6 +2027,7 @@ int main(int argc, char** argv) {
             std::size_t writer_reactors = 0;
             std::size_t reactors_per_ip = 1;
             bool target_precreate_files = false;
+            bool shared_nothing = false;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--target") {
@@ -2061,6 +2066,8 @@ int main(int argc, char** argv) {
                     ensure_target_directories = false;
                 } else if (args[i] == "--target-precreate-files") {
                     target_precreate_files = true;
+                } else if (args[i] == "--shared-nothing") {
+                    shared_nothing = true;
                 } else if (args[i] == "--no-preserve-target-metadata") {
                     preserve_metadata = false;
                 } else {
@@ -2081,7 +2088,8 @@ int main(int argc, char** argv) {
                                                                 writer_file_window,
                                                                 writer_reactors,
                                                                 reactors_per_ip,
-                                                                target_precreate_files);
+                                                                target_precreate_files,
+                                                                shared_nothing);
             std::cout << "pipeline=" << report.pipeline_description << '\n'
                       << "copy_target_result"
                       << " files_written=" << report.files_transferred

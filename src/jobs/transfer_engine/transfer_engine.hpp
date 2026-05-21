@@ -654,7 +654,8 @@ public:
                                                           std::size_t lane_queue_depth = 0,
                                                           bool pack_small_files = true,
                                                           double max_duration_seconds = 0.0,
-                                                          std::uint32_t stats_interval_seconds = 5) const;
+                                                          std::uint32_t stats_interval_seconds = 5,
+                                                          bool shared_nothing = false) const;
     [[nodiscard]] TransferReport run_copy_target_pipeline(const std::string& target_root,
                                                           const std::string& bind_host,
                                                           std::uint16_t base_port,
@@ -669,7 +670,8 @@ public:
                                                           std::size_t writer_file_window = 0,
                                                           std::size_t writer_reactors = 0,
                                                           std::size_t reactors_per_ip = 1,
-                                                          bool precreate_target_files = false) const;
+                                                          bool precreate_target_files = false,
+                                                          bool shared_nothing = false) const;
     [[nodiscard]] TransferReport transfer_directory(const SenderRuntimeConfig& runtime) const;
     void run_receiver(const ReceiverRuntimeConfig& runtime) const;
     [[nodiscard]] static std::vector<FileSpec> scan_directory(const std::filesystem::path& source_root, bool recursive = true);
