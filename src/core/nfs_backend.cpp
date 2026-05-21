@@ -5413,7 +5413,7 @@ private:
 
     private:
         void run() {
-            pin_current_thread_to_cpu(index_);
+            pin_current_thread_to_cpu(16U + index_);
             try {
                 while (!stop_requested_.load(std::memory_order_acquire) || inbound_.load(std::memory_order_acquire) != nullptr ||
                        !backlog_.empty() || !active_.empty()) {

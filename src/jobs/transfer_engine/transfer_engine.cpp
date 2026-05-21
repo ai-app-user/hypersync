@@ -44,6 +44,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #include "common/buffer_pool.hpp"
 #include "common/config.hpp"
 #include "common/content_hash.hpp"
@@ -87,6 +92,21 @@ namespace {
 
 inline constexpr std::size_t kMetadataPartitionTransportPoolSlots = 1024U;
 inline constexpr std::size_t kMetadataDiscardDefaultBufferSlots = 128U;
+
+void pin_copy_target_classifier_thread(std::size_t lane_index) noexcept {
+#if defined(__linux__)
+    const unsigned int hardware_cpus = std::thread::hardware_concurrency();
+    if (hardware_cpus == 0U) {
+        return;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(static_cast<int>((8U + (lane_index % 8U)) % hardware_cpus), &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+    (void)lane_index;
+#endif
+}
 
 std::string nfs_url_with_server_expression(std::string_view root_url, std::string_view server_expression) {
     if (server_expression.empty()) {
@@ -4848,6 +4868,30 @@ private:
 
 std::size_t shard_for_folder_hash(std::uint64_t folder_hash, std::size_t shard_count) {
     return shard_count == 0U ? 0U : static_cast<std::size_t>(folder_hash % shard_count);
+}
+
+std::uint64_t packed_small_parent_locality_hash(const DataBuffer& buffer, std::uint64_t fallback) {
+    std::uint64_t key = fallback;
+    bool found = false;
+    const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
+        if (found) {
+            return;
+        }
+        if (view.folder_hash != 0U) {
+            key = view.folder_hash;
+            found = true;
+            return;
+        }
+        const std::string_view path = view.rel_path;
+        const std::size_t slash = path.find_last_of('/');
+        if (slash != std::string_view::npos && slash != 0U) {
+            key = hash64(path.substr(0U, slash));
+        } else if (slash == 0U) {
+            key = hash64(std::string_view {path.data(), 1U});
+        }
+        found = true;
+    });
+    return ok && found ? key : fallback;
 }
 
 inline constexpr BufferPoolId kDistributedDiffSourcePoolId = 30;
@@ -16409,7 +16453,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
 
         TargetDataWriterConfig small_writer_config = base_writer_config;
         small_writer_config.worker_count = 16U;
-        small_writer_config.async_window = 1U;
+        small_writer_config.async_window = 16U;
         small_writer_config.direct_reactor_submit = false;
         small_writer_config.direct_reactor_writes = false;
 
@@ -16466,6 +16510,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                 target_lane->queue,
                 BufferTransportEndpoint::tcp(bind_host.empty() ? std::string("0.0.0.0") : bind_host,
                                              static_cast<std::uint16_t>(base_port + lane)));
+            target_lane->receiver->set_worker_cpu_affinity(lane % 8U, 1U);
             target_lanes.push_back(std::move(target_lane));
         }
 
@@ -16572,6 +16617,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         classifiers.reserve(lanes);
         for (std::size_t lane_index = 0; lane_index < lanes; ++lane_index) {
             classifiers.emplace_back([&, lane_index]() {
+                pin_copy_target_classifier_thread(lane_index);
                 TargetWriterBackend::Options folder_options;
                 folder_options.preserve_metadata = false;
                 folder_options.fsync_on_finish = false;
@@ -16588,9 +16634,12 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                             ensure_buffer_directories(*folder_backend, handle);
                             const DataBuffer& buffer = data_buffer(data_pool, handle);
                             if (is_packed_small_file_buffer(buffer)) {
-                                const std::uint64_t key = buffer.trailer.file_id != 0U
-                                                              ? buffer.trailer.file_id
-                                                              : static_cast<std::uint64_t>(handle.index);
+                                const std::uint64_t fallback_key = buffer.trailer.folder_hash != 0U
+                                                                       ? buffer.trailer.folder_hash
+                                                                       : (buffer.trailer.file_id != 0U
+                                                                              ? buffer.trailer.file_id
+                                                                              : static_cast<std::uint64_t>(handle.index));
+                                const std::uint64_t key = packed_small_parent_locality_hash(buffer, fallback_key);
                                 transferred = push_sharded(small_queue,
                                                            static_cast<std::size_t>(key % small_threads),
                                                            handle);
@@ -16741,9 +16790,10 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             " x" + std::to_string(lanes) + ")->[ReadyClassifier-NFS-1 x" +
             std::to_string(lanes) + "]->(SmallReadyFileQueue-" +
             std::to_string(small_queue_depth_per_shard) + " x" + std::to_string(small_threads) +
-            ")->[DataWriter-NFS/reactors=" +
+            " parent-hash)->[DataWriter-NFS/reactors=" +
             std::to_string(base_writer_config.reactor_count) + " window=" +
             std::to_string(base_writer_config.max_concurrent_file_transactions) +
+            " batch=" + std::to_string(small_writer_config.async_window) +
             "]+(MediumReadyBufQueue-" + std::to_string(lane_queue_depth) + " x" +
             std::to_string(medium_threads) + ")->[DataWriter-NFS-" +
             std::to_string(medium_threads) + "]+(LargeReadyBufQueue-" +
