@@ -1752,3 +1752,27 @@ logical size: 335.99 TB
   - Source: `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`.
   - Target: `files_written=505`, `failed=0`, `bytes=9335989`, `buffers_received=39`; verified 505 files on target.
   - Performance was poor (`elapsed_s=160.611`, `gbit_s=0.000465`) because TCP sender/receiver startup or target acceptance delayed buffer movement; next work should instrument lane connection/accept timing and start listeners before any target-side NFS writer activity.
+
+## 2026-05-20 - Async Copy Bridge Hardening
+
+- Commits:
+  - Hypersync `060c21e`: start all `copy-target` receivers before starting any target writers.
+  - Hypersync `170b388`: allow `TargetDataWriterJob` to batch ordinary `BufQueue` inputs, not only `ShardedBufQueue`, so `copy-target --data-writer-async-window` applies to received transport buffers.
+  - Hypersync `28921ff`: `copy-source` now connects every TCP lane before starting metadata scanning or data reading, and hands those sockets to `BufferStreamSender`.
+  - Piper `1b7f28f`: `connect_tcp()` now uses non-blocking connect plus `poll`, so black-holed targets obey the retry budget instead of hanging inside kernel TCP connect.
+- Local verification after each code change: `make -j8 unit-test` passed (`74/74`).
+- Functional smoke on nopo before it became unreachable:
+  - Pipeline after receiver-first fix: `[BufferReceiver-1 x4]->(DataBufQueue-256 x4)->[DataWriter-NFS-1 x4]`.
+  - Source: `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=38`, `elapsed_s=0.920515`.
+  - Target: `files_written=505`, `failed=0`, `bytes=9335989`, `buffers_received=38`, `elapsed_s=16.2832`; verified `505` files.
+  - The target writer finished almost immediately after receiver completion; on this tiny smoke the reported target elapsed is mostly startup/accept timing, not NFS write time.
+- Larger copy attempt to nopo `160.211.77.39` could not run because SSH to nopo timed out.
+- Agnopo `160.211.81.199` is reachable from the local workstation and has the `8ed98ee4-b263-4319-be97-2093377beb65` NFS volume mounted RW, but transfer1 cannot open data TCP connections to agnopo: sender sockets stayed in `SYN-SENT`.
+- The failed agnopo test exposed a source-side safety problem: the old `copy-source` could read NFS data while senders were still stuck connecting, producing progress like `files_read=505` and `sent_buffers=0`.
+- After `28921ff` + Piper `1b7f28f`, the same unreachable agnopo case fails before source reads begin:
+  - Command attempted `copy-source --host 160.211.81.199 --base-port 45941 --lanes 2`.
+  - Result: `rc=1`, `elapsed=12s`, stderr `connect failed for 160.211.81.199:45941: Connection timed out`.
+  - No source progress lines were emitted, confirming that data reads no longer start unless the TCP bridge is connected.
+- Current blocker for a true transfer1-to-target performance copy run is host reachability, not the queue bridge code:
+  - nopo `160.211.77.39`: SSH timed out during retest.
+  - agnopo `160.211.81.199`: SSH works from local, but transfer1-to-agnopo data ports do not complete TCP handshake.
