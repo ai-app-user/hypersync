@@ -16394,16 +16394,40 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
     }
 
     const auto started_at = std::chrono::steady_clock::now();
+    auto elapsed_since_start = [&]() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    };
+
+    std::cerr << "copy_target_start"
+              << " lanes=" << lanes
+              << " base_port=" << base_port
+              << " queue_depth=" << lane_queue_depth
+              << " pool_slots_per_lane=" << data_buffer_slots_per_lane
+              << std::endl;
     for (auto& lane : target_lanes) {
-        lane->writer->start();
         lane->receiver->start();
     }
+    std::cerr << "copy_target_receivers_started"
+              << " elapsed_s=" << elapsed_since_start()
+              << std::endl;
+    for (auto& lane : target_lanes) {
+        lane->writer->start();
+    }
+    std::cerr << "copy_target_writers_started"
+              << " elapsed_s=" << elapsed_since_start()
+              << std::endl;
     for (auto& lane : target_lanes) {
         lane->receiver->wait();
     }
+    std::cerr << "copy_target_receivers_done"
+              << " elapsed_s=" << elapsed_since_start()
+              << std::endl;
     for (auto& lane : target_lanes) {
         lane->writer->wait();
     }
+    std::cerr << "copy_target_writers_done"
+              << " elapsed_s=" << elapsed_since_start()
+              << std::endl;
 
     TransferReport report;
     for (const auto& lane : target_lanes) {
