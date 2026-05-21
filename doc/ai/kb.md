@@ -2117,3 +2117,28 @@ logical size: 335.99 TB
 - Interpretation:
   - Sharding the sender ingress queue did not improve end-to-end receiver throughput; it regressed from the prior best `52.10 Gbit/s` at 32 lanes to `39.41 Gbit/s` at 64 lanes.
   - The centralized sender MPMC queue is not the dominant limiter for remote transport-to-null. The remaining ceiling is more likely target-side receive/read_exact framing, per-frame receiver queue/pool lifecycle, or socket-drain behavior.
+
+## 2026-05-21 - Shared-Nothing WAN Transport Isolation Sweep
+
+- Hypersync `f200524` added `benchmark-transport --shared-nothing` for remote sender/receiver roles.
+- Pipeline under test:
+  `[DirectSocketGeneratorSender-1 xN]->TCP WAN->[DirectSocketReceiverDiscard-1 xN]`.
+- Implementation invariant:
+  - No sender-side generator queue.
+  - No receiver-side `BufQueue`.
+  - No `BufferDiscarder` job.
+  - Each sender lane owns its payload buffer and TCP socket.
+  - Each receiver lane reads directly into its lane-local preallocated frame and discards inline.
+- Deployment followed package-only model:
+  - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-shared-nothing-20260521T231930Z`.
+  - agnopo bundle: `/tmp/wsync-codex/deployments/hypersync-shared-nothing-20260521T231930Z`.
+  - Manifest: Hypersync `f200524710cd5250d559afdd24af9158436dd405`, dirty `0`; Piper `78cd1d366b24684678014603edededd8429178c6`, dirty `0`.
+- Sweep used `numactl --cpunodebind=0 --membind=0`, 1 MiB zero payload frames, 128 GiB total payload, transfer1 -> agnopo.
+- Receiver-truth results:
+  - `16` lanes: `129.70 Gbit/s`, receiver elapsed `8.48s`.
+  - `32` lanes: `125.32 Gbit/s`, receiver elapsed `8.77s`.
+  - `64` lanes: `152.36 Gbit/s`, receiver elapsed `7.22s`.
+- Interpretation:
+  - Removing all queue and discard handoff layers raised the C++ transport-to-null ceiling from `52.10 Gbit/s` to `152.36 Gbit/s`.
+  - The remaining delta to the best iperf baseline (`~171 Gbit/s`) is much smaller and likely belongs to socket framing/syscall overhead or NUMA placement details, not the job graph.
+  - Sender-side reported rates (`552-606 Gbit/s`) are not transport truth because they mostly measure how fast transfer1 can hand data to kernel socket buffers. Continue using receiver `payload_bytes_received / elapsed` as the WAN transport signal.
