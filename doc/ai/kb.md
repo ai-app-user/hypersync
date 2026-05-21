@@ -1953,3 +1953,32 @@ logical size: 335.99 TB
   - The classifier/reactor decoupling worked: RX stayed fluid and the small queue absorbed the burst.
   - End-to-end target throughput improved by about `68%` (`18.22 -> 30.74 Gbit/s`) on the same deterministic payload.
   - Remaining bottleneck is now downstream NFS write throughput, especially large queue drain plus small writer/reactor behavior, not classifier backpressure.
+
+## 2026-05-21 - Copy Target Affinity and Small-File Locality Attempt
+
+- Piper `277032b` added an explicit per-job worker CPU affinity override:
+  - `ThreadedJob::set_worker_cpu_affinity(base_cpu, cpu_count)` pins worker `N` to `base_cpu + (N % cpu_count)`.
+  - Jobs without an override keep the existing non-reactor CPU corridor behavior.
+- Hypersync `4ca3127` changed integrated NFS `copy-target`:
+  - `BufferReceiver` lane workers are pinned to CPUs `0..7`.
+  - `ReadyClassifier` lane threads are pinned to CPUs `8..15`.
+  - NFS target write reactors are pinned starting at CPU `16`.
+  - Packed-small-file buffers are routed into `SmallReadyFileQueue` by parent-folder hash instead of file id.
+  - The small writer batches up to `16` packed-small buffers per backend call.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Deployed package by artifact only:
+  - Transfer1 build artifact: `/mnt/local-nvme/wsync-codex/copy-perf-20260520T054528Z/hypersync-copy-4ca3127-piper-277032b.tar.gz`.
+  - agnopo unpacked path: `/tmp/wsync-codex/hypersync-copy-4ca3127-piper-277032b`.
+- Deterministic `copy-mix-v1` run:
+  - Source result: `50,100` files, `110.75 GB`, `105,788` buffers, `5.782s`, `153.24 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,788` buffers, `28.828s`, `30.735 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-affinity-locality-20260521T192713Z/target.out` on agnopo.
+  - Target lifecycle: receivers done `26.62s`, classifiers done `26.64s`, writers done `28.83s`.
+  - Pipeline:
+    `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(SmallReadyFileQueue-16384 x16 parent-hash)->[DataWriter-NFS/reactors=64 window=64 batch=16]+(MediumReadyBufQueue-4096 x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-4096 x112)->[DataWriter-NFS-112]`.
+- Interpretation:
+  - Against the previous wall-clock baseline this did not materially improve throughput (`30.74 -> 30.735 Gbit/s`).
+  - RX stayed fluid after traffic arrived: sampled RX depth peaked around `882/32768`, so classifier backpressure remains fixed.
+  - Small staging stayed shallow: sampled max `SMALL_WR_Q` was `619/262144`; routed packed-small buffers reached `3388`, representing the packed form of the `50,000` small files.
+  - Large queue drain still controls the tail: sampled `LRG_Q` climbed to about `5692` and drained after classifiers completed.
+  - The target log includes a long pre-traffic wait before the first buffer sample around `T+17.8s`; active-write throughput is therefore much higher than the report's wall-clock `30.7 Gbit/s`, but the same reporting method was used for the prior baseline.
