@@ -16119,7 +16119,7 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     senders.reserve(lanes);
     for (std::size_t lane = 0; lane < lanes; ++lane) {
         lane_queues.push_back(std::make_unique<BufQueue>(lane_queue_depth));
-        ScopedFd fd = connect_tcp(target_host, static_cast<std::uint16_t>(base_port + lane), 500, 10);
+        ScopedFd fd = connect_tcp(target_host, static_cast<std::uint16_t>(base_port + lane), 60, 250);
         senders.push_back(std::make_unique<BufferStreamSenderJob>(
             1U,
             *lane_queues.back(),
