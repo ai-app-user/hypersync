@@ -16420,7 +16420,15 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
 
         DirectTargetWriterStats small_stats;
         std::atomic<std::uint64_t> folders_created {0};
+        std::atomic<std::uint64_t> classifier_buffers {0};
+        std::atomic<std::uint64_t> mkdir_calls {0};
+        std::atomic<std::uint64_t> mkdir_wait_ns {0};
+        std::atomic<std::uint64_t> small_write_calls {0};
+        std::atomic<std::uint64_t> small_write_wait_ns {0};
+        std::atomic<std::uint64_t> medium_buffers_routed {0};
+        std::atomic<std::uint64_t> large_buffers_routed {0};
         std::atomic<bool> classifier_failed {false};
+        std::atomic<bool> telemetry_done {false};
         std::mutex error_mutex;
         std::exception_ptr classifier_error;
 
@@ -16482,7 +16490,14 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                 add_parent(buffer.trailer.rel_path.view());
             }
             if (!folders.empty()) {
+                const auto mkdir_started = std::chrono::steady_clock::now();
                 backend.ensure_directories(folders);
+                const auto mkdir_finished = std::chrono::steady_clock::now();
+                mkdir_calls.fetch_add(1U, std::memory_order_relaxed);
+                mkdir_wait_ns.fetch_add(
+                    static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(mkdir_finished - mkdir_started).count()),
+                    std::memory_order_relaxed);
                 folders_created.fetch_add(folders.size(), std::memory_order_relaxed);
             }
         };
@@ -16511,7 +16526,14 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             if (!ok) {
                 throw std::runtime_error("copy-target classifier received malformed packed-small-file buffer");
             }
+            const auto write_started = std::chrono::steady_clock::now();
             small_backend->write_files(files);
+            const auto write_finished = std::chrono::steady_clock::now();
+            small_write_calls.fetch_add(1U, std::memory_order_relaxed);
+            small_write_wait_ns.fetch_add(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(write_finished - write_started).count()),
+                std::memory_order_relaxed);
             small_stats.buffers_processed.fetch_add(1U, std::memory_order_relaxed);
             small_stats.files_written.fetch_add(files.size(), std::memory_order_relaxed);
             small_stats.bytes_written.fetch_add(payload_bytes, std::memory_order_relaxed);
@@ -16578,12 +16600,19 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                     transferred = push_sharded(medium_queue,
                                                                static_cast<std::size_t>(key % medium_threads),
                                                                handle);
+                                    if (transferred) {
+                                        medium_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
+                                    }
                                 } else {
                                     transferred = push_sharded(large_queue,
                                                                static_cast<std::size_t>(key % large_threads),
                                                                handle);
+                                    if (transferred) {
+                                        large_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
+                                    }
                                 }
                             }
+                            classifier_buffers.fetch_add(1U, std::memory_order_relaxed);
                             if (!transferred) {
                                 data_pool.release(handle);
                             }
@@ -16603,6 +16632,85 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                   << " elapsed_s=" << elapsed_since_start()
                   << std::endl;
 
+        std::thread telemetry_thread([&]() {
+            using namespace std::chrono_literals;
+            std::uint64_t last_rx_buffers = 0;
+            std::uint64_t last_written_bytes = 0;
+            auto last = std::chrono::steady_clock::now();
+            while (!telemetry_done.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(200ms);
+                const auto now = std::chrono::steady_clock::now();
+                const double interval = std::chrono::duration<double>(now - last).count();
+                std::uint64_t rx_buffers = 0;
+                std::uint64_t rx_bytes = 0;
+                std::size_t rx_depth = 0;
+                std::size_t rx_high = 0;
+                for (const auto& lane : target_lanes) {
+                    const BufferTransportStats receiver_stats = lane->receiver->stats();
+                    rx_buffers += receiver_stats.buffers;
+                    rx_bytes += receiver_stats.payload_bytes;
+                    rx_depth += lane->queue.size();
+                    rx_high += lane->queue.high_watermark();
+                }
+                const TargetWriterStats small_snapshot = small_stats.snapshot();
+                const TargetWriterStats medium_snapshot = medium_writer.stats();
+                const TargetWriterStats large_snapshot = large_writer.stats();
+                const std::uint64_t written_bytes =
+                    small_snapshot.bytes_written + medium_snapshot.bytes_written + large_snapshot.bytes_written;
+                const double rx_buffers_s =
+                    interval > 0.0 ? static_cast<double>(rx_buffers - last_rx_buffers) / interval : 0.0;
+                const double write_gbit_s =
+                    interval > 0.0
+                        ? static_cast<double>(written_bytes - last_written_bytes) * 8.0 / interval / 1e9
+                        : 0.0;
+                last = now;
+                last_rx_buffers = rx_buffers;
+                last_written_bytes = written_bytes;
+                const std::uint64_t mkdir_call_count = mkdir_calls.load(std::memory_order_relaxed);
+                const std::uint64_t small_call_count = small_write_calls.load(std::memory_order_relaxed);
+                const double mkdir_avg_ms =
+                    mkdir_call_count == 0U
+                        ? 0.0
+                        : static_cast<double>(mkdir_wait_ns.load(std::memory_order_relaxed)) /
+                              static_cast<double>(mkdir_call_count) / 1'000'000.0;
+                const double small_avg_ms =
+                    small_call_count == 0U
+                        ? 0.0
+                        : static_cast<double>(small_write_wait_ns.load(std::memory_order_relaxed)) /
+                              static_cast<double>(small_call_count) / 1'000'000.0;
+                std::cerr << std::fixed << std::setprecision(1)
+                          << "[T+" << elapsed_since_start() << "s] "
+                          << "RX_Q:[" << rx_depth << "/" << (lanes * lane_queue_depth)
+                          << " hw=" << rx_high << "] "
+                          << "RX:" << rx_buffers << " buf " << std::setprecision(2)
+                          << (static_cast<double>(rx_bytes) * 8.0 / 1e9) << "Gb "
+                          << std::setprecision(1)
+                          << "rx_buf_s=" << rx_buffers_s << " | "
+                          << "POOL:[" << data_pool.in_use() << "/" << data_pool.capacity() << "] | "
+                          << "MKDIR_Q:inline calls=" << mkdir_call_count
+                          << " folders=" << folders_created.load(std::memory_order_relaxed)
+                          << " avg_ms=" << mkdir_avg_ms << " | "
+                          << "SMALL_WR_Q:direct calls=" << small_call_count
+                          << " files=" << small_snapshot.files_written
+                          << " avg_ms=" << small_avg_ms << " | "
+                          << "MED_Q:[" << medium_queue.size() << "/" << medium_queue.capacity()
+                          << " routed=" << medium_buffers_routed.load(std::memory_order_relaxed)
+                          << " written=" << medium_snapshot.files_written << "] | "
+                          << "LRG_Q:[" << large_queue.size() << "/" << large_queue.capacity()
+                          << " routed=" << large_buffers_routed.load(std::memory_order_relaxed)
+                          << " written=" << large_snapshot.files_written << "] | "
+                          << "CLASSIFIED:" << classifier_buffers.load(std::memory_order_relaxed)
+                          << " | W:" << write_gbit_s << "Gbit/s"
+                          << std::defaultfloat << std::endl;
+            }
+        });
+        const auto stop_telemetry = [&]() {
+            telemetry_done.store(true, std::memory_order_release);
+            if (telemetry_thread.joinable()) {
+                telemetry_thread.join();
+            }
+        };
+
         for (auto& lane : target_lanes) {
             lane->receiver->wait();
         }
@@ -16615,15 +16723,18 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         medium_queue.close();
         large_queue.close();
         std::cerr << "copy_target_classifiers_done"
+                  << " buffers=" << classifier_buffers.load(std::memory_order_relaxed)
                   << " elapsed_s=" << elapsed_since_start()
                   << std::endl;
         if (classifier_error) {
             medium_writer.stop();
             large_writer.stop();
+            stop_telemetry();
             std::rethrow_exception(classifier_error);
         }
         medium_writer.wait();
         large_writer.wait();
+        stop_telemetry();
         std::cerr << "copy_target_writers_done"
                   << " elapsed_s=" << elapsed_since_start()
                   << std::endl;
