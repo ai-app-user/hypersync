@@ -14892,7 +14892,9 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
             RawBufferPool send_pool(kDataBufferPoolId, total_pool_slots, buffer_size);
             BufferPoolRegistry send_registry;
             send_registry.register_pool(send_pool);
-            BufQueue sender_input(std::max<std::size_t>(1U, total_pool_slots));
+            const std::size_t queue_depth_per_lane =
+                std::max<std::size_t>(1U, pool_slots_per_transport);
+            ShardedBufQueue sender_input(transports, queue_depth_per_lane);
             BufferGeneratorJob generator(BufferGeneratorConfig(generator_threads,
                                                                total_buffers,
                                                                generator_pattern,
@@ -14906,7 +14908,7 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
             for (std::size_t index = 0; index < transports; ++index) {
                 senders.push_back(std::make_unique<BufferSenderJob>(
                     sender_threads,
-                    sender_input,
+                    sender_input.shard(index),
                     send_registry,
                     BufferTransportEndpoint::tcp(tcp_host, static_cast<std::uint16_t>(base_port + index))));
             }
@@ -14946,7 +14948,7 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
             report.pool_slots_per_transport = pool_slots_per_transport;
             report.buffers_per_transport = buffers_per_transport;
             report.pattern = to_string(generator_pattern);
-            report.transport_kind = "tcp-remote-sender-shared";
+            report.transport_kind = "tcp-remote-sender-sharded";
             return report;
         }
 
@@ -15175,7 +15177,9 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
         RawBufferPool send_pool(kDataBufferPoolId, total_pool_slots, buffer_size);
         BufferPoolRegistry send_registry;
         send_registry.register_pool(send_pool);
-        BufQueue sender_input(std::max<std::size_t>(1U, total_pool_slots));
+        const std::size_t queue_depth_per_lane =
+            std::max<std::size_t>(1U, pool_slots_per_transport);
+        ShardedBufQueue sender_input(transports, queue_depth_per_lane);
         BufferGeneratorJob generator(BufferGeneratorConfig(generator_threads,
                                                            total_buffers,
                                                            generator_pattern,
@@ -15217,7 +15221,7 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
                                                                       *receiver_outputs.back(),
                                                                       *receive_registries.back()));
             senders.push_back(std::make_unique<BufferSenderJob>(sender_threads,
-                                                                sender_input,
+                                                                sender_input.shard(index),
                                                                 send_registry,
                                                                 std::move(endpoint)));
         }
@@ -15273,7 +15277,7 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
         report.pool_slots_per_transport = pool_slots_per_transport;
         report.buffers_per_transport = buffers_per_transport;
         report.pattern = to_string(generator_pattern);
-        report.transport_kind = transport_kind + "-shared";
+        report.transport_kind = transport_kind + "-sharded";
         if (transport_kind == "unix" && socket_dir.empty()) {
             std::error_code ignored;
             std::filesystem::remove_all(effective_socket_dir, ignored);
