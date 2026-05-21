@@ -351,6 +351,17 @@ struct ReadyFileSpillway {
 
 std::size_t queued_ready_file_spillway(ReadyFileSpillway& spillway);
 
+struct TargetBufferSpillway {
+    std::mutex mutex;
+    std::condition_variable cv_not_empty;
+    std::deque<BufferHandle> handles;
+    bool input_done = false;
+    bool stop = false;
+    std::exception_ptr error;
+    std::size_t high_watermark = 0;
+    std::atomic<std::int64_t>* depth_counter = nullptr;
+};
+
 struct ScannerCapacityControl {
     std::atomic<std::size_t> active_workers {1};
     std::mutex mutex;
@@ -6519,6 +6530,75 @@ std::vector<FileSpec> take_ready_file_spill_batch(ReadyFileSpillway& spillway, s
     for (std::size_t index = 0; index < count; ++index) {
         batch.push_back(std::move(spillway.files.front()));
         spillway.files.pop_front();
+    }
+    return batch;
+}
+
+void fail_target_buffer_spillway(TargetBufferSpillway& spillway,
+                                 RawBufferPool& pool,
+                                 std::exception_ptr error = std::current_exception()) {
+    std::deque<BufferHandle> handles;
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        spillway.error = error;
+        spillway.stop = true;
+        handles.swap(spillway.handles);
+    }
+    if (spillway.depth_counter != nullptr) {
+        spillway.depth_counter->fetch_sub(static_cast<std::int64_t>(handles.size()), std::memory_order_relaxed);
+    }
+    for (const BufferHandle& handle : handles) {
+        pool.release(handle);
+    }
+    spillway.cv_not_empty.notify_all();
+}
+
+void mark_target_buffer_spillway_input_done(TargetBufferSpillway& spillway) {
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        spillway.input_done = true;
+    }
+    spillway.cv_not_empty.notify_all();
+}
+
+bool spill_target_buffer(TargetBufferSpillway& spillway, const BufferHandle& handle) {
+    {
+        std::lock_guard<std::mutex> lock(spillway.mutex);
+        if (spillway.stop || spillway.error) {
+            return false;
+        }
+        spillway.handles.push_back(handle);
+        spillway.high_watermark = std::max(spillway.high_watermark, spillway.handles.size());
+    }
+    if (spillway.depth_counter != nullptr) {
+        spillway.depth_counter->fetch_add(1, std::memory_order_relaxed);
+    }
+    spillway.cv_not_empty.notify_one();
+    return true;
+}
+
+std::vector<BufferHandle> take_target_buffer_spill_batch(TargetBufferSpillway& spillway,
+                                                         std::size_t max_handles) {
+    std::vector<BufferHandle> batch;
+    if (max_handles == 0U) {
+        return batch;
+    }
+    std::unique_lock<std::mutex> lock(spillway.mutex);
+    spillway.cv_not_empty.wait(lock, [&spillway]() {
+        return spillway.stop || spillway.error || !spillway.handles.empty() || spillway.input_done;
+    });
+    if (spillway.stop || spillway.error || spillway.handles.empty()) {
+        return batch;
+    }
+    const std::size_t count = std::min(max_handles, spillway.handles.size());
+    batch.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        batch.push_back(spillway.handles.front());
+        spillway.handles.pop_front();
+    }
+    lock.unlock();
+    if (spillway.depth_counter != nullptr) {
+        spillway.depth_counter->fetch_sub(static_cast<std::int64_t>(count), std::memory_order_relaxed);
     }
     return batch;
 }
@@ -16464,8 +16544,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         medium_writer_config.direct_reactor_writes = false;
 
         TargetDataWriterConfig large_writer_config = base_writer_config;
-        large_writer_config.worker_count = 112U;
-        large_writer_config.async_window = 2U;
+        large_writer_config.worker_count = 48U;
+        large_writer_config.async_window = 8U;
         large_writer_config.direct_reactor_submit = false;
         large_writer_config.direct_reactor_writes = false;
 
@@ -16474,14 +16554,19 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         const std::size_t large_threads = target_data_writer_effective_worker_count(large_writer_config);
         const std::size_t small_queue_depth_per_shard =
             std::max<std::size_t>(1U, (262144U + small_threads - 1U) / small_threads);
+        const std::size_t target_bulk_queue_depth_per_shard = std::max<std::size_t>(lane_queue_depth, 16384U);
         ShardedBufQueue small_queue(small_threads, small_queue_depth_per_shard);
-        ShardedBufQueue medium_queue(medium_threads, lane_queue_depth);
-        ShardedBufQueue large_queue(large_threads, lane_queue_depth);
+        ShardedBufQueue medium_queue(medium_threads, target_bulk_queue_depth_per_shard);
+        ShardedBufQueue large_queue(large_threads, target_bulk_queue_depth_per_shard);
 
         CopyTargetEngineTelemetry telemetry;
         small_queue.set_depth_counter(&telemetry.small_write_queue_depth);
         medium_queue.set_depth_counter(&telemetry.medium_write_queue_depth);
         large_queue.set_depth_counter(&telemetry.large_write_queue_depth);
+        TargetBufferSpillway medium_spillway;
+        TargetBufferSpillway large_spillway;
+        medium_spillway.depth_counter = &telemetry.medium_spillway_size;
+        large_spillway.depth_counter = &telemetry.large_spillway_size;
         std::atomic<std::uint64_t> folders_created {0};
         std::atomic<std::uint64_t> classifier_buffers {0};
         std::atomic<std::uint64_t> mkdir_calls {0};
@@ -16528,6 +16613,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             small_queue.close();
             medium_queue.close();
             large_queue.close();
+            fail_target_buffer_spillway(medium_spillway, data_pool, error);
+            fail_target_buffer_spillway(large_spillway, data_pool, error);
         };
 
         const auto ensure_buffer_directories = [&](TargetWriterBackend& backend, const BufferHandle& handle) {
@@ -16586,6 +16673,15 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             }
             return queue.push_wait(shard, handle);
         };
+        const auto try_push_or_spill = [](ShardedBufQueue& queue,
+                                          TargetBufferSpillway& spillway,
+                                          std::size_t shard,
+                                          const BufferHandle& handle) {
+            if (queue.try_push(shard, handle)) {
+                return true;
+            }
+            return spill_target_buffer(spillway, handle);
+        };
 
         TargetDataWriterJob small_writer(small_writer_config, data_pool, small_queue);
         TargetDataWriterJob medium_writer(medium_writer_config, data_pool, medium_queue);
@@ -16612,6 +16708,49 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         small_writer.start();
         medium_writer.start();
         large_writer.start();
+
+        std::vector<std::thread> spillway_drainers;
+        spillway_drainers.reserve(2U);
+        const auto drain_spillway = [&](TargetBufferSpillway& spillway,
+                                        ShardedBufQueue& queue,
+                                        std::size_t shard_count,
+                                        std::string_view name) {
+            try {
+                while (!classifier_failed.load(std::memory_order_acquire)) {
+                    std::vector<BufferHandle> batch = take_target_buffer_spill_batch(spillway, 1024U);
+                    if (batch.empty()) {
+                        std::lock_guard<std::mutex> lock(spillway.mutex);
+                        if (spillway.input_done || spillway.stop || spillway.error) {
+                            break;
+                        }
+                        continue;
+                    }
+                    for (const BufferHandle& spilled : batch) {
+                        const DataBuffer& spilled_buffer = data_buffer(data_pool, spilled);
+                        const std::uint64_t key = spilled_buffer.trailer.file_id != 0U
+                                                      ? spilled_buffer.trailer.file_id
+                                                      : hash64(spilled_buffer.trailer.rel_path.view());
+                        if (!queue.push_wait(static_cast<std::size_t>(key % shard_count), spilled)) {
+                            data_pool.release(spilled);
+                            throw std::runtime_error(std::string("copy-target ") + std::string(name) +
+                                                     " spillway drainer saw a closed writer queue");
+                        }
+                    }
+                }
+            } catch (...) {
+                remember_classifier_error(std::current_exception());
+            }
+        };
+        spillway_drainers.emplace_back(drain_spillway,
+                                       std::ref(medium_spillway),
+                                       std::ref(medium_queue),
+                                       medium_threads,
+                                       std::string_view("medium"));
+        spillway_drainers.emplace_back(drain_spillway,
+                                       std::ref(large_spillway),
+                                       std::ref(large_queue),
+                                       large_threads,
+                                       std::string_view("large"));
 
         std::vector<std::thread> classifiers;
         classifiers.reserve(lanes);
@@ -16652,16 +16791,18 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                               ? buffer.trailer.file_id
                                                               : hash64(buffer.trailer.rel_path.view());
                                 if (file_size < 1024U * 1024U) {
-                                    transferred = push_sharded(medium_queue,
-                                                               static_cast<std::size_t>(key % medium_threads),
-                                                               handle);
+                                    transferred = try_push_or_spill(medium_queue,
+                                                                    medium_spillway,
+                                                                    static_cast<std::size_t>(key % medium_threads),
+                                                                    handle);
                                     if (transferred) {
                                         medium_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
                                     }
                                 } else {
-                                    transferred = push_sharded(large_queue,
-                                                               static_cast<std::size_t>(key % large_threads),
-                                                               handle);
+                                    transferred = try_push_or_spill(large_queue,
+                                                                    large_spillway,
+                                                                    static_cast<std::size_t>(key % large_threads),
+                                                                    handle);
                                     if (transferred) {
                                         large_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
                                     }
@@ -16691,8 +16832,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             using namespace std::chrono_literals;
             const auto rx_capacity = static_cast<std::int64_t>(lanes * lane_queue_depth);
             const auto small_capacity = static_cast<std::int64_t>(small_queue.capacity());
-            const auto medium_capacity = static_cast<std::int64_t>(medium_threads * lane_queue_depth);
-            const auto large_capacity = static_cast<std::int64_t>(large_threads * lane_queue_depth);
+            const auto medium_capacity = static_cast<std::int64_t>(medium_queue.capacity());
+            const auto large_capacity = static_cast<std::int64_t>(large_queue.capacity());
             while (!telemetry_done.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(200ms);
                 const auto mkdir_issued = telemetry.mkdir_requests_issued.load(std::memory_order_relaxed);
@@ -16741,6 +16882,13 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                   << std::endl;
         for (auto& classifier : classifiers) {
             classifier.join();
+        }
+        mark_target_buffer_spillway_input_done(medium_spillway);
+        mark_target_buffer_spillway_input_done(large_spillway);
+        for (auto& drainer : spillway_drainers) {
+            if (drainer.joinable()) {
+                drainer.join();
+            }
         }
         small_queue.close();
         medium_queue.close();
@@ -16794,11 +16942,12 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             std::to_string(base_writer_config.reactor_count) + " window=" +
             std::to_string(base_writer_config.max_concurrent_file_transactions) +
             " batch=" + std::to_string(small_writer_config.async_window) +
-            "]+(MediumReadyBufQueue-" + std::to_string(lane_queue_depth) + " x" +
+            "]+(MediumReadyBufQueue-" + std::to_string(target_bulk_queue_depth_per_shard) + " x" +
             std::to_string(medium_threads) + ")->[DataWriter-NFS-" +
             std::to_string(medium_threads) + "]+(LargeReadyBufQueue-" +
-            std::to_string(lane_queue_depth) + " x" + std::to_string(large_threads) +
-            ")->[DataWriter-NFS-" + std::to_string(large_threads) + "]";
+            std::to_string(target_bulk_queue_depth_per_shard) + " x" + std::to_string(large_threads) +
+            ")->[DataWriter-NFS-" + std::to_string(large_threads) +
+            " batch=" + std::to_string(large_writer_config.async_window) + "]";
         (void)folders_created;
         return report;
     }
