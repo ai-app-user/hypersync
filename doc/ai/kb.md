@@ -2048,3 +2048,26 @@ logical size: 335.99 TB
   - The gate is functionally correct and all files verified, but it was slower than the previous default path (`31.17 -> 26.19 Gbit/s`).
   - Decoupling by create-then-open added an extra handle round trip: `CREATE+CLOSE` in the precreation lane followed by `OPEN+WRITE+COMMIT+CLOSE` in the writer lane.
   - The low `CREATE_Q` and writer queue depths show there was no queue saturation; the cost is protocol lifecycle overhead. A future version would need to pass the created raw file handle/token into the writer reactors to avoid the extra `OPEN` before this design can beat the integrated create/write reactor path.
+
+## 2026-05-21 - Remote Buffer Transport WAN Benchmark
+
+- Added remote roles to `benchmark-transport` so the generic buffer bridge can be measured across real transfer1 -> agnopo latency instead of local loopback:
+  - Receiver side: `benchmark-transport --role receiver --transport tcp`.
+  - Sender side: `benchmark-transport --role sender --transport tcp --shared-input`.
+  - Pipeline under test: `[BufferGenerator-32]->(SharedInputQueue)->[BufferSender-1 xN]->TCP WAN->[BufferReceiver-1 xN]->(BufQueue)->[BufferDiscarder-1 xN]`.
+- Deployment followed the package-only model:
+  - Hypersync commit: `4b28a34bab63333a8e9c4ef1ed67a92a1715c529`, dirty `0`.
+  - Piper commit after WAN fixes: `78cd1d366b24684678014603edededd8429178c6`, dirty `0`.
+  - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-remote-transport-20260521T210315Z`.
+  - agnopo bundle: `/tmp/wsync-codex/deployments/hypersync-remote-transport-20260521T210315Z`.
+- Fixes found during the real WAN test:
+  - The first remote run timed out connecting even while agnopo was listening because `BufferSenderJob` used a `10ms` TCP connect timeout; transfer1 -> agnopo TCP setup is roughly `60-75ms`. Piper `f73a049` raised buffer transport TCP connect attempts to `200ms`.
+  - The next run was receiver-window limited. Piper `78cd1d3` moved stream socket tuning before `connect()` and before `listen()` so TCP window scaling is negotiated with the large requested socket buffers instead of being applied too late after the handshake.
+- Receiver-side truth results, 1 MiB payload frames, zero pattern, transfer1 -> agnopo over real TCP:
+  - `64` lanes, `128` buffers/lane, `8 GiB` total: receiver `4.20 Gbit/s`, `16.35s`.
+  - `64` lanes, `1024` buffers/lane, `64 GiB` total after pre-handshake socket tuning: receiver `44.24 Gbit/s`, `12.43s`.
+  - `16` lanes, `4096` buffers/lane, `64 GiB` total after pre-handshake socket tuning: receiver `39.36 Gbit/s`, `13.97s`.
+- Sender-side benchmark numbers are not authoritative for this test because the sender can finish after handing bytes to kernel socket queues while agnopo is still draining. Use receiver `payload_bytes_received / receiver elapsed` for transport truth.
+- Interpretation:
+  - The generic buffer receiver/discard path is now working over real WAN latency, but it tops out in the same `~40-45 Gbit/s` band seen in earlier target ingest experiments, far below the `iperf3` host-to-host baseline (`~149-171 Gbit/s` at 8-16 streams).
+  - This confirms the remaining gap is in the Hypersync/Piper buffer transport receive path or per-frame socket read/queue handoff mechanics, not in local loopback, packaging, firewall reachability, or NFS writer behavior.
