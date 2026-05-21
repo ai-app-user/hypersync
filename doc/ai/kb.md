@@ -1982,3 +1982,29 @@ logical size: 335.99 TB
   - Small staging stayed shallow: sampled max `SMALL_WR_Q` was `619/262144`; routed packed-small buffers reached `3388`, representing the packed form of the `50,000` small files.
   - Large queue drain still controls the tail: sampled `LRG_Q` climbed to about `5692` and drained after classifiers completed.
   - The target log includes a long pre-traffic wait before the first buffer sample around `T+17.8s`; active-write throughput is therefore much higher than the report's wall-clock `30.7 Gbit/s`, but the same reporting method was used for the prior baseline.
+
+## 2026-05-21 - Target Ingestion Spillway and Bulk Queue Sweep
+
+- Hypersync `05b51c3` restored target-side non-blocking spillways for medium/large buffers in integrated NFS `copy-target`:
+  - Classifiers now use `try_push()` for medium/large queues and spill `BufferHandle`s into heap-backed spillways when a shard is full.
+  - Dedicated spillway drainer threads are allowed to block on the writer queues, keeping classifier threads non-blocking for bulk routing.
+  - `MediumReadyBufQueue` and `LargeReadyBufQueue` per-shard capacity increased from `4,096` to `16,384`.
+  - Large writer consolidation test used `DataWriter-NFS-48 batch=8`.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Deterministic `copy-mix-v1` spillway run with `48` large writers:
+  - Source result: `50,100` files, `110.75 GB`, `105,782` buffers, `5.717s`, `154.98 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,782` buffers, `30.028s`, `29.51 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-spillway-bulkq-20260521T193401Z/target.out` on agnopo.
+  - Target lifecycle: receivers done `27.21s`, classifiers done `27.22s`, writers done `30.03s`.
+  - Queue highs: `RX_Q=952`, `SMALL_WR_Q=410`, `MED_SPILL=0`, `LRG_SPILL=0`, `MED_Q=0`, `LRG_Q=4556`.
+  - Pipeline: `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(SmallReadyFileQueue-16384 x16 parent-hash)->[DataWriter-NFS/reactors=64 window=64 batch=16]+(MediumReadyBufQueue-16384 x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-16384 x48)->[DataWriter-NFS-48 batch=8]`.
+- Follow-up retest with `112` large writers (`3ae6bb8`) was worse:
+  - Source result: `183.70 Gbit/s`, `4.823s`.
+  - Target result: `18.52 Gbit/s`, `47.84s`.
+  - Target telemetry log: `/tmp/hypersync-spillway112-20260521T193654Z/target.out` on agnopo.
+  - Queue highs: `RX_Q=119`, `SMALL_WR_Q=174`, `MED_SPILL=0`, `LRG_SPILL=0`, `LRG_Q=5622`.
+  - The queue telemetry reached zero long before `writers_done`, meaning the tail is inside downstream NFS writer calls/in-flight completions, not classifier-to-queue backpressure.
+- Conclusion:
+  - The spillway code is correct as a guardrail, but in these runs spillways never activated. The prior assumption that large/medium shard saturation was stalling classifiers was not supported by telemetry.
+  - Classifier/RX backpressure remains fixed (`RX_Q` stayed far below capacity).
+  - The current limiter is now the target-side NFS write drain/tail, especially after queues have emptied into writer-owned work.
