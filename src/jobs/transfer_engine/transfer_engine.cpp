@@ -16544,8 +16544,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         medium_writer_config.direct_reactor_writes = false;
 
         TargetDataWriterConfig large_writer_config = base_writer_config;
-        large_writer_config.worker_count = 48U;
-        large_writer_config.async_window = 8U;
+        large_writer_config.worker_count = 112U;
+        large_writer_config.async_window = 2U;
         large_writer_config.direct_reactor_submit = false;
         large_writer_config.direct_reactor_writes = false;
 
