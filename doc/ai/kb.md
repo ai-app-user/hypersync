@@ -1898,3 +1898,33 @@ logical size: 335.99 TB
   - Once all `50,000` small files completed around `T+53.9s`, receive drained quickly from about `99,789` to `105,775` buffers and interval write bandwidth rose into the `28-41 Gbit/s` range while the remaining large queue drained.
 - Conclusion:
   - The integrated path is backpressured primarily because classifier threads synchronously execute direct small-file NFS writes before returning to receiver queue draining. This keeps RX queues full and throttles TCP ingestion. Directory creation and large queue saturation are not the first-order bottlenecks in this trace.
+
+## 2026-05-21 - Low-Overhead Copy Target Telemetry
+
+- Piper `dc0f794` added opt-in queue-depth telemetry counters to `BufQueue` and `ShardedBufQueue`.
+  - The queue counter is an external relaxed atomic mirror updated only on successful push/pop.
+  - Normal queue behavior is unchanged when no counter is registered.
+- Hypersync `56722db` replaced the earlier sampling-heavy integrated `copy-target` telemetry with a low-overhead target monitor:
+  - Uses `CopyTargetEngineTelemetry` relaxed atomics for RX queue depth, mkdir in-flight depth, small direct write in-flight depth, medium/large queue depth, spillway placeholders, and mkdir issued/ack counters.
+  - Emits one unbuffered `fprintf(stdout, ...)` line every `200ms`.
+  - Lifecycle logs remain on `stderr`; telemetry lines are in `target.out`.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Deployed package by artifact only:
+  - Transfer1 build artifact: `/mnt/local-nvme/wsync-codex/copy-perf-20260520T054528Z/hypersync-copy-56722db-piper-dc0f794.tar.gz`.
+  - agnopo unpacked path: `/tmp/wsync-codex/hypersync-copy-56722db-piper-dc0f794`.
+- Deterministic `copy-mix-v1` low-overhead telemetry run:
+  - Source result: `50,100` files, `110.75 GB`, `105,807` buffers, `5.242s`, `169.01 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,807` buffers, `48.63s`, `18.22 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-lowtelemetry-20260521T1820Z/target.out` on agnopo.
+  - Target lifecycle: receivers done `46.10s`, classifiers done `46.12s`, writers done `48.63s`.
+- Key telemetry samples:
+  - Early active phase: `T+16.2s RX_Q=[1356/32768] MKDIR lag=0 avg_ms=0.104 SMALL_WR_Q=[1/4096] LRG_Q=[684/458752] CLASSIFIED=10175`.
+  - Saturated slow phase: `T+24.2s RX_Q=[4096/32768] MKDIR lag=0 avg_ms=0.013 SMALL_WR_Q=[1/4096] LRG_Q=[0/458752] CLASSIFIED=91125`.
+  - End of classifier phase: `T+46.2s RX_Q=[0/32768] MKDIR lag=0 avg_ms=0.014 SMALL_WR_Q=[0/4096] LRG_Q=[5309/458752] CLASSIFIED=105807`.
+  - Final drain: `T+48.6s RX_Q=[0/32768] MKDIR lag=0 avg_ms=0.014 SMALL_WR_Q=[0/4096] LRG_Q=[0/458752] CLASSIFIED=105807`.
+- Updated diagnosis:
+  - The telemetry itself is no longer doing queue scans or iostream formatting.
+  - Directory creation is not lagging: issued and ack stay equal or nearly equal, and average mkdir time is about `0.013-0.014 ms` after warm-up.
+  - The RX queue pins at exactly one lane worth of capacity (`4096`) while classifiers are busy, proving TCP ingest is still backpressured by classifier-side work.
+  - `SMALL_WR_Q=[1/4096]` means the current "small direct" path is not a real queue feeding all 64 reactors; it is synchronous classifier-to-backend execution with only one active call visible at a time per sampled instant.
+  - Next architectural fix should introduce a true `SmallReadyFileQueue` / direct-submit queue between `ReadyClassifier` and `DataWriter-NFS/reactors=64`, so classifiers only classify and enqueue, while reactors consume independently.
