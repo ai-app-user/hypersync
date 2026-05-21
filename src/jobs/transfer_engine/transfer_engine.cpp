@@ -16372,6 +16372,297 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                        data_buffer_slots_per_lane == 0U
                                                            ? lane_queue_depth * 2U + 2U
                                                            : data_buffer_slots_per_lane);
+    if (ensure_target_directories && is_nfs_url(target_root)) {
+        const std::size_t receiver_pool_slots =
+            std::max<std::size_t>(lanes * (data_buffer_slots_per_lane + 2U),
+                                  lanes * lane_queue_depth + 8192U);
+        RawBufferPool data_pool = make_data_buffer_pool(receiver_pool_slots);
+
+        TargetDataWriterConfig base_writer_config = load_target_data_writer_config(config_store_);
+        base_writer_config.target_root = target_root;
+        base_writer_config.verify_hash = verify_hash;
+        base_writer_config.preserve_metadata = preserve_metadata;
+        base_writer_config.fsync_on_finish = target_fsync;
+        base_writer_config.ensure_parent_directories = false;
+        base_writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
+        base_writer_config.reactor_count = writer_reactors == 0U ? 64U : writer_reactors;
+        base_writer_config.max_concurrent_file_transactions = writer_file_window == 0U ? 64U : writer_file_window;
+        if (writer_async_window != 0U) {
+            base_writer_config.async_window = writer_async_window;
+        }
+
+        TargetDataWriterConfig medium_writer_config = base_writer_config;
+        medium_writer_config.worker_count = 64U;
+        medium_writer_config.async_window = 2U;
+        medium_writer_config.direct_reactor_submit = false;
+        medium_writer_config.direct_reactor_writes = false;
+
+        TargetDataWriterConfig large_writer_config = base_writer_config;
+        large_writer_config.worker_count = 112U;
+        large_writer_config.async_window = 2U;
+        large_writer_config.direct_reactor_submit = false;
+        large_writer_config.direct_reactor_writes = false;
+
+        const std::size_t medium_threads = target_data_writer_effective_worker_count(medium_writer_config);
+        const std::size_t large_threads = target_data_writer_effective_worker_count(large_writer_config);
+        ShardedBufQueue medium_queue(medium_threads, lane_queue_depth);
+        ShardedBufQueue large_queue(large_threads, lane_queue_depth);
+
+        TargetWriterBackend::Options small_options;
+        small_options.preserve_metadata = preserve_metadata;
+        small_options.fsync_on_finish = target_fsync;
+        small_options.ensure_parent_directories = false;
+        small_options.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
+        small_options.reactor_count = base_writer_config.reactor_count;
+        small_options.max_concurrent_file_transactions = base_writer_config.max_concurrent_file_transactions;
+        std::unique_ptr<TargetWriterBackend> small_backend =
+            make_target_writer_backend(target_root, 0U, small_options);
+
+        DirectTargetWriterStats small_stats;
+        std::atomic<std::uint64_t> folders_created {0};
+        std::atomic<bool> classifier_failed {false};
+        std::mutex error_mutex;
+        std::exception_ptr classifier_error;
+
+        struct CopyTargetReceiverLane {
+            BufQueue queue;
+            std::unique_ptr<BufferReceiverJob> receiver;
+            explicit CopyTargetReceiverLane(std::size_t depth) : queue(depth) {}
+        };
+        std::vector<std::unique_ptr<CopyTargetReceiverLane>> target_lanes;
+        target_lanes.reserve(lanes);
+        for (std::size_t lane = 0; lane < lanes; ++lane) {
+            auto target_lane = std::make_unique<CopyTargetReceiverLane>(lane_queue_depth);
+            target_lane->receiver = std::make_unique<BufferReceiverJob>(
+                1U,
+                data_pool,
+                target_lane->queue,
+                BufferTransportEndpoint::tcp(bind_host.empty() ? std::string("0.0.0.0") : bind_host,
+                                             static_cast<std::uint16_t>(base_port + lane)));
+            target_lanes.push_back(std::move(target_lane));
+        }
+
+        auto remember_classifier_error = [&](std::exception_ptr error) {
+            {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!classifier_error) {
+                    classifier_error = error;
+                }
+            }
+            classifier_failed.store(true, std::memory_order_release);
+            for (auto& lane : target_lanes) {
+                lane->queue.close();
+            }
+            medium_queue.close();
+            large_queue.close();
+        };
+
+        const auto ensure_buffer_directories = [&](TargetWriterBackend& backend, const BufferHandle& handle) {
+            const DataBuffer& buffer = data_buffer(data_pool, handle);
+            std::vector<FileSpec> folders;
+            std::unordered_set<std::string> seen;
+            const auto add_parent = [&](std::string_view rel_path) {
+                const std::string parent = parent_path(rel_path);
+                if (parent.empty() || !seen.insert(parent).second) {
+                    return;
+                }
+                FileSpec folder;
+                folder.rel_path = parent;
+                folder.mode = 0755U;
+                folders.push_back(std::move(folder));
+            };
+            if (is_packed_small_file_buffer(buffer)) {
+                const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
+                    add_parent(view.rel_path);
+                });
+                if (!ok) {
+                    throw std::runtime_error("copy-target classifier received malformed packed-small-file buffer");
+                }
+            } else if (!buffer.trailer.rel_path.view().empty()) {
+                add_parent(buffer.trailer.rel_path.view());
+            }
+            if (!folders.empty()) {
+                backend.ensure_directories(folders);
+                folders_created.fetch_add(folders.size(), std::memory_order_relaxed);
+            }
+        };
+
+        const auto write_small_buffer = [&](const BufferHandle& handle) {
+            const DataBuffer& buffer = data_buffer(data_pool, handle);
+            std::vector<TargetWriterBackend::WriteChunk> files;
+            std::uint64_t payload_bytes = 0;
+            files.reserve(packed_small_file_count(buffer));
+            const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
+                FileSpec file;
+                file.rel_path = std::string(view.rel_path);
+                file.declared_size = view.file_size;
+                file.mtime = view.mtime;
+                file.mode = view.mode != 0U ? view.mode : 0644U;
+                file.uid = view.uid;
+                file.gid = view.gid;
+                TargetWriterBackend::WriteChunk chunk;
+                chunk.spec = std::move(file);
+                chunk.data = view.data;
+                chunk.offset = 0U;
+                chunk.last_chunk = true;
+                payload_bytes += view.data.size();
+                files.push_back(std::move(chunk));
+            });
+            if (!ok) {
+                throw std::runtime_error("copy-target classifier received malformed packed-small-file buffer");
+            }
+            small_backend->write_files(files);
+            small_stats.buffers_processed.fetch_add(1U, std::memory_order_relaxed);
+            small_stats.files_written.fetch_add(files.size(), std::memory_order_relaxed);
+            small_stats.bytes_written.fetch_add(payload_bytes, std::memory_order_relaxed);
+        };
+
+        const auto push_sharded = [](ShardedBufQueue& queue, std::size_t shard, const BufferHandle& handle) {
+            if (queue.try_push(shard, handle)) {
+                return true;
+            }
+            return queue.push_wait(shard, handle);
+        };
+
+        TargetDataWriterJob medium_writer(medium_writer_config, data_pool, medium_queue);
+        TargetDataWriterJob large_writer(large_writer_config, data_pool, large_queue);
+
+        const auto started_at = std::chrono::steady_clock::now();
+        auto elapsed_since_start = [&]() {
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+        };
+
+        std::cerr << "copy_target_start"
+                  << " lanes=" << lanes
+                  << " base_port=" << base_port
+                  << " queue_depth=" << lane_queue_depth
+                  << " pool_slots=" << receiver_pool_slots
+                  << " integrated_folder_ready=1"
+                  << std::endl;
+        for (auto& lane : target_lanes) {
+            lane->receiver->start();
+        }
+        std::cerr << "copy_target_receivers_started"
+                  << " elapsed_s=" << elapsed_since_start()
+                  << std::endl;
+        medium_writer.start();
+        large_writer.start();
+
+        std::vector<std::thread> classifiers;
+        classifiers.reserve(lanes);
+        for (std::size_t lane_index = 0; lane_index < lanes; ++lane_index) {
+            classifiers.emplace_back([&, lane_index]() {
+                TargetWriterBackend::Options folder_options;
+                folder_options.preserve_metadata = false;
+                folder_options.fsync_on_finish = false;
+                folder_options.ensure_parent_directories = false;
+                folder_options.max_concurrent_file_transactions =
+                    std::max<std::size_t>(1U, base_writer_config.max_concurrent_file_transactions);
+                auto folder_backend = make_target_writer_backend(target_root, lane_index, folder_options);
+                BufferHandle handle;
+                try {
+                    while (!classifier_failed.load(std::memory_order_acquire) &&
+                           target_lanes[lane_index]->queue.pop_wait(handle)) {
+                        bool transferred = false;
+                        try {
+                            ensure_buffer_directories(*folder_backend, handle);
+                            const DataBuffer& buffer = data_buffer(data_pool, handle);
+                            if (is_packed_small_file_buffer(buffer)) {
+                                write_small_buffer(handle);
+                            } else {
+                                const std::uint64_t file_size = buffer.trailer.file_size;
+                                const std::uint64_t key = buffer.trailer.file_id != 0U
+                                                              ? buffer.trailer.file_id
+                                                              : hash64(buffer.trailer.rel_path.view());
+                                if (file_size < 1024U * 1024U) {
+                                    transferred = push_sharded(medium_queue,
+                                                               static_cast<std::size_t>(key % medium_threads),
+                                                               handle);
+                                } else {
+                                    transferred = push_sharded(large_queue,
+                                                               static_cast<std::size_t>(key % large_threads),
+                                                               handle);
+                                }
+                            }
+                            if (!transferred) {
+                                data_pool.release(handle);
+                            }
+                        } catch (...) {
+                            if (!transferred) {
+                                data_pool.release(handle);
+                            }
+                            throw;
+                        }
+                    }
+                } catch (...) {
+                    remember_classifier_error(std::current_exception());
+                }
+            });
+        }
+        std::cerr << "copy_target_writers_started"
+                  << " elapsed_s=" << elapsed_since_start()
+                  << std::endl;
+
+        for (auto& lane : target_lanes) {
+            lane->receiver->wait();
+        }
+        std::cerr << "copy_target_receivers_done"
+                  << " elapsed_s=" << elapsed_since_start()
+                  << std::endl;
+        for (auto& classifier : classifiers) {
+            classifier.join();
+        }
+        medium_queue.close();
+        large_queue.close();
+        std::cerr << "copy_target_classifiers_done"
+                  << " elapsed_s=" << elapsed_since_start()
+                  << std::endl;
+        if (classifier_error) {
+            medium_writer.stop();
+            large_writer.stop();
+            std::rethrow_exception(classifier_error);
+        }
+        medium_writer.wait();
+        large_writer.wait();
+        std::cerr << "copy_target_writers_done"
+                  << " elapsed_s=" << elapsed_since_start()
+                  << std::endl;
+
+        const TargetWriterStats small_snapshot = small_stats.snapshot();
+        const TargetWriterStats medium_snapshot = medium_writer.stats();
+        const TargetWriterStats large_snapshot = large_writer.stats();
+        TransferReport report;
+        for (const auto& lane : target_lanes) {
+            const BufferTransportStats rx = lane->receiver->stats();
+            report.chunks_sent += rx.buffers;
+        }
+        report.bytes_transferred =
+            small_snapshot.bytes_written + medium_snapshot.bytes_written + large_snapshot.bytes_written;
+        report.files_transferred =
+            small_snapshot.files_written + medium_snapshot.files_written + large_snapshot.files_written;
+        report.files_failed =
+            small_snapshot.files_failed + medium_snapshot.files_failed + large_snapshot.files_failed;
+        report.files_total = report.files_transferred + report.files_failed;
+        report.elapsed_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+        report.bytes_per_second =
+            report.elapsed_seconds > 0.0 ? static_cast<double>(report.bytes_transferred) / report.elapsed_seconds
+                                         : 0.0;
+        report.pipeline_description =
+            "[BufferReceiver-1 x" + std::to_string(lanes) +
+            "]->(RecvDataBufQueue-" + std::to_string(lane_queue_depth) +
+            " x" + std::to_string(lanes) + ")->[ReadyClassifier-NFS-1 x" +
+            std::to_string(lanes) + "]->(SmallReadyDirect)->[DataWriter-NFS/reactors=" +
+            std::to_string(base_writer_config.reactor_count) + " window=" +
+            std::to_string(base_writer_config.max_concurrent_file_transactions) +
+            "]+(MediumReadyBufQueue-" + std::to_string(lane_queue_depth) + " x" +
+            std::to_string(medium_threads) + ")->[DataWriter-NFS-" +
+            std::to_string(medium_threads) + "]+(LargeReadyBufQueue-" +
+            std::to_string(lane_queue_depth) + " x" + std::to_string(large_threads) +
+            ")->[DataWriter-NFS-" + std::to_string(large_threads) + "]";
+        (void)folders_created;
+        return report;
+    }
 
     struct CopyTargetLane {
         RawBufferPool pool;
