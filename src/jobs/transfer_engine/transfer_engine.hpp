@@ -600,6 +600,7 @@ public:
         std::uint16_t base_port = 39000,
         const std::filesystem::path& socket_dir = {},
         bool shared_input_queue = false,
+        bool shared_nothing = false,
         const std::string& remote_role = "local",
         const std::string& tcp_host = "127.0.0.1") const;
     [[nodiscard]] FakeRemoteDiffBenchmarkReport benchmark_fake_remote_diff_pipeline(

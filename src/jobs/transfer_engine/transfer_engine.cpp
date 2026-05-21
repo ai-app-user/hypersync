@@ -41,6 +41,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -14764,6 +14765,144 @@ MetadataWriterBenchmarkReport TransferEngine::benchmark_metadata_writer(
     return report;
 }
 
+namespace {
+
+constexpr std::uint64_t kSharedNothingBufferFrameMagic = 0x5753594e43425546ULL;  // WSYNCBUF
+constexpr std::uint32_t kSharedNothingBufferFrameVersion = 1;
+
+void shared_nothing_write_u16_be(std::array<std::byte, 32>& out,
+                                 std::size_t offset,
+                                 std::uint16_t value) noexcept {
+    out[offset] = static_cast<std::byte>((value >> 8U) & 0xFFU);
+    out[offset + 1U] = static_cast<std::byte>(value & 0xFFU);
+}
+
+void shared_nothing_write_u32_be(std::array<std::byte, 32>& out,
+                                 std::size_t offset,
+                                 std::uint32_t value) noexcept {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        out[offset++] = static_cast<std::byte>((value >> static_cast<unsigned>(shift)) & 0xFFU);
+    }
+}
+
+void shared_nothing_write_u64_be(std::array<std::byte, 32>& out,
+                                 std::size_t offset,
+                                 std::uint64_t value) noexcept {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out[offset++] = static_cast<std::byte>((value >> static_cast<unsigned>(shift)) & 0xFFU);
+    }
+}
+
+std::uint32_t shared_nothing_read_u32_be(const std::array<std::byte, 32>& in,
+                                         std::size_t offset) noexcept {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(in.data() + offset);
+    return (static_cast<std::uint32_t>(bytes[0]) << 24U) |
+           (static_cast<std::uint32_t>(bytes[1]) << 16U) |
+           (static_cast<std::uint32_t>(bytes[2]) << 8U) |
+           static_cast<std::uint32_t>(bytes[3]);
+}
+
+std::uint64_t shared_nothing_read_u64_be(const std::array<std::byte, 32>& in,
+                                         std::size_t offset) noexcept {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(in.data() + offset);
+    std::uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+        value = (value << 8U) | static_cast<std::uint64_t>(bytes[index]);
+    }
+    return value;
+}
+
+std::array<std::byte, 32> make_shared_nothing_header(std::size_t payload_bytes) {
+    if (payload_bytes > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("shared-nothing transport payload too large");
+    }
+    std::array<std::byte, 32> header {};
+    shared_nothing_write_u64_be(header, 0, kSharedNothingBufferFrameMagic);
+    shared_nothing_write_u32_be(header, 8, kSharedNothingBufferFrameVersion);
+    shared_nothing_write_u16_be(header, 12, kDataBufferPoolId);
+    shared_nothing_write_u32_be(header, 16, static_cast<std::uint32_t>(payload_bytes));
+    return header;
+}
+
+std::uint32_t parse_shared_nothing_header(const std::array<std::byte, 32>& header) {
+    if (shared_nothing_read_u64_be(header, 0) != kSharedNothingBufferFrameMagic) {
+        throw std::runtime_error("invalid shared-nothing buffer frame magic");
+    }
+    if (shared_nothing_read_u32_be(header, 8) != kSharedNothingBufferFrameVersion) {
+        throw std::runtime_error("unsupported shared-nothing buffer frame version");
+    }
+    return shared_nothing_read_u32_be(header, 16);
+}
+
+void write_shared_nothing_frame(int fd,
+                                const std::array<std::byte, 32>& header,
+                                const std::byte* payload,
+                                std::size_t payload_bytes) {
+    std::array<iovec, 2> iov {{
+        {const_cast<std::byte*>(header.data()), header.size()},
+        {const_cast<std::byte*>(payload), payload_bytes},
+    }};
+    int iov_count = payload_bytes == 0U ? 1 : 2;
+    while (iov_count > 0) {
+        const ssize_t written = ::writev(fd, iov.data(), iov_count);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::system_error(errno, std::generic_category(), "shared-nothing writev failed");
+        }
+        if (written == 0) {
+            throw std::runtime_error("shared-nothing writev wrote zero bytes");
+        }
+        std::size_t remaining = static_cast<std::size_t>(written);
+        while (iov_count > 0 && remaining >= iov.front().iov_len) {
+            remaining -= iov.front().iov_len;
+            iov[0] = iov[1];
+            --iov_count;
+        }
+        if (iov_count > 0 && remaining != 0U) {
+            iov.front().iov_base = static_cast<std::byte*>(iov.front().iov_base) + remaining;
+            iov.front().iov_len -= remaining;
+        }
+    }
+}
+
+void fill_shared_nothing_payload(std::vector<std::byte>& payload,
+                                 BufferGeneratorPattern pattern,
+                                 std::uint64_t seed) {
+    if (pattern == BufferGeneratorPattern::zero) {
+        std::memset(payload.data(), 0, payload.size());
+        return;
+    }
+    std::uint64_t state = seed == 0U ? 0x9e3779b97f4a7c15ULL : seed;
+    for (std::size_t offset = 0; offset < payload.size(); ++offset) {
+        state ^= state >> 12U;
+        state ^= state << 25U;
+        state ^= state >> 27U;
+        const std::uint64_t value = state * 0x2545F4914F6CDD1DULL;
+        const unsigned char byte =
+            pattern == BufferGeneratorPattern::fast_text
+                ? static_cast<unsigned char>('A' + (value % 26U))
+                : static_cast<unsigned char>(value & 0xFFU);
+        payload[offset] = static_cast<std::byte>(byte);
+    }
+}
+
+ScopedFd accept_shared_nothing_tcp(int listen_fd) {
+    for (;;) {
+        try {
+            return accept_tcp(listen_fd);
+        } catch (const std::system_error& error) {
+            if (error.code().value() == EINTR || error.code().value() == ECONNABORTED) {
+                continue;
+            }
+            throw;
+        }
+    }
+}
+
+}  // namespace
+
 BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
     std::size_t transports,
     std::uint64_t buffers_per_transport,
@@ -14778,6 +14917,7 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
     std::uint16_t base_port,
     const std::filesystem::path& socket_dir,
     bool shared_input_queue,
+    bool shared_nothing,
     const std::string& remote_role,
     const std::string& tcp_host) const {
     if (transports == 0U ||
@@ -14812,6 +14952,147 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
             : socket_dir;
     if (transport_kind == "unix") {
         std::filesystem::create_directories(effective_socket_dir);
+    }
+
+    if (shared_nothing) {
+        if (transport_kind != "tcp" || (remote_role != "sender" && remote_role != "receiver")) {
+            throw std::invalid_argument("shared-nothing transport benchmark requires --transport tcp and --role sender|receiver");
+        }
+
+        std::atomic<std::uint64_t> buffers_processed {0};
+        std::atomic<std::uint64_t> payload_bytes_processed {0};
+        std::atomic<std::uint64_t> first_receive_ns {0};
+        std::atomic<std::uint64_t> last_receive_ns {0};
+        std::exception_ptr worker_error;
+        std::mutex worker_error_mutex;
+        auto capture_worker_error = [&]() {
+            std::lock_guard<std::mutex> lock(worker_error_mutex);
+            if (!worker_error) {
+                worker_error = std::current_exception();
+            }
+        };
+
+        const auto started_at = std::chrono::steady_clock::now();
+        std::vector<std::thread> workers;
+        workers.reserve(transports);
+        std::vector<ScopedFd> listeners;
+
+        if (remote_role == "receiver") {
+            listeners.reserve(transports);
+            for (std::size_t index = 0; index < transports; ++index) {
+                listeners.push_back(listen_tcp(tcp_host,
+                                               static_cast<std::uint16_t>(base_port + index),
+                                               64));
+            }
+            for (std::size_t index = 0; index < transports; ++index) {
+                workers.emplace_back([&, index]() {
+                    try {
+                        ScopedFd fd = accept_shared_nothing_tcp(listeners[index].get());
+                        std::vector<std::byte> payload(buffer_size);
+                        for (;;) {
+                            std::array<std::byte, 32> header;
+                            if (!read_exact_or_eof(fd.get(), header.data(), header.size())) {
+                                break;
+                            }
+                            const std::uint32_t payload_bytes = parse_shared_nothing_header(header);
+                            if (payload_bytes > payload.size()) {
+                                throw std::runtime_error("shared-nothing frame exceeds receiver buffer size");
+                            }
+                            if (payload_bytes != 0U &&
+                                !read_exact_or_eof(fd.get(), payload.data(), payload_bytes)) {
+                                throw std::runtime_error("unexpected EOF while reading shared-nothing payload");
+                            }
+                            const auto frame_ns = static_cast<std::uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+                            std::uint64_t expected = 0;
+                            (void)first_receive_ns.compare_exchange_strong(expected,
+                                                                            frame_ns,
+                                                                            std::memory_order_relaxed,
+                                                                            std::memory_order_relaxed);
+                            last_receive_ns.store(frame_ns, std::memory_order_relaxed);
+                            buffers_processed.fetch_add(1U, std::memory_order_relaxed);
+                            payload_bytes_processed.fetch_add(payload_bytes, std::memory_order_relaxed);
+                        }
+                    } catch (...) {
+                        capture_worker_error();
+                    }
+                });
+            }
+        } else {
+            for (std::size_t index = 0; index < transports; ++index) {
+                workers.emplace_back([&, index]() {
+                    try {
+                        ScopedFd fd = connect_tcp(tcp_host,
+                                                  static_cast<std::uint16_t>(base_port + index),
+                                                  500,
+                                                  200);
+                        std::vector<std::byte> payload(buffer_size);
+                        fill_shared_nothing_payload(payload,
+                                                    generator_pattern,
+                                                    0x9e3779b97f4a7c15ULL ^ static_cast<std::uint64_t>(index));
+                        const std::array<std::byte, 32> header =
+                            make_shared_nothing_header(payload.size());
+                        for (std::uint64_t sequence = 0; sequence < buffers_per_transport; ++sequence) {
+                            write_shared_nothing_frame(fd.get(), header, payload.data(), payload.size());
+                            buffers_processed.fetch_add(1U, std::memory_order_relaxed);
+                            payload_bytes_processed.fetch_add(payload.size(), std::memory_order_relaxed);
+                        }
+                        ::shutdown(fd.get(), SHUT_WR);
+                    } catch (...) {
+                        capture_worker_error();
+                    }
+                });
+            }
+        }
+
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        if (worker_error) {
+            std::rethrow_exception(worker_error);
+        }
+        const auto ended_at = std::chrono::steady_clock::now();
+
+        BufferTransportBenchmarkReport report;
+        const std::uint64_t buffers = buffers_processed.load(std::memory_order_relaxed);
+        const std::uint64_t payload_bytes = payload_bytes_processed.load(std::memory_order_relaxed);
+        if (remote_role == "receiver") {
+            report.buffers_received = buffers;
+            report.buffers_discarded = buffers;
+            report.payload_bytes_received = payload_bytes;
+            report.receiver_threads = transports;
+            report.discarder_threads = 0;
+            report.transport_kind = "tcp-remote-receiver-shared-nothing";
+        } else {
+            report.buffers_generated = buffers;
+            report.buffers_sent = buffers;
+            report.payload_bytes_sent = payload_bytes;
+            report.generator_threads = transports;
+            report.sender_threads = transports;
+            report.transport_kind = "tcp-remote-sender-shared-nothing";
+        }
+        report.elapsed_seconds = std::chrono::duration<double>(ended_at - started_at).count();
+        if (remote_role == "receiver") {
+            const std::uint64_t first_ns = first_receive_ns.load(std::memory_order_relaxed);
+            const std::uint64_t last_ns = last_receive_ns.load(std::memory_order_relaxed);
+            if (first_ns != 0U && last_ns > first_ns) {
+                report.elapsed_seconds = static_cast<double>(last_ns - first_ns) / 1'000'000'000.0;
+            }
+        }
+        report.bytes_per_second = report.elapsed_seconds > 0.0
+                                      ? static_cast<double>(payload_bytes) / report.elapsed_seconds
+                                      : 0.0;
+        report.gigabytes_per_second = report.bytes_per_second / 1'000'000'000.0;
+        report.gibibytes_per_second = report.bytes_per_second / (1024.0 * 1024.0 * 1024.0);
+        report.gigabits_per_second = report.bytes_per_second * 8.0 / 1'000'000'000.0;
+        report.transports = transports;
+        report.buffer_size = buffer_size;
+        report.pool_slots_per_transport = 1U;
+        report.buffers_per_transport = buffers_per_transport;
+        report.pattern = to_string(generator_pattern);
+        return report;
     }
 
     if (remote_role == "receiver") {
