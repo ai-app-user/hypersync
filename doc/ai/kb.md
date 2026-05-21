@@ -2008,3 +2008,24 @@ logical size: 335.99 TB
   - The spillway code is correct as a guardrail, but in these runs spillways never activated. The prior assumption that large/medium shard saturation was stalling classifiers was not supported by telemetry.
   - Classifier/RX backpressure remains fixed (`RX_Q` stayed far below capacity).
   - The current limiter is now the target-side NFS write drain/tail, especially after queues have emptied into writer-owned work.
+
+## 2026-05-21 - Explicit NFS Unstable Writes and Async Commit Sweep
+
+- Hypersync `f743009` audited and changed target-side NFS write stability behavior:
+  - Small reactor writes now use raw `rpc_nfs_write_async`; they pass `UNSTABLE` unless stable small-file writes are explicitly enabled.
+  - Legacy medium/large target writer chunks now use raw `rpc_nfs_write_async(..., UNSTABLE)` instead of the higher-level `nfs_pwrite_async` wrapper.
+  - File finalization now batches `rpc_nfs_commit_async` calls for completed files and closes asynchronously after commit callbacks complete.
+  - Writer service loops use a 0ms service timeout while async writes/commits/closes are outstanding.
+  - Linux release build with libnfs succeeded for `hypersync f743009` + `piper 277032b`.
+  - Local unit-test execution was attempted but hung without a PASS stream and was terminated; no local unit-test pass was recorded for this patch.
+- Deterministic `copy-mix-v1` run:
+  - Source result: `50,100` files, `110.75 GB`, `105,768` buffers, `6.161s`, `143.82 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,768` buffers, `28.426s`, `31.17 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-unstable-commit-20260521T195229Z/target.out` on agnopo.
+  - Target lifecycle: receivers done `27.55s`, classifiers done `27.56s`, writers done `28.43s`.
+  - Queue highs: `RX_Q=16`, `SMALL_WR_Q=18`, `MED_SPILL=0`, `LRG_SPILL=0`, `MED_Q=0`, `LRG_Q=2073`, `CLASSIFIED=105768`.
+  - Pipeline: `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(SmallReadyFileQueue-16384 x16 parent-hash)->[DataWriter-NFS/reactors=64 window=64 batch=16]+(MediumReadyBufQueue-16384 x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-16384 x48)->[DataWriter-NFS-48 batch=8]`.
+- Conclusion:
+  - The explicit unstable-write and async-commit implementation is functionally valid for the deterministic dataset: all files were written and verified.
+  - The target writer tail did not collapse. Throughput stayed in the same band as the earlier `48`-large-writer run (`29.51 -> 31.17 Gbit/s`), and queues remained shallow.
+  - The remaining limiter is still inside the NFS writer/commit/close path or storage-side acknowledgement behavior, not target RX, classification, staging queues, or large/medium spillway pressure.
