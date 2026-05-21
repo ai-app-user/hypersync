@@ -1824,3 +1824,32 @@ logical size: 335.99 TB
   - Add honest source timing for lane preconnect and sender drain time.
   - Add target-side periodic progress so receiver, folder gate, and writer backlog are visible while the run is active.
   - Use a stable benchmark input for copy testing; `/HaWoR` with max-duration is too phase-dependent.
+
+## 2026-05-21 - Copy Target Folder-Ready Reactor Integration
+
+- Added Hypersync `dbd708e`: `copy-target` now switches to an integrated folder-ready target path for NFS targets when directory creation is enabled.
+  - New target pipeline shape:
+    `[BufferReceiver-1 x lanes]->(RecvDataBufQueue-D x lanes)->[ReadyClassifier-NFS-1 x lanes]->(SmallReadyDirect)->[DataWriter-NFS/reactors=R window=W]+(MediumReadyBufQueue-D x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-D x112)->[DataWriter-NFS-112]`.
+  - The fallback generic path remains for non-NFS targets or `--assume-target-directories`.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Established deterministic transfer1 benchmark dataset:
+  - Path: `/mnt/local-nvme/wsync-codex/datasets/copy-mix-v1`.
+  - Shape: `50,000` small files under `500` folders plus `100` x `1 GiB` large files.
+  - Total: `50,100` files, about `104 GiB`.
+- Functional smoke with integrated target path from `/HaWoR/video/path/0` succeeded:
+  - Source: `43,402` files, `1.17 GB`, `2.84s`.
+  - Target: `43,402` files verified, pipeline printed as integrated folder-ready target path, but target elapsed was `30.0s`; small-file-heavy directory/classifier behavior still needs tuning.
+- Deterministic `copy-mix-v1` integrated target run:
+  - Source: `50,100` files, `110.75 GB`, `4.55s`, `194.81 Gbit/s`.
+  - Target: `50,100` files verified, `50.52s`, `17.54 Gbit/s`.
+  - Receiver completion was `47.37s`; classifier completion `47.39s`; writers done `50.52s`. The target bottleneck is primarily receive/buffer ingestion and downstream backpressure, before final NFS write completion.
+- Bridge-only isolation using exact `null://` target and generic fallback path:
+  - `16` lanes: source `203.91 Gbit/s`, target receive/discard `37.75 Gbit/s`.
+  - Lane sweep with `copy-mix-v1` and `null://` target:
+    - `1` lane: target `18.34 Gbit/s`.
+    - `4` lanes: target `31.02 Gbit/s`.
+    - `8` lanes: target `45.59 Gbit/s`.
+    - `16` lanes: target `43.89 Gbit/s`.
+    - `32` lanes did not complete before target timeout in this sweep.
+    - `64` lanes stalled during connection/startup and was killed.
+  - Interpretation: target-side TCP receive/buffer ingestion currently tops out around `40-46 Gbit/s` on this deterministic payload. More lanes do not solve it and can regress/hang. The next optimization should focus on the buffer receiver transport path, queue handoff, and avoiding extra target-side copies/zeroing before further NFS writer tuning.
