@@ -16113,18 +16113,39 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     RawBufferPool data_pool = make_data_buffer_pool(pool_slots);
     BufferPoolRegistry registry;
     registry.register_pool(data_pool);
+    std::vector<ScopedFd> lane_fds(lanes);
+    std::vector<std::exception_ptr> lane_connect_errors(lanes);
+    std::vector<std::thread> lane_connectors;
+    lane_connectors.reserve(lanes);
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        lane_connectors.emplace_back([&, lane]() {
+            try {
+                lane_fds[lane] = connect_tcp(target_host, static_cast<std::uint16_t>(base_port + lane), 60, 250);
+            } catch (...) {
+                lane_connect_errors[lane] = std::current_exception();
+            }
+        });
+    }
+    for (std::thread& connector : lane_connectors) {
+        connector.join();
+    }
+    for (const auto& error : lane_connect_errors) {
+        if (error) {
+            std::rethrow_exception(error);
+        }
+    }
+
     std::vector<std::unique_ptr<BufQueue>> lane_queues;
     std::vector<std::unique_ptr<BufferStreamSenderJob>> senders;
     lane_queues.reserve(lanes);
     senders.reserve(lanes);
     for (std::size_t lane = 0; lane < lanes; ++lane) {
         lane_queues.push_back(std::make_unique<BufQueue>(lane_queue_depth));
-        ScopedFd fd = connect_tcp(target_host, static_cast<std::uint16_t>(base_port + lane), 60, 250);
         senders.push_back(std::make_unique<BufferStreamSenderJob>(
             1U,
             *lane_queues.back(),
             registry,
-            fd.release()));
+            lane_fds[lane].release()));
     }
 
     const auto file_provider = [&file_queue]() {
