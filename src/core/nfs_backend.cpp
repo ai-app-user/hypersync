@@ -6556,13 +6556,18 @@ TargetNfsMountPlan plan_target_nfs_mount(std::string_view root_url) {
         components.push_back(std::move(component));
     }
 
-    if (components.size() <= 3U || components[0] != "volumes") {
+    if (components.size() <= 2U || components[0] != "volumes") {
         return plan;
     }
 
-    std::string mount_path = "/" + components[0] + "/" + components[1] + "/" + components[2];
+    const bool has_share_component = components.size() > 3U && components[2] == "data";
+    const std::size_t mount_component_count = has_share_component ? 3U : 2U;
+    std::string mount_path = "/" + components[0] + "/" + components[1];
+    if (has_share_component) {
+        mount_path += "/" + components[2];
+    }
     std::string prefix_path;
-    for (std::size_t index = 3U; index < components.size(); ++index) {
+    for (std::size_t index = mount_component_count; index < components.size(); ++index) {
         if (!prefix_path.empty()) {
             prefix_path.push_back('/');
         }
