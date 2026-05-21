@@ -16114,16 +16114,17 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
     BufferPoolRegistry registry;
     registry.register_pool(data_pool);
     std::vector<std::unique_ptr<BufQueue>> lane_queues;
-    std::vector<std::unique_ptr<BufferSenderJob>> senders;
+    std::vector<std::unique_ptr<BufferStreamSenderJob>> senders;
     lane_queues.reserve(lanes);
     senders.reserve(lanes);
     for (std::size_t lane = 0; lane < lanes; ++lane) {
         lane_queues.push_back(std::make_unique<BufQueue>(lane_queue_depth));
-        senders.push_back(std::make_unique<BufferSenderJob>(
+        ScopedFd fd = connect_tcp(target_host, static_cast<std::uint16_t>(base_port + lane), 500, 10);
+        senders.push_back(std::make_unique<BufferStreamSenderJob>(
             1U,
             *lane_queues.back(),
             registry,
-            BufferTransportEndpoint::tcp(target_host, static_cast<std::uint16_t>(base_port + lane))));
+            fd.release()));
     }
 
     const auto file_provider = [&file_queue]() {
@@ -16322,7 +16323,7 @@ TransferReport TransferEngine::run_copy_source_pipeline(const std::filesystem::p
                                   "]->(FileQueue)->[DataReader-NFS-" +
                                   std::to_string(effective_data_threads) +
                                   "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
-                                  " x" + std::to_string(lanes) + ")->[BufferSender-1 x" +
+                                  " x" + std::to_string(lanes) + ")->[BufferStreamSender-1 x" +
                                   std::to_string(lanes) + "]";
     return report;
 }
