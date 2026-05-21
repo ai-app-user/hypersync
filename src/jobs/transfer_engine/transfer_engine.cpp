@@ -14777,7 +14777,9 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
     const std::string& transport_kind,
     std::uint16_t base_port,
     const std::filesystem::path& socket_dir,
-    bool shared_input_queue) const {
+    bool shared_input_queue,
+    const std::string& remote_role,
+    const std::string& tcp_host) const {
     if (transports == 0U ||
         buffers_per_transport == 0U ||
         buffer_size == 0U ||
@@ -14790,6 +14792,12 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
     }
     if (transport_kind != "none" && transport_kind != "unix" && transport_kind != "tcp") {
         throw std::invalid_argument("buffer transport benchmark transport must be none, unix, or tcp");
+    }
+    if (remote_role != "local" && remote_role != "sender" && remote_role != "receiver") {
+        throw std::invalid_argument("buffer transport benchmark role must be local, sender, or receiver");
+    }
+    if (remote_role != "local" && transport_kind != "tcp") {
+        throw std::invalid_argument("remote buffer transport benchmark roles require --transport tcp");
     }
     if (transport_kind == "tcp" &&
         static_cast<unsigned>(base_port) + transports - 1U > 65535U) {
@@ -14804,6 +14812,219 @@ BufferTransportBenchmarkReport TransferEngine::benchmark_buffer_transport(
             : socket_dir;
     if (transport_kind == "unix") {
         std::filesystem::create_directories(effective_socket_dir);
+    }
+
+    if (remote_role == "receiver") {
+        std::vector<std::unique_ptr<RawBufferPool>> receive_pools;
+        std::vector<std::unique_ptr<BufferPoolRegistry>> receive_registries;
+        std::vector<std::unique_ptr<BufQueue>> receiver_outputs;
+        std::vector<std::unique_ptr<BufferReceiverJob>> receivers;
+        std::vector<std::unique_ptr<BufferDiscarderJob>> discarders;
+        receive_pools.reserve(transports);
+        receive_registries.reserve(transports);
+        receiver_outputs.reserve(transports);
+        receivers.reserve(transports);
+        discarders.reserve(transports);
+
+        for (std::size_t index = 0; index < transports; ++index) {
+            BufferTransportEndpoint endpoint =
+                BufferTransportEndpoint::tcp(tcp_host, static_cast<std::uint16_t>(base_port + index));
+            receive_pools.push_back(std::make_unique<RawBufferPool>(kDataBufferPoolId,
+                                                                     pool_slots_per_transport,
+                                                                     buffer_size));
+            receive_registries.push_back(std::make_unique<BufferPoolRegistry>());
+            receive_registries.back()->register_pool(*receive_pools.back());
+            receiver_outputs.push_back(std::make_unique<BufQueue>(std::max<std::size_t>(1U, pool_slots_per_transport)));
+            receivers.push_back(std::make_unique<BufferReceiverJob>(receiver_threads,
+                                                                    *receive_pools.back(),
+                                                                    *receiver_outputs.back(),
+                                                                    endpoint));
+            discarders.push_back(std::make_unique<BufferDiscarderJob>(BufferDiscarderConfig(discarder_threads),
+                                                                      *receiver_outputs.back(),
+                                                                      *receive_registries.back()));
+        }
+
+        const auto started_at = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < transports; ++index) {
+            receivers[index]->start();
+            discarders[index]->start();
+        }
+        for (auto& receiver : receivers) {
+            receiver->wait();
+        }
+        for (auto& discarder : discarders) {
+            discarder->wait();
+        }
+        const auto ended_at = std::chrono::steady_clock::now();
+
+        BufferTransportBenchmarkReport report;
+        for (std::size_t index = 0; index < transports; ++index) {
+            const auto receiver_stats = receivers[index]->stats();
+            const auto discarder_stats = discarders[index]->stats();
+            report.buffers_received += receiver_stats.buffers;
+            report.buffers_discarded += discarder_stats.buffers_discarded;
+            report.payload_bytes_received += receiver_stats.payload_bytes;
+        }
+        report.elapsed_seconds = std::chrono::duration<double>(ended_at - started_at).count();
+        report.bytes_per_second = report.elapsed_seconds > 0.0
+                                      ? static_cast<double>(report.payload_bytes_received) / report.elapsed_seconds
+                                      : 0.0;
+        report.gigabytes_per_second = report.bytes_per_second / 1'000'000'000.0;
+        report.gibibytes_per_second = report.bytes_per_second / (1024.0 * 1024.0 * 1024.0);
+        report.gigabits_per_second = report.bytes_per_second * 8.0 / 1'000'000'000.0;
+        report.transports = transports;
+        report.generator_threads = 0;
+        report.sender_threads = 0;
+        report.receiver_threads = receiver_threads;
+        report.discarder_threads = discarder_threads;
+        report.buffer_size = buffer_size;
+        report.pool_slots_per_transport = pool_slots_per_transport;
+        report.buffers_per_transport = buffers_per_transport;
+        report.pattern = to_string(generator_pattern);
+        report.transport_kind = "tcp-remote-receiver";
+        return report;
+    }
+
+    if (remote_role == "sender") {
+        if (shared_input_queue) {
+            const std::size_t total_pool_slots = pool_slots_per_transport * transports;
+            const std::uint64_t total_buffers = buffers_per_transport * transports;
+            RawBufferPool send_pool(kDataBufferPoolId, total_pool_slots, buffer_size);
+            BufferPoolRegistry send_registry;
+            send_registry.register_pool(send_pool);
+            BufQueue sender_input(std::max<std::size_t>(1U, total_pool_slots));
+            BufferGeneratorJob generator(BufferGeneratorConfig(generator_threads,
+                                                               total_buffers,
+                                                               generator_pattern,
+                                                               0x9e3779b97f4a7c15ULL,
+                                                               1.0),
+                                         send_pool,
+                                         sender_input);
+
+            std::vector<std::unique_ptr<BufferSenderJob>> senders;
+            senders.reserve(transports);
+            for (std::size_t index = 0; index < transports; ++index) {
+                senders.push_back(std::make_unique<BufferSenderJob>(
+                    sender_threads,
+                    sender_input,
+                    send_registry,
+                    BufferTransportEndpoint::tcp(tcp_host, static_cast<std::uint16_t>(base_port + index))));
+            }
+
+            const auto started_at = std::chrono::steady_clock::now();
+            for (auto& sender : senders) {
+                sender->start();
+            }
+            generator.start();
+            generator.wait();
+            for (auto& sender : senders) {
+                sender->wait();
+            }
+            const auto ended_at = std::chrono::steady_clock::now();
+
+            BufferTransportBenchmarkReport report;
+            const auto generator_stats = generator.stats();
+            report.buffers_generated = generator_stats.buffers_generated;
+            report.payload_bytes_sent = generator_stats.bytes_generated;
+            for (const auto& sender : senders) {
+                const auto sender_stats = sender->stats();
+                report.buffers_sent += sender_stats.buffers;
+            }
+            report.elapsed_seconds = std::chrono::duration<double>(ended_at - started_at).count();
+            report.bytes_per_second = report.elapsed_seconds > 0.0
+                                          ? static_cast<double>(report.payload_bytes_sent) / report.elapsed_seconds
+                                          : 0.0;
+            report.gigabytes_per_second = report.bytes_per_second / 1'000'000'000.0;
+            report.gibibytes_per_second = report.bytes_per_second / (1024.0 * 1024.0 * 1024.0);
+            report.gigabits_per_second = report.bytes_per_second * 8.0 / 1'000'000'000.0;
+            report.transports = transports;
+            report.generator_threads = generator_threads;
+            report.sender_threads = sender_threads;
+            report.receiver_threads = 0;
+            report.discarder_threads = 0;
+            report.buffer_size = buffer_size;
+            report.pool_slots_per_transport = pool_slots_per_transport;
+            report.buffers_per_transport = buffers_per_transport;
+            report.pattern = to_string(generator_pattern);
+            report.transport_kind = "tcp-remote-sender-shared";
+            return report;
+        }
+
+        struct SendLane {
+            RawBufferPool pool;
+            BufferPoolRegistry registry;
+            BufQueue queue;
+            std::unique_ptr<BufferSenderJob> sender;
+            std::unique_ptr<BufferGeneratorJob> generator;
+
+            SendLane(std::size_t pool_slots, std::size_t bytes_per_buffer)
+                : pool(kDataBufferPoolId, pool_slots, bytes_per_buffer),
+                  queue(pool_slots) {
+                registry.register_pool(pool);
+            }
+        };
+
+        std::vector<std::unique_ptr<SendLane>> lanes;
+        lanes.reserve(transports);
+        for (std::size_t index = 0; index < transports; ++index) {
+            auto lane = std::make_unique<SendLane>(pool_slots_per_transport, buffer_size);
+            lane->sender = std::make_unique<BufferSenderJob>(
+                sender_threads,
+                lane->queue,
+                lane->registry,
+                BufferTransportEndpoint::tcp(tcp_host, static_cast<std::uint16_t>(base_port + index)));
+            lane->generator = std::make_unique<BufferGeneratorJob>(
+                BufferGeneratorConfig(generator_threads,
+                                      buffers_per_transport,
+                                      generator_pattern,
+                                      0x9e3779b97f4a7c15ULL ^ static_cast<std::uint64_t>(index),
+                                      1.0),
+                lane->pool,
+                lane->queue);
+            lanes.push_back(std::move(lane));
+        }
+
+        const auto started_at = std::chrono::steady_clock::now();
+        for (auto& lane : lanes) {
+            lane->sender->start();
+        }
+        for (auto& lane : lanes) {
+            lane->generator->start();
+        }
+        for (auto& lane : lanes) {
+            lane->generator->wait();
+        }
+        for (auto& lane : lanes) {
+            lane->sender->wait();
+        }
+        const auto ended_at = std::chrono::steady_clock::now();
+
+        BufferTransportBenchmarkReport report;
+        for (const auto& lane : lanes) {
+            const auto generator_stats = lane->generator->stats();
+            const auto sender_stats = lane->sender->stats();
+            report.buffers_generated += generator_stats.buffers_generated;
+            report.payload_bytes_sent += generator_stats.bytes_generated;
+            report.buffers_sent += sender_stats.buffers;
+        }
+        report.elapsed_seconds = std::chrono::duration<double>(ended_at - started_at).count();
+        report.bytes_per_second = report.elapsed_seconds > 0.0
+                                      ? static_cast<double>(report.payload_bytes_sent) / report.elapsed_seconds
+                                      : 0.0;
+        report.gigabytes_per_second = report.bytes_per_second / 1'000'000'000.0;
+        report.gibibytes_per_second = report.bytes_per_second / (1024.0 * 1024.0 * 1024.0);
+        report.gigabits_per_second = report.bytes_per_second * 8.0 / 1'000'000'000.0;
+        report.transports = transports;
+        report.generator_threads = generator_threads;
+        report.sender_threads = sender_threads;
+        report.receiver_threads = 0;
+        report.discarder_threads = 0;
+        report.buffer_size = buffer_size;
+        report.pool_slots_per_transport = pool_slots_per_transport;
+        report.buffers_per_transport = buffers_per_transport;
+        report.pattern = to_string(generator_pattern);
+        report.transport_kind = "tcp-remote-sender";
+        return report;
     }
 
     if (transport_kind == "none") {

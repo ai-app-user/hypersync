@@ -1530,7 +1530,7 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] benchmark-synthetic-replay --profile <profile.txt> [--max-files <n>] [--file-count-scale <n>] [--data-size-scale <n>] [--latency-emulation] [--with-payload] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-nfs-profile --source <nfs-url> [--max-records <n>] [--phase-count <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--readdirplus-page-bytes <n>] [--small-file-threshold-bytes <n>] [--profile-data-reads] [--data-sample-rate <n>] [--data-sample-max-files-per-phase <n>] [--data-sample-max-bytes-per-phase <n>] [--data-sample-large-read-bytes <n>] [--data-sample-outstanding-requests <n>] [--stats-interval-seconds <n>] [--output <profile.txt>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-hash [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--threads <n>] [--block-size <bytes>] [--duration-seconds <n>] [--min-gigabits-per-core <n>]\n"
-        << "  hypersync [--config <config.yaml>] benchmark-transport [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
+        << "  hypersync [--config <config.yaml>] benchmark-transport [--role local|sender|receiver] [--host <host>] [--bind-host <host>] [--transports <n>] [--buffers-per-transport <n>] [--buffer-size <bytes>] [--pool-slots <n>] [--generator-threads <n>] [--sender-threads <n>] [--receiver-threads <n>] [--discarder-threads <n>] [--pattern zero|fast_text|xoshiro256] [--transport none|unix|tcp] [--shared-input] [--base-port <port>] [--socket-dir <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-fake-diff [--file-count <n>] [--folder-count <n>] [--average-file-size <bytes>] [--source-threads <n>] [--fake-remote-threads <n>] [--checker-threads <n>] [--remote-delay-us <n>] [--request-queue-depth <n>] [--batch-queue-depth <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-metadata-writer --output <records.parquet|dataset-dir|csv|txt> [--output-format text|csv|parquet] [--file-count <n>] [--folder-count <n>] [--batch-size <n>] [--average-file-size <bytes>] [--duckdb-memory-limit <value>] [--duckdb-threads <n>] [--duckdb-checkpoint-threshold <value>] [--parquet-compression zstd|snappy|uncompressed] [--partitions <n>] [--partition-mode threads|processes|transport-processes|generate-discard|generate-hash-discard|pack-discard|folder-pack-discard|transport-discard]\n"
         << "  hypersync [--config <config.yaml>] hash --source <dir|nfs-url> --output <records.csv|txt|parquet> [--output-format text|csv|parquet] [--records all|files|folders] [--hash md5|sha256|xxh64|xxh3_64|xxh3_128] [--hash-mode file|blocks] [--hash-block-size <bytes>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--hash-threads <n>] [--max-files-queued <n>] [--max-hash-chunks-queued <n>] [--max-duration-seconds <n>]\n"
@@ -2723,6 +2723,8 @@ int main(int argc, char** argv) {
             std::size_t discarder_threads = 1;
             std::string pattern = "xoshiro256";
             std::string transport_kind = "unix";
+            std::string transport_role = "local";
+            std::string transport_host = "127.0.0.1";
             std::uint16_t base_port = 39000;
             std::filesystem::path socket_dir;
             bool shared_input_queue = false;
@@ -2753,6 +2755,19 @@ int main(int argc, char** argv) {
                     pattern = require_option(args, i, "--pattern");
                 } else if (args[i] == "--transport") {
                     transport_kind = require_option(args, i, "--transport");
+                } else if (args[i] == "--role" || args[i] == "--transport-role") {
+                    transport_role = require_option(args, i, args[i]);
+                    if (transport_role != "local" && transport_role != "sender" && transport_role != "receiver") {
+                        throw std::runtime_error("--role must be local, sender, or receiver");
+                    }
+                    if (transport_role != "local" && transport_kind == "unix") {
+                        transport_kind = "tcp";
+                    }
+                } else if (args[i] == "--host" ||
+                           args[i] == "--connect-host" ||
+                           args[i] == "--bind-host" ||
+                           args[i] == "--listen-host") {
+                    transport_host = require_option(args, i, args[i]);
                 } else if (args[i] == "--shared-input" || args[i] == "--shared-input-queue") {
                     shared_input_queue = true;
                 } else if (args[i] == "--base-port") {
@@ -2776,7 +2791,9 @@ int main(int argc, char** argv) {
                                                                    transport_kind,
                                                                    base_port,
                                                                    socket_dir,
-                                                                   shared_input_queue);
+                                                                   shared_input_queue,
+                                                                   transport_role,
+                                                                   transport_host);
             std::cout << "buffer_transport_benchmark"
                       << " transport=" << report.transport_kind
                       << " pattern=" << report.pattern
