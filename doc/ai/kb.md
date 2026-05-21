@@ -1853,3 +1853,20 @@ logical size: 335.99 TB
     - `32` lanes did not complete before target timeout in this sweep.
     - `64` lanes stalled during connection/startup and was killed.
   - Interpretation: target-side TCP receive/buffer ingestion currently tops out around `40-46 Gbit/s` on this deterministic payload. More lanes do not solve it and can regress/hang. The next optimization should focus on the buffer receiver transport path, queue handoff, and avoiding extra target-side copies/zeroing before further NFS writer tuning.
+
+## 2026-05-21 - Target Ingestion No-Zero Transport Optimization
+
+- Piper `0023377` optimized the target-side transport receive path:
+  - Removed receiver-side tail `memset` for short frames in both `BufferReceiverJob` and `BufferStreamReceiverJob`.
+  - Changed `RawBufferPool` storage from zero-initialized `std::vector<std::byte>` to aligned uninitialized raw storage while keeping the same fixed-size reusable pool lifecycle.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Deterministic bridge-only `copy-mix-v1` null-target results after the change:
+  - `4` lanes: target `49.60 Gbit/s` (previously `31.02 Gbit/s`).
+  - `8` lanes: target `72.18 Gbit/s` (previously `45.59 Gbit/s`).
+  - `16` lanes: target `68.62 Gbit/s` (previously `43.89 Gbit/s`).
+  - Current bridge sweet spot is `8` lanes for this payload. Removing zeroing produced a real ingestion improvement, but the bridge still falls short of the source side.
+- Integrated NFS target retest with the current bridge sweet spot (`8` lanes):
+  - Source: `50,100` files, `110.75 GB`, `5.32s`, `166.68 Gbit/s`.
+  - Target integrated folder-ready pipeline: `50,100` files verified, `48.77s`, `18.17 Gbit/s`.
+  - Target phase timing: receivers done `46.01s`, classifiers done `46.02s`, writers done `48.77s`.
+  - Interpretation: the no-zero receiver fix improves bridge-only ingestion substantially, but the NFS integrated path is now backpressured by downstream folder/classifier/small-write behavior. Next target-side work should add live queue/backlog stats around receiver queues, classifier direct small writes, medium/large writer queues, and decouple receiver draining from folder/classifier writes more aggressively.
