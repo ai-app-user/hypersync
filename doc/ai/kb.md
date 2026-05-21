@@ -1776,3 +1776,27 @@ logical size: 335.99 TB
 - Current blocker for a true transfer1-to-target performance copy run is host reachability, not the queue bridge code:
   - nopo `160.211.77.39`: SSH timed out during retest.
   - agnopo `160.211.81.199`: SSH works from local, but transfer1-to-agnopo data ports do not complete TCP handshake.
+
+## 2026-05-20 - Async Copy to Agnopo After Firewall
+
+- Firewall was opened for transfer1 -> agnopo data ports.
+- Found two follow-up issues and fixed them:
+  - `copy-source` preflight connect was too aggressive after bounded TCP connect landed; changed lane preconnect from `500 x 10ms` to `60 x 250ms` in Hypersync `a51ea3d`.
+  - Agnopo target export shape is `/volumes/<uuid>`, while nopo export shape was `/volumes/<uuid>/data`; updated NFS target mount-prefix planning in Hypersync `a1e94ea` so both shapes work.
+- Local verification after both fixes: `make -j8 unit-test` passed (`74/74`).
+- Deployed package `hypersync-copy-a1e94ea` to agnopo through the artifact path, not source copy.
+- 4-lane smoke from transfer1 to agnopo succeeded:
+  - Source pipeline: `[MetaReader-NFS-16]->(FileQueue)->[DataReader-NFS-32]->(DataBufQueue-256 x4)->[BufferStreamSender-1 x4]`.
+  - Target pipeline: `[BufferReceiver-1 x4]->(DataBufQueue-256 x4)->[DataWriter-NFS-1 x4]`.
+  - Source: `files_found=506`, `files_read=505`, `failed=0`, `bytes=9335989`, `buffers_sent=39`, `elapsed_s=0.953005`, `0.078 Gbit/s`.
+  - Target: `files_written=505`, `failed=0`, `bytes=9335989`, `buffers_received=39`, `elapsed_s=10.0453`; verified `505` target files.
+- 16-lane bounded larger copy from source `/HaWoR/video/path/0` to agnopo succeeded:
+  - Source pipeline: `[MetaReader-NFS-96]->(FileQueue)->[DataReader-NFS-96]->(DataBufQueue-1024 x16)->[BufferStreamSender-1 x16]`.
+  - Target pipeline: `[BufferReceiver-1 x16]->(DataBufQueue-1024 x16)->[DataWriter-NFS-1 x16]`.
+  - Source: `files_found=46239`, `files_read=43435`, `failed=0`, `bytes=1471031377`, `buffers_sent=1661`, `elapsed_s=1.29649`, `9.08 Gbit/s`.
+  - Target: `files_written=43435`, `failed=0`, `bytes=1471031377`, `buffers_received=1661`, `elapsed_s=32.8532`, `0.358 Gbit/s`; verified `43435` target files.
+  - This subtree finished too quickly to be a multi-minute bandwidth test and is mostly a small-file / directory-heavy workload.
+- Interpretation:
+  - The TCP queue bridge is functional now.
+  - Source NFS read and transfer-side send are no longer blocked by firewall.
+  - Current copy bottleneck is target-side NFS write/create behavior in this generic copy-target shape, especially with inline parent-directory creation. Next performance work should route folder creation through the dedicated folder-ready job path and/or precreate target folders, then reuse the high-performance small-file reactor writer configuration instead of this minimal `DataWriter-NFS-1 x lanes` target shape.
