@@ -1928,3 +1928,28 @@ logical size: 335.99 TB
   - The RX queue pins at exactly one lane worth of capacity (`4096`) while classifiers are busy, proving TCP ingest is still backpressured by classifier-side work.
   - `SMALL_WR_Q=[1/4096]` means the current "small direct" path is not a real queue feeding all 64 reactors; it is synchronous classifier-to-backend execution with only one active call visible at a time per sampled instant.
   - Next architectural fix should introduce a true `SmallReadyFileQueue` / direct-submit queue between `ReadyClassifier` and `DataWriter-NFS/reactors=64`, so classifiers only classify and enqueue, while reactors consume independently.
+
+## 2026-05-21 - Copy Target Small Queue Decoupling
+
+- Hypersync `c2b0730` changed integrated NFS `copy-target` from synchronous `SmallReadyDirect` to an explicit small-file staging queue:
+  - New pipeline shape:
+    `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(SmallReadyFileQueue-16384 x16)->[DataWriter-NFS/reactors=64 window=64]+(MediumReadyBufQueue-4096 x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-4096 x112)->[DataWriter-NFS-112]`.
+  - Total small queue capacity is `262,144` handles (`16` shards x `16,384` each).
+  - Classifier threads now enqueue packed-small-file buffers and immediately return to RX draining instead of synchronously calling the NFS small writer.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Deployed package by artifact only:
+  - Transfer1 build artifact: `/mnt/local-nvme/wsync-codex/copy-perf-20260520T054528Z/hypersync-copy-c2b0730-piper-dc0f794.tar.gz`.
+  - agnopo unpacked path: `/tmp/wsync-codex/hypersync-copy-c2b0730-piper-dc0f794`.
+- Deterministic `copy-mix-v1` small-queue run:
+  - Source result: `50,100` files, `110.75 GB`, `105,805` buffers, `5.609s`, `157.96 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,805` buffers, `28.825s`, `30.74 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-smallqueue-20260521T1840Z/target.out` on agnopo.
+  - Target lifecycle: receivers done `26.45s`, classifiers done `26.46s`, writers done `28.83s`.
+- Telemetry comparison:
+  - Before small queue: `RX_Q` pinned at `4096`, classifiers finished at `46.12s`, target throughput `18.22 Gbit/s`.
+  - After small queue: sampled max `RX_Q` was only `22`, max `SMALL_WR_Q` was `3050`, max `LRG_Q` was `13799`, classifiers finished at `26.46s`, target throughput `30.74 Gbit/s`.
+  - Example active sample: `T+24.2s RX_Q=[0/32768] SMALL_WR_Q=[2760/262144 routed=3405] LRG_Q=[12650/458752] CLASSIFIED=78498`.
+- Conclusion:
+  - The classifier/reactor decoupling worked: RX stayed fluid and the small queue absorbed the burst.
+  - End-to-end target throughput improved by about `68%` (`18.22 -> 30.74 Gbit/s`) on the same deterministic payload.
+  - Remaining bottleneck is now downstream NFS write throughput, especially large queue drain plus small writer/reactor behavior, not classifier backpressure.
