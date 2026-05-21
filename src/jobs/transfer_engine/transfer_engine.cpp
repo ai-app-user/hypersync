@@ -16339,7 +16339,9 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                         bool target_fsync,
                                                         bool ensure_target_directories,
                                                         std::size_t writer_async_window,
-                                                        std::size_t writer_file_window) const {
+                                                        std::size_t writer_file_window,
+                                                        std::size_t writer_reactors,
+                                                        std::size_t reactors_per_ip) const {
     if (target_root.empty()) {
         throw std::runtime_error("--target is required");
     }
@@ -16379,6 +16381,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         writer_config.preserve_metadata = preserve_metadata;
         writer_config.fsync_on_finish = target_fsync;
         writer_config.ensure_parent_directories = ensure_target_directories;
+        writer_config.reactor_count = writer_reactors;
+        writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
         if (writer_async_window != 0U) {
             writer_config.async_window = writer_async_window;
         }

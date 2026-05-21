@@ -1511,7 +1511,7 @@ void print_usage() {
     std::cerr
         << "Usage:\n"
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
-        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories]\n"
+        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories]\n"
         << "  hypersync [--config <config.yaml>] copy-source --source <nfs-url> --host <host> [--base-port <port>] [--lanes <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--pack-small-files] [--no-pack-small-files] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync status --socket <path>\n"
         << "  hypersync tuning [--iface <name>] [--cpu-mask <mask>] [--peer <ip>] [--apply]\n"
@@ -2020,6 +2020,8 @@ int main(int argc, char** argv) {
             bool ensure_target_directories = true;
             std::size_t writer_async_window = 0;
             std::size_t writer_file_window = 0;
+            std::size_t writer_reactors = 0;
+            std::size_t reactors_per_ip = 1;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--target") {
@@ -2042,6 +2044,12 @@ int main(int argc, char** argv) {
                 } else if (args[i] == "--data-writer-file-window") {
                     writer_file_window = parse_size_t_option(require_option(args, i, "--data-writer-file-window"),
                                                              "--data-writer-file-window");
+                } else if (args[i] == "--data-writer-reactors") {
+                    writer_reactors = parse_size_t_option(require_option(args, i, "--data-writer-reactors"),
+                                                          "--data-writer-reactors");
+                } else if (args[i] == "--reactors-per-ip") {
+                    reactors_per_ip = parse_size_t_option(require_option(args, i, "--reactors-per-ip"),
+                                                          "--reactors-per-ip");
                 } else if (args[i] == "--verify-hash") {
                     verify_hash = true;
                 } else if (args[i] == "--skip-verify") {
@@ -2067,7 +2075,9 @@ int main(int argc, char** argv) {
                                                                 target_fsync,
                                                                 ensure_target_directories,
                                                                 writer_async_window,
-                                                                writer_file_window);
+                                                                writer_file_window,
+                                                                writer_reactors,
+                                                                reactors_per_ip);
             std::cout << "pipeline=" << report.pipeline_description << '\n'
                       << "copy_target_result"
                       << " files_written=" << report.files_transferred
