@@ -1870,3 +1870,31 @@ logical size: 335.99 TB
   - Target integrated folder-ready pipeline: `50,100` files verified, `48.77s`, `18.17 Gbit/s`.
   - Target phase timing: receivers done `46.01s`, classifiers done `46.02s`, writers done `48.77s`.
   - Interpretation: the no-zero receiver fix improves bridge-only ingestion substantially, but the NFS integrated path is now backpressured by downstream folder/classifier/small-write behavior. Next target-side work should add live queue/backlog stats around receiver queues, classifier direct small writes, medium/large writer queues, and decouple receiver draining from folder/classifier writes more aggressively.
+
+## 2026-05-21 - Copy Target Queue Telemetry
+
+- Hypersync `119dafc` added 200ms target-side telemetry for the integrated NFS `copy-target` path:
+  - RX lane queue depth/high watermark, received buffers/bytes, receive buffer rate, and buffer-pool occupancy.
+  - Inline target directory creation call count, folder count, and average wait.
+  - Direct small-file writer call count, files written, and average wait.
+  - Medium and large queue depth/capacity plus routed/written counts.
+  - Classified buffer count and interval write bandwidth.
+  - Local verification: `make -j8 unit-test` passed (`74/74`).
+- Deployed package by artifact only:
+  - Transfer1 build artifact: `/mnt/local-nvme/wsync-codex/copy-perf-20260520T054528Z/hypersync-copy-119dafc-piper-0023377.tar.gz`.
+  - agnopo unpacked path: `/tmp/wsync-codex/hypersync-copy-119dafc-piper-0023377`.
+- Deterministic `copy-mix-v1` telemetry run:
+  - Source pipeline: `[MetaReader-NFS-32]->(FileQueue)->[DataReader-NFS-96]->(DataBufQueue-4096 x8)->[BufferStreamSender-1 x8]`.
+  - Target pipeline: `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(SmallReadyDirect)->[DataWriter-NFS/reactors=64 window=64]+(MediumReadyBufQueue-4096 x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-4096 x112)->[DataWriter-NFS-112]`.
+  - Source result: `50,100` files, `110.75 GB`, `105,775` buffers, `5.549s`, `159.67 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,775` buffers, `57.66s`, `15.37 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-telemetry2-20260521T175438Z/target.err` on agnopo.
+- Diagnosis from the telemetry:
+  - The receive lane queue hit and stayed near the per-lane cap: `RX_Q:[4096/32768 hw=4109]` through the slow middle of the run.
+  - Medium queue was unused for this dataset (`MED_Q` always `0`).
+  - Large writer queue did not show sustained saturation; it was often near `0`, then drained a few thousand buffered large chunks after small-file processing released pressure.
+  - Inline mkdir was not the visible bottleneck (`avg_ms` rounded to `0.0` at 200ms reporting precision).
+  - The direct small-file write path is the visible coupling point: `SMALL_WR_Q:direct calls=3375 files=50000 avg_ms=11.1` by completion, and while small writes were active the target receive rate collapsed to roughly `90-200` buffers/s with interval write bandwidth often around `1 Gbit/s`.
+  - Once all `50,000` small files completed around `T+53.9s`, receive drained quickly from about `99,789` to `105,775` buffers and interval write bandwidth rose into the `28-41 Gbit/s` range while the remaining large queue drained.
+- Conclusion:
+  - The integrated path is backpressured primarily because classifier threads synchronously execute direct small-file NFS writes before returning to receiver queue draining. This keeps RX queues full and throttles TCP ingestion. Directory creation and large queue saturation are not the first-order bottlenecks in this trace.
