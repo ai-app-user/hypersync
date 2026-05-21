@@ -6907,7 +6907,10 @@ void record_data_read_metadata_batch_laned(bool recursive,
         }
         logical_size_bytes += logical_size;
         const std::string parent = parent_path(file.rel_path);
-        const std::uint64_t key = parent.empty() ? hash64(file.rel_path) : hash64(parent);
+        const std::uint64_t key =
+            logical_size <= kSmallFileThreshold && !parent.empty()
+                ? hash64(parent)
+                : hash64(file.rel_path);
         files_by_lane[static_cast<std::size_t>(key % lanes)].push_back(std::move(file));
     }
 
