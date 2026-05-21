@@ -207,6 +207,88 @@ std::size_t target_data_writer_effective_worker_count(const TargetDataWriterConf
     return configured;
 }
 
+TargetDataFolderGateJob::TargetDataFolderGateJob(TargetDataWriterConfig config,
+                                                 RawBufferPool& data_pool,
+                                                 BufQueue& input,
+                                                 BufQueue& output)
+    : ThreadedJob(std::max<std::size_t>(1U, config.worker_count)),
+      config_(std::move(config)),
+      data_pool_(data_pool),
+      input_(input),
+      output_(output) {}
+
+TargetDataFolderGateJob::~TargetDataFolderGateJob() = default;
+
+void TargetDataFolderGateJob::run_worker(std::size_t worker_index) {
+    TargetWriterBackend::Options options;
+    options.preserve_metadata = false;
+    options.fsync_on_finish = false;
+    options.ensure_parent_directories = false;
+    options.reactors_per_ip = std::max<std::size_t>(1U, config_.reactors_per_ip);
+    options.max_concurrent_file_transactions = config_.max_concurrent_file_transactions;
+    auto backend = make_target_writer_backend(config_.target_root,
+                                              config_.endpoint_index_offset + worker_index,
+                                              options);
+
+    BufferHandle handle;
+    while (!stop_requested() && wait_for_input(worker_index, input_, handle)) {
+        try {
+            ensure_buffer_directories(*backend, handle);
+            if (!wait_for_output(worker_index, output_, handle)) {
+                data_pool_.release(handle);
+                break;
+            }
+        } catch (...) {
+            data_pool_.release(handle);
+            throw;
+        }
+    }
+}
+
+void TargetDataFolderGateJob::on_stop_requested() {
+    input_.close();
+    output_.close();
+}
+
+void TargetDataFolderGateJob::on_all_workers_finished() {
+    output_.close();
+}
+
+void TargetDataFolderGateJob::ensure_buffer_directories(TargetWriterBackend& backend, const BufferHandle& handle) {
+    const DataBuffer& buffer = data_buffer(data_pool_, handle);
+    std::vector<FileSpec> folders;
+    std::unordered_set<std::string> seen;
+    const auto add_parent = [&](std::string_view rel_path) {
+        const std::string parent = parent_path(rel_path);
+        if (parent.empty()) {
+            return;
+        }
+        if (!seen.insert(parent).second) {
+            return;
+        }
+        FileSpec folder;
+        folder.rel_path = parent;
+        folder.mode = 0755U;
+        folders.push_back(std::move(folder));
+    };
+
+    if (is_packed_small_file_buffer(buffer)) {
+        const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
+            add_parent(view.rel_path);
+        });
+        if (!ok) {
+            throw std::runtime_error("DataFolderGate-" + backend_job_suffix(config_.target_root) +
+                                     " received malformed packed-small-file buffer");
+        }
+    } else if (!is_pathless_regular_data_buffer(buffer)) {
+        add_parent(buffer.trailer.rel_path.view());
+    }
+
+    if (!folders.empty()) {
+        backend.ensure_directories(folders);
+    }
+}
+
 TargetMetaWriterJob::TargetMetaWriterJob(TargetMetaWriterConfig config,
                                          RawBufferPool& metadata_pool,
                                          BufQueue& input)

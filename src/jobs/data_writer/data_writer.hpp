@@ -106,6 +106,32 @@ struct TargetWriterStats {
     std::uint64_t bytes_written = 0;
 };
 
+// Consumes data buffers, creates their parent directories through the selected
+// target backend, and forwards the original buffers unchanged to the writer
+// queue. This keeps copy-target directory creation out of the file write hot
+// path while preserving buffer ownership.
+class TargetDataFolderGateJob final : public ThreadedJob {
+public:
+    TargetDataFolderGateJob(TargetDataWriterConfig config,
+                            RawBufferPool& data_pool,
+                            BufQueue& input,
+                            BufQueue& output);
+    ~TargetDataFolderGateJob() override;
+
+protected:
+    void run_worker(std::size_t worker_index) override;
+    void on_stop_requested() override;
+    void on_all_workers_finished() override;
+
+private:
+    void ensure_buffer_directories(TargetWriterBackend& backend, const BufferHandle& handle);
+
+    TargetDataWriterConfig config_;
+    RawBufferPool& data_pool_;
+    BufQueue& input_;
+    BufQueue& output_;
+};
+
 // Consumes flat-folder metadata buffers and creates/applies target directory
 // metadata through the selected target backend (NFS, local FS, or future FS).
 class TargetMetaWriterJob final : public ThreadedJob {

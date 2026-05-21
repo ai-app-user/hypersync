@@ -16353,13 +16353,16 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
     struct CopyTargetLane {
         RawBufferPool pool;
         BufferPoolRegistry registry;
-        BufQueue queue;
+        BufQueue receiver_queue;
+        BufQueue writer_queue;
         std::unique_ptr<BufferReceiverJob> receiver;
+        std::unique_ptr<TargetDataFolderGateJob> folder_gate;
         std::unique_ptr<TargetDataWriterJob> writer;
 
         CopyTargetLane(std::size_t pool_slots, std::size_t queue_depth)
             : pool(make_data_buffer_pool(pool_slots)),
-              queue(queue_depth) {
+              receiver_queue(queue_depth),
+              writer_queue(queue_depth) {
             registry.register_pool(pool);
         }
     };
@@ -16385,12 +16388,26 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         target_lane->receiver = std::make_unique<BufferReceiverJob>(
             1U,
             target_lane->pool,
-            target_lane->queue,
+            target_lane->receiver_queue,
             BufferTransportEndpoint::tcp(bind_host.empty() ? std::string("0.0.0.0") : bind_host,
                                          static_cast<std::uint16_t>(base_port + lane)));
+        BufQueue* writer_input = &target_lane->receiver_queue;
+        if (ensure_target_directories) {
+            TargetDataWriterConfig folder_gate_config = writer_config;
+            folder_gate_config.worker_count = 1U;
+            folder_gate_config.preserve_metadata = false;
+            folder_gate_config.fsync_on_finish = false;
+            folder_gate_config.ensure_parent_directories = false;
+            target_lane->folder_gate = std::make_unique<TargetDataFolderGateJob>(folder_gate_config,
+                                                                                 target_lane->pool,
+                                                                                 target_lane->receiver_queue,
+                                                                                 target_lane->writer_queue);
+            writer_config.ensure_parent_directories = false;
+            writer_input = &target_lane->writer_queue;
+        }
         target_lane->writer = std::make_unique<TargetDataWriterJob>(writer_config,
                                                                     target_lane->pool,
-                                                                    target_lane->queue);
+                                                                    *writer_input);
         target_lanes.push_back(std::move(target_lane));
     }
 
@@ -16414,6 +16431,11 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
     for (auto& lane : target_lanes) {
         lane->writer->start();
     }
+    for (auto& lane : target_lanes) {
+        if (lane->folder_gate != nullptr) {
+            lane->folder_gate->start();
+        }
+    }
     std::cerr << "copy_target_writers_started"
               << " elapsed_s=" << elapsed_since_start()
               << std::endl;
@@ -16421,6 +16443,14 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         lane->receiver->wait();
     }
     std::cerr << "copy_target_receivers_done"
+              << " elapsed_s=" << elapsed_since_start()
+              << std::endl;
+    for (auto& lane : target_lanes) {
+        if (lane->folder_gate != nullptr) {
+            lane->folder_gate->wait();
+        }
+    }
+    std::cerr << "copy_target_folder_gates_done"
               << " elapsed_s=" << elapsed_since_start()
               << std::endl;
     for (auto& lane : target_lanes) {
@@ -16443,10 +16473,18 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
     report.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
     report.bytes_per_second =
         report.elapsed_seconds > 0.0 ? static_cast<double>(report.bytes_transferred) / report.elapsed_seconds : 0.0;
-    report.pipeline_description = "[BufferReceiver-1 x" + std::to_string(lanes) +
-                                  "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
-                                  " x" + std::to_string(lanes) + ")->[DataWriter-NFS-1 x" +
-                                  std::to_string(lanes) + "]";
+    report.pipeline_description =
+        ensure_target_directories
+            ? "[BufferReceiver-1 x" + std::to_string(lanes) +
+                  "]->(RecvDataBufQueue-" + std::to_string(lane_queue_depth) +
+                  " x" + std::to_string(lanes) + ")->[FolderCreation-NFS-1 x" +
+                  std::to_string(lanes) + "]->(ReadyDataBufQueue-" +
+                  std::to_string(lane_queue_depth) + " x" + std::to_string(lanes) +
+                  ")->[DataWriter-NFS-1 x" + std::to_string(lanes) + "]"
+            : "[BufferReceiver-1 x" + std::to_string(lanes) +
+                  "]->(DataBufQueue-" + std::to_string(lane_queue_depth) +
+                  " x" + std::to_string(lanes) + ")->[DataWriter-NFS-1 x" +
+                  std::to_string(lanes) + "]";
     return report;
 }
 
