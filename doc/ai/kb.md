@@ -2095,3 +2095,25 @@ logical size: 335.99 TB
 - Interpretation:
   - Privileged tuning fixed transfer1 drift and improved the useful 16/32-lane range, but the generic buffer transport remains far below iperf's `~149-171 Gbit/s` baseline.
   - More lanes are not enough; 64 lanes adds overhead/regression. Current best observed generic transport-to-null result is about `52 Gbit/s` at `32` lanes.
+
+## 2026-05-21 - Sharded Sender Queue WAN Transport Experiment
+
+- Hypersync `8e9a6ff` changed `benchmark-transport --role sender --shared-input` from one centralized sender `BufQueue` to a lane-sharded `ShardedBufQueue`:
+  - Generator workers publish to `worker_index % transport_count`.
+  - Each `BufferSender` lane consumes only its own queue shard.
+  - Report kind changed to `tcp-remote-sender-sharded` / local `tcp-sharded` or `unix-sharded`.
+- Deployment followed package-only model:
+  - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-sharded-transport-20260521T223207Z`.
+  - agnopo bundle: `/tmp/wsync-codex/deployments/hypersync-sharded-transport-20260521T223207Z`.
+  - Manifest: Hypersync `8e9a6fffd229106127293a6e8a08eb6ce9a39d5d`, dirty `0`; Piper `78cd1d366b24684678014603edededd8429178c6`, dirty `0`.
+- WAN validation pipeline:
+  `[BufferGenerator-32]->(ShardedInputQueue xN)->[BufferSender-1 xN]->TCP WAN->[BufferReceiver-1 xN]->(BufQueue)->[BufferDiscarder-1 xN]`.
+- Receiver-truth results after privileged host tuning, 1 MiB frames, 64 GiB payload, transfer1 -> agnopo:
+  - `8` lanes: `33.94 Gbit/s`, receiver elapsed `16.20s`.
+  - `16` lanes: `36.02 Gbit/s`, receiver elapsed `15.26s`.
+  - `32` lanes: `36.68 Gbit/s`, receiver elapsed `14.99s`.
+  - `64` lanes: `39.41 Gbit/s`, receiver elapsed `13.95s`.
+- Sender-side completion was fast (`194-421 Gbit/s` reported depending on lane count), but those numbers only measure enqueue into kernel/socket buffers and are not authoritative for WAN transport truth.
+- Interpretation:
+  - Sharding the sender ingress queue did not improve end-to-end receiver throughput; it regressed from the prior best `52.10 Gbit/s` at 32 lanes to `39.41 Gbit/s` at 64 lanes.
+  - The centralized sender MPMC queue is not the dominant limiter for remote transport-to-null. The remaining ceiling is more likely target-side receive/read_exact framing, per-frame receiver queue/pool lifecycle, or socket-drain behavior.
