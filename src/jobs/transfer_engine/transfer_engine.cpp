@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cctype>
 #include <ctime>
@@ -6017,6 +6018,21 @@ struct DirectTargetWriterStats {
         out.bytes_written = bytes_written.load(std::memory_order_acquire);
         return out;
     }
+};
+
+struct alignas(64) CopyTargetEngineTelemetry {
+    std::atomic<std::int64_t> rx_queue_depth {0};
+    std::atomic<std::int64_t> mkdir_queue_depth {0};
+    std::atomic<std::int64_t> small_write_queue_depth {0};
+    std::atomic<std::int64_t> medium_write_queue_depth {0};
+    std::atomic<std::int64_t> large_write_queue_depth {0};
+    std::atomic<std::int64_t> medium_spillway_size {0};
+    std::atomic<std::int64_t> large_spillway_size {0};
+    std::atomic<std::uint64_t> mkdir_requests_issued {0};
+    std::atomic<std::uint64_t> mkdir_completions_ack {0};
+    std::atomic<std::uint64_t> mkdir_wait_ns {0};
+    std::atomic<std::uint64_t> rx_buffers_received {0};
+    std::atomic<std::uint64_t> rx_bytes_received {0};
 };
 
 void print_direct_data_buffer_write_stats(const DataReadBenchmarkStats& stats,
@@ -16418,6 +16434,9 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         std::unique_ptr<TargetWriterBackend> small_backend =
             make_target_writer_backend(target_root, 0U, small_options);
 
+        CopyTargetEngineTelemetry telemetry;
+        medium_queue.set_depth_counter(&telemetry.medium_write_queue_depth);
+        large_queue.set_depth_counter(&telemetry.large_write_queue_depth);
         DirectTargetWriterStats small_stats;
         std::atomic<std::uint64_t> folders_created {0};
         std::atomic<std::uint64_t> classifier_buffers {0};
@@ -16441,6 +16460,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         target_lanes.reserve(lanes);
         for (std::size_t lane = 0; lane < lanes; ++lane) {
             auto target_lane = std::make_unique<CopyTargetReceiverLane>(lane_queue_depth);
+            target_lane->queue.set_depth_counter(&telemetry.rx_queue_depth);
             target_lane->receiver = std::make_unique<BufferReceiverJob>(
                 1U,
                 data_pool,
@@ -16491,13 +16511,26 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             }
             if (!folders.empty()) {
                 const auto mkdir_started = std::chrono::steady_clock::now();
-                backend.ensure_directories(folders);
+                const auto folder_count = static_cast<std::uint64_t>(folders.size());
+                telemetry.mkdir_queue_depth.fetch_add(static_cast<std::int64_t>(folder_count),
+                                                       std::memory_order_relaxed);
+                telemetry.mkdir_requests_issued.fetch_add(folder_count, std::memory_order_relaxed);
+                try {
+                    backend.ensure_directories(folders);
+                } catch (...) {
+                    telemetry.mkdir_queue_depth.fetch_sub(static_cast<std::int64_t>(folder_count),
+                                                           std::memory_order_relaxed);
+                    throw;
+                }
                 const auto mkdir_finished = std::chrono::steady_clock::now();
+                telemetry.mkdir_queue_depth.fetch_sub(static_cast<std::int64_t>(folder_count),
+                                                       std::memory_order_relaxed);
+                telemetry.mkdir_completions_ack.fetch_add(folder_count, std::memory_order_relaxed);
                 mkdir_calls.fetch_add(1U, std::memory_order_relaxed);
-                mkdir_wait_ns.fetch_add(
-                    static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(mkdir_finished - mkdir_started).count()),
-                    std::memory_order_relaxed);
+                const auto mkdir_elapsed_ns = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(mkdir_finished - mkdir_started).count());
+                mkdir_wait_ns.fetch_add(mkdir_elapsed_ns, std::memory_order_relaxed);
+                telemetry.mkdir_wait_ns.fetch_add(mkdir_elapsed_ns, std::memory_order_relaxed);
                 folders_created.fetch_add(folders.size(), std::memory_order_relaxed);
             }
         };
@@ -16527,7 +16560,14 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                 throw std::runtime_error("copy-target classifier received malformed packed-small-file buffer");
             }
             const auto write_started = std::chrono::steady_clock::now();
-            small_backend->write_files(files);
+            telemetry.small_write_queue_depth.fetch_add(1, std::memory_order_relaxed);
+            try {
+                small_backend->write_files(files);
+            } catch (...) {
+                telemetry.small_write_queue_depth.fetch_sub(1, std::memory_order_relaxed);
+                throw;
+            }
+            telemetry.small_write_queue_depth.fetch_sub(1, std::memory_order_relaxed);
             const auto write_finished = std::chrono::steady_clock::now();
             small_write_calls.fetch_add(1U, std::memory_order_relaxed);
             small_write_wait_ns.fetch_add(
@@ -16634,74 +16674,42 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
 
         std::thread telemetry_thread([&]() {
             using namespace std::chrono_literals;
-            std::uint64_t last_rx_buffers = 0;
-            std::uint64_t last_written_bytes = 0;
-            auto last = std::chrono::steady_clock::now();
+            const auto rx_capacity = static_cast<std::int64_t>(lanes * lane_queue_depth);
+            const auto small_capacity = static_cast<std::int64_t>(
+                std::max<std::size_t>(1U, small_options.reactor_count) *
+                std::max<std::size_t>(1U, small_options.max_concurrent_file_transactions));
+            const auto medium_capacity = static_cast<std::int64_t>(medium_threads * lane_queue_depth);
+            const auto large_capacity = static_cast<std::int64_t>(large_threads * lane_queue_depth);
             while (!telemetry_done.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(200ms);
-                const auto now = std::chrono::steady_clock::now();
-                const double interval = std::chrono::duration<double>(now - last).count();
-                std::uint64_t rx_buffers = 0;
-                std::uint64_t rx_bytes = 0;
-                std::size_t rx_depth = 0;
-                std::size_t rx_high = 0;
-                for (const auto& lane : target_lanes) {
-                    const BufferTransportStats receiver_stats = lane->receiver->stats();
-                    rx_buffers += receiver_stats.buffers;
-                    rx_bytes += receiver_stats.payload_bytes;
-                    rx_depth += lane->queue.size();
-                    rx_high += lane->queue.high_watermark();
-                }
-                const TargetWriterStats small_snapshot = small_stats.snapshot();
-                const TargetWriterStats medium_snapshot = medium_writer.stats();
-                const TargetWriterStats large_snapshot = large_writer.stats();
-                const std::uint64_t written_bytes =
-                    small_snapshot.bytes_written + medium_snapshot.bytes_written + large_snapshot.bytes_written;
-                const double rx_buffers_s =
-                    interval > 0.0 ? static_cast<double>(rx_buffers - last_rx_buffers) / interval : 0.0;
-                const double write_gbit_s =
-                    interval > 0.0
-                        ? static_cast<double>(written_bytes - last_written_bytes) * 8.0 / interval / 1e9
-                        : 0.0;
-                last = now;
-                last_rx_buffers = rx_buffers;
-                last_written_bytes = written_bytes;
-                const std::uint64_t mkdir_call_count = mkdir_calls.load(std::memory_order_relaxed);
-                const std::uint64_t small_call_count = small_write_calls.load(std::memory_order_relaxed);
+                const auto mkdir_issued = telemetry.mkdir_requests_issued.load(std::memory_order_relaxed);
+                const auto mkdir_ack = telemetry.mkdir_completions_ack.load(std::memory_order_relaxed);
+                const auto mkdir_lag = mkdir_issued >= mkdir_ack ? mkdir_issued - mkdir_ack : 0U;
                 const double mkdir_avg_ms =
-                    mkdir_call_count == 0U
+                    mkdir_ack == 0U
                         ? 0.0
-                        : static_cast<double>(mkdir_wait_ns.load(std::memory_order_relaxed)) /
-                              static_cast<double>(mkdir_call_count) / 1'000'000.0;
-                const double small_avg_ms =
-                    small_call_count == 0U
-                        ? 0.0
-                        : static_cast<double>(small_write_wait_ns.load(std::memory_order_relaxed)) /
-                              static_cast<double>(small_call_count) / 1'000'000.0;
-                std::cerr << std::fixed << std::setprecision(1)
-                          << "[T+" << elapsed_since_start() << "s] "
-                          << "RX_Q:[" << rx_depth << "/" << (lanes * lane_queue_depth)
-                          << " hw=" << rx_high << "] "
-                          << "RX:" << rx_buffers << " buf " << std::setprecision(2)
-                          << (static_cast<double>(rx_bytes) * 8.0 / 1e9) << "Gb "
-                          << std::setprecision(1)
-                          << "rx_buf_s=" << rx_buffers_s << " | "
-                          << "POOL:[" << data_pool.in_use() << "/" << data_pool.capacity() << "] | "
-                          << "MKDIR_Q:inline calls=" << mkdir_call_count
-                          << " folders=" << folders_created.load(std::memory_order_relaxed)
-                          << " avg_ms=" << mkdir_avg_ms << " | "
-                          << "SMALL_WR_Q:direct calls=" << small_call_count
-                          << " files=" << small_snapshot.files_written
-                          << " avg_ms=" << small_avg_ms << " | "
-                          << "MED_Q:[" << medium_queue.size() << "/" << medium_queue.capacity()
-                          << " routed=" << medium_buffers_routed.load(std::memory_order_relaxed)
-                          << " written=" << medium_snapshot.files_written << "] | "
-                          << "LRG_Q:[" << large_queue.size() << "/" << large_queue.capacity()
-                          << " routed=" << large_buffers_routed.load(std::memory_order_relaxed)
-                          << " written=" << large_snapshot.files_written << "] | "
-                          << "CLASSIFIED:" << classifier_buffers.load(std::memory_order_relaxed)
-                          << " | W:" << write_gbit_s << "Gbit/s"
-                          << std::defaultfloat << std::endl;
+                        : static_cast<double>(telemetry.mkdir_wait_ns.load(std::memory_order_relaxed)) /
+                              static_cast<double>(mkdir_ack) / 1'000'000.0;
+                std::fprintf(stdout,
+                             "[T+%.1fs] RX_Q: [%lld/%lld] | MKDIR_Q: [%lld] (LAG: %llu issued=%llu ack=%llu avg_ms=%.3f) | SMALL_WR_Q: [%lld/%lld] | MED_SPILL: [%lld] | LRG_SPILL: [%lld] | MED_Q: [%lld/%lld] | LRG_Q: [%lld/%lld] | CLASSIFIED: %llu\n",
+                             elapsed_since_start(),
+                             static_cast<long long>(telemetry.rx_queue_depth.load(std::memory_order_relaxed)),
+                             static_cast<long long>(rx_capacity),
+                             static_cast<long long>(telemetry.mkdir_queue_depth.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(mkdir_lag),
+                             static_cast<unsigned long long>(mkdir_issued),
+                             static_cast<unsigned long long>(mkdir_ack),
+                             mkdir_avg_ms,
+                             static_cast<long long>(telemetry.small_write_queue_depth.load(std::memory_order_relaxed)),
+                             static_cast<long long>(small_capacity),
+                             static_cast<long long>(telemetry.medium_spillway_size.load(std::memory_order_relaxed)),
+                             static_cast<long long>(telemetry.large_spillway_size.load(std::memory_order_relaxed)),
+                             static_cast<long long>(telemetry.medium_write_queue_depth.load(std::memory_order_relaxed)),
+                             static_cast<long long>(medium_capacity),
+                             static_cast<long long>(telemetry.large_write_queue_depth.load(std::memory_order_relaxed)),
+                             static_cast<long long>(large_capacity),
+                             static_cast<unsigned long long>(classifier_buffers.load(std::memory_order_relaxed)));
+                std::fflush(stdout);
             }
         });
         const auto stop_telemetry = [&]() {
