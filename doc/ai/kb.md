@@ -2071,3 +2071,27 @@ logical size: 335.99 TB
 - Interpretation:
   - The generic buffer receiver/discard path is now working over real WAN latency, but it tops out in the same `~40-45 Gbit/s` band seen in earlier target ingest experiments, far below the `iperf3` host-to-host baseline (`~149-171 Gbit/s` at 8-16 streams).
   - This confirms the remaining gap is in the Hypersync/Piper buffer transport receive path or per-frame socket read/queue handoff mechanics, not in local loopback, packaging, firewall reachability, or NFS writer behavior.
+
+## 2026-05-21 - Privileged Host Tuning and WAN Transport Scaling Sweep
+
+- User requested a privileged tuning pass on transfer1 and agnopo followed by a real WAN transport validation sweep.
+- Ran the supported deployed bundle with `sudo ./hypersync tuning --iface ens3 --apply` on both hosts. No source-tree runtime was used.
+  - transfer1 bundle path: `/mnt/local-nvme/wsync-codex/deployments/hypersync-remote-transport-20260521T210315Z`.
+  - agnopo bundle path: `/tmp/wsync-codex/deployments/hypersync-remote-transport-20260521T210315Z`.
+- Post-apply tuning summaries:
+  - transfer1: `mismatches=0`, RPS/XPS mask expanded to all `160` logical CPUs (`ffffffff,ffffffff,ffffffff,ffffffff,ffffffff`), NFS BDI read-ahead corrected to `16384 KB`.
+  - agnopo: `mismatches=0`, RPS/XPS mask remains all `80` logical CPUs (`0000ffff,ffffffff,ffffffff`), NFS BDI read-ahead `16384 KB`.
+  - Both hosts retain Hypersync's larger TCP settings: `rmem_max/wmem_max=2147483647`, `tcp_rmem/tcp_wmem=4096 1048576 2147483647`, `fq`, `bbr`.
+- Remote WAN transport validation pipeline:
+  `[BufferGenerator-32]->(SharedInputQueue)->[BufferSender-1 xN]->TCP WAN->[BufferReceiver-1 xN]->(BufQueue)->[BufferDiscarder-1 xN]`.
+- Receiver-truth results after privileged tuning, 1 MiB frames, 64 GiB payload, transfer1 -> agnopo:
+  - `8` lanes: `40.99 Gbit/s`, receiver elapsed `13.41s`.
+  - `16` lanes: `50.52 Gbit/s`, receiver elapsed `10.88s`.
+  - `32` lanes: `52.10 Gbit/s`, receiver elapsed `10.55s`.
+  - `64` lanes: `38.55 Gbit/s`, receiver elapsed `14.26s`.
+- Comparison to pre-apply receiver-truth results:
+  - `16` lanes improved from `39.36` to `50.52 Gbit/s`.
+  - `64` lanes regressed from `44.24` to `38.55 Gbit/s`.
+- Interpretation:
+  - Privileged tuning fixed transfer1 drift and improved the useful 16/32-lane range, but the generic buffer transport remains far below iperf's `~149-171 Gbit/s` baseline.
+  - More lanes are not enough; 64 lanes adds overhead/regression. Current best observed generic transport-to-null result is about `52 Gbit/s` at `32` lanes.
