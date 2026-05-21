@@ -1,6 +1,7 @@
 #include "jobs/data_writer/data_writer.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -482,23 +483,26 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     auto backend = make_target_writer_backend(config_.target_root,
                                               config_.endpoint_index_offset + worker_index,
                                               options);
+    std::optional<BufferHandle> carried;
     BufferHandle handle;
-    while (!stop_requested() && pop_input(worker_index, handle)) {
+    while (!stop_requested() && (carried.has_value() || pop_input(worker_index, handle))) {
+        if (carried.has_value()) {
+            handle = *carried;
+            carried.reset();
+        }
         std::vector<BufferHandle> batch;
         try {
             const bool first_is_packed = is_packed_small_file_buffer(data_buffer(data_pool_, handle));
-            if (config_.async_window > 1U && sharded_input_ != nullptr) {
+            if (config_.async_window > 1U) {
                 batch.push_back(handle);
-                const std::size_t shard =
-                    sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
                 while (batch.size() < config_.async_window) {
                     BufferHandle next;
-                    if (!sharded_input_->try_pop(shard, next)) {
+                    if (!try_pop_input(worker_index, next)) {
                         break;
                     }
                     const bool next_is_packed = is_packed_small_file_buffer(data_buffer(data_pool_, next));
                     if (next_is_packed != first_is_packed) {
-                        sharded_input_->push_wait(shard, next);
+                        carried = next;
                         break;
                     }
                     batch.push_back(next);
@@ -512,6 +516,10 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
                 process_buffer(*backend, handle);
             }
         } catch (...) {
+            if (carried.has_value()) {
+                data_pool_.release(*carried);
+                carried.reset();
+            }
             if (batch.empty()) {
                 data_pool_.release(handle);
             } else {
@@ -528,6 +536,9 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
                 data_pool_.release(batched);
             }
         }
+    }
+    if (carried.has_value()) {
+        data_pool_.release(*carried);
     }
 }
 
@@ -553,6 +564,17 @@ bool TargetDataWriterJob::pop_input(std::size_t worker_index, BufferHandle& hand
     }
     auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_input_empty);
     return sharded_input_->shard(shard).pop_wait(handle);
+}
+
+bool TargetDataWriterJob::try_pop_input(std::size_t worker_index, BufferHandle& handle) {
+    if (input_ != nullptr) {
+        return input_->try_pop(handle);
+    }
+    if (sharded_input_ == nullptr) {
+        return false;
+    }
+    const std::size_t shard = sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
+    return sharded_input_->try_pop(shard, handle);
 }
 
 void TargetDataWriterJob::process_buffer(TargetWriterBackend& backend, const BufferHandle& handle) {

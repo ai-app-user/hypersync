@@ -160,6 +160,7 @@ protected:
 
 private:
     [[nodiscard]] bool pop_input(std::size_t worker_index, BufferHandle& handle);
+    [[nodiscard]] bool try_pop_input(std::size_t worker_index, BufferHandle& handle);
     void process_buffer(TargetWriterBackend& backend, const BufferHandle& handle);
     void process_regular_batch(TargetWriterBackend& backend, const std::vector<BufferHandle>& handles);
     void process_packed_small_file_batch(TargetWriterBackend& backend, const std::vector<BufferHandle>& handles);

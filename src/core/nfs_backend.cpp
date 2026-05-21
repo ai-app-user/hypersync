@@ -6518,6 +6518,7 @@ private:
 
 #endif
 
+#if HYPERSYNC_HAS_LIBNFS
 struct TargetNfsMountPlan {
     std::string mount_url;
     std::string target_prefix;
@@ -6572,6 +6573,7 @@ TargetNfsMountPlan plan_target_nfs_mount(std::string_view root_url) {
     plan.target_prefix = std::move(prefix_path);
     return plan;
 }
+#endif
 
 }  // namespace
 
