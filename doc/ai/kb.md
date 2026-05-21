@@ -2142,3 +2142,29 @@ logical size: 335.99 TB
   - Removing all queue and discard handoff layers raised the C++ transport-to-null ceiling from `52.10 Gbit/s` to `152.36 Gbit/s`.
   - The remaining delta to the best iperf baseline (`~171 Gbit/s`) is much smaller and likely belongs to socket framing/syscall overhead or NUMA placement details, not the job graph.
   - Sender-side reported rates (`552-606 Gbit/s`) are not transport truth because they mostly measure how fast transfer1 can hand data to kernel socket buffers. Continue using receiver `payload_bytes_received / elapsed` as the WAN transport signal.
+
+## 2026-05-21 - Production Copy Shared-Nothing Integration
+
+- Hypersync `be685a0` added `copy-source --shared-nothing` and `copy-target --shared-nothing`.
+- Source shared-nothing pipeline:
+  `[MetaReader-NFS-8]->(FileQueue-parent-hash/file-hash xN)->[DataReader-NFS-1 xN]->TCP[DirectSocketSender-1 xN]`.
+- Target shared-nothing pipeline:
+  `[BufferReceiver-1 xN]->(RecvDataBufQueue-D xN)->[FolderCreation-NFS-1 xN]->(ReadyDataBufQueue-D xN)->[DataWriter-NFS-1 xN]`.
+- First 16-lane deterministic `copy-mix-v1` run was functionally correct but slow:
+  - Source: `50,100` files, `110.75 GB`, `105,752` buffers, `20.675s`, `42.85 Gbit/s`.
+  - Target: `50,100` files, zero failures, `110.75 GB`, `87.72s`, `10.10 Gbit/s`.
+  - Diagnosis: all 100 large files lived under the same `/large` parent and the first source hash used parent locality for every file, collapsing large-file read/send work onto one lane.
+- Hypersync `b0c528d` fixed source lane allocation:
+  - Small files continue using parent-directory hash for locality.
+  - Files larger than `kSmallFileThreshold` use full file-path hash to distribute large files across lanes.
+- Post-fix deterministic `copy-mix-v1` runs, transfer1 -> agnopo:
+  - `64` lanes, writer async window `8`, file window `64`: source `389.42 Gbit/s`, target `59.62 Gbit/s`, target elapsed `14.86s`, zero failures.
+  - `64` lanes, writer async window `32`, file window `128`: source `412.05 Gbit/s`, target `53.05 Gbit/s`, target elapsed `16.70s`, zero failures.
+  - `128` lanes, writer async window `8`, file window `64`: source `687.75 Gbit/s`, target `57.49 Gbit/s`, target elapsed `15.41s`, zero failures.
+  - `64` lanes with directories precreated and `--assume-target-directories`: source `411.42 Gbit/s`, target `54.39 Gbit/s`, target elapsed `16.29s`, zero failures.
+- Current best production shared-nothing copy result:
+  - `64` lanes, writer async window `8`, file window `64`: `59.62 Gbit/s`.
+- Interpretation:
+  - Shared-nothing production copy improves the deterministic target result from the previous integrated NFS copy best (`31.17 Gbit/s`) to `59.62 Gbit/s`, roughly `1.9x`.
+  - It is still far below the shared-nothing transport null ceiling (`152.36 Gbit/s`) and synthetic local NFS writer ceilings, so the remaining bottleneck is target-side per-lane `DataWriter-NFS-1` write lifecycle depth/implementation, not TCP transport.
+  - Precreating directories did not improve throughput, so directory creation is not the primary limiter for this dataset.
