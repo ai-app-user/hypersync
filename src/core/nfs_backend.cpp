@@ -1884,6 +1884,10 @@ public:
         (void)files;
     }
 
+    void create_files(const std::vector<FileSpec>& files) override {
+        (void)files;
+    }
+
     void finish_file(const FileSpec& spec) override {
         (void)spec;
     }
@@ -5504,14 +5508,23 @@ private:
             transaction.phase = FileTransaction::Phase::creating;
             transaction.create_state = {};
             transaction.create_state.queued_at = std::chrono::steady_clock::now();
-            const int queue_result = nfs_create_async(session_.context(),
-                                                      transaction.remote_path.c_str(),
-                                                      O_TRUNC,
-                                                      static_cast<int>(transaction.spec.mode),
-                                                      generic_nfs_callback,
-                                                      &transaction.create_state);
+            const int queue_result =
+                fleet_.options_.assume_precreated_files
+                    ? nfs_open_async(session_.context(),
+                                     transaction.remote_path.c_str(),
+                                     O_WRONLY,
+                                     generic_nfs_callback,
+                                     &transaction.create_state)
+                    : nfs_create_async(session_.context(),
+                                       transaction.remote_path.c_str(),
+                                       O_TRUNC,
+                                       static_cast<int>(transaction.spec.mode),
+                                       generic_nfs_callback,
+                                       &transaction.create_state);
             if (queue_result != 0) {
-                throw std::runtime_error("nfs_create_async queue failed: " +
+                throw std::runtime_error(std::string(fleet_.options_.assume_precreated_files
+                                                         ? "nfs_open_async queue failed: "
+                                                         : "nfs_create_async queue failed: ") +
                                          std::string(nfs_get_error(session_.context())));
             }
         }
@@ -5588,11 +5601,17 @@ private:
                 try {
                     if (transaction.phase == FileTransaction::Phase::creating && transaction.create_state.done) {
                         if (transaction.create_state.status < 0) {
-                            throw std::runtime_error("nfs_create_async failed: " + transaction.create_state.error);
+                            throw std::runtime_error(std::string(fleet_.options_.assume_precreated_files
+                                                                     ? "nfs_open_async failed: "
+                                                                     : "nfs_create_async failed: ") +
+                                                     transaction.create_state.error);
                         }
                         transaction.handle = static_cast<struct nfsfh*>(transaction.create_state.data);
                         if (transaction.handle == nullptr) {
-                            throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
+                            throw std::runtime_error(std::string(fleet_.options_.assume_precreated_files
+                                                                     ? "nfs_open_async"
+                                                                     : "nfs_create_async") +
+                                                     " succeeded without returning a file handle");
                         }
                         if (transaction.data.empty()) {
                             queue_close(transaction);
@@ -5852,6 +5871,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
         bool ensure_parent_directories = true;
         bool stable_small_file_writes = false;
         bool tcp_cork_small_file_writes = false;
+        bool assume_precreated_files = false;
         std::size_t reactors_per_ip = 1;
         std::size_t reactor_count = 0;
         std::size_t max_concurrent_file_transactions = 64;
@@ -5862,6 +5882,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
             out << root_url << "|pm=" << preserve_metadata << "|fs=" << fsync_on_finish
                 << "|ep=" << ensure_parent_directories << "|sw=" << stable_small_file_writes
                 << "|tc=" << tcp_cork_small_file_writes
+                << "|pc=" << assume_precreated_files
                 << "|rpi=" << reactors_per_ip << "|rc=" << reactor_count
                 << "|fw=" << max_concurrent_file_transactions
                 << "|tp=" << target_prefix;
@@ -5879,6 +5900,7 @@ std::shared_ptr<NfsTargetWriteReactorFleet> shared_target_write_reactor_fleet(
     key.ensure_parent_directories = options.ensure_parent_directories;
     key.stable_small_file_writes = options.stable_small_file_writes;
     key.tcp_cork_small_file_writes = options.tcp_cork_small_file_writes;
+    key.assume_precreated_files = options.assume_precreated_files;
     key.reactors_per_ip = std::max<std::size_t>(1U, options.reactors_per_ip);
     key.reactor_count = options.reactor_count;
     key.max_concurrent_file_transactions = options.max_concurrent_file_transactions;
@@ -6224,6 +6246,92 @@ public:
         reactor_fleet_->write_files(files);
     }
 
+    void create_files(const std::vector<FileSpec>& files) override {
+        struct PendingCreate {
+            FileSpec spec;
+            std::string rel_path;
+            std::string remote_path;
+            struct nfsfh* handle = nullptr;
+            AsyncCommandState create_state;
+            AsyncCommandState close_state;
+            enum class Phase { creating, closing, done } phase = Phase::creating;
+        };
+
+        std::deque<FileSpec> backlog;
+        for (const FileSpec& file : files) {
+            if (file.rel_path.empty()) {
+                continue;
+            }
+            backlog.push_back(file);
+        }
+
+        std::list<PendingCreate> active;
+        const std::size_t window = std::max<std::size_t>(1U, options_.max_concurrent_file_transactions);
+
+        auto fill_window = [&]() {
+            while (!backlog.empty() && active.size() < window) {
+                PendingCreate& create = active.emplace_back();
+                create.spec = std::move(backlog.front());
+                backlog.pop_front();
+                create.rel_path = target_rel_path(create.spec.rel_path);
+                if (options_.ensure_parent_directories) {
+                    ensure_directory_chain(parent_path(create.rel_path));
+                }
+                create.remote_path = "/" + create.rel_path;
+                create.create_state.queued_at = std::chrono::steady_clock::now();
+                const int queue_result = nfs_create_async(legacy_session().context(),
+                                                          create.remote_path.c_str(),
+                                                          O_TRUNC,
+                                                          static_cast<int>(create.spec.mode),
+                                                          generic_nfs_callback,
+                                                          &create.create_state);
+                if (queue_result != 0) {
+                    throw std::runtime_error("nfs_create_async queue failed: " +
+                                             std::string(nfs_get_error(legacy_session().context())));
+                }
+            }
+        };
+
+        fill_window();
+        while (!active.empty() || !backlog.empty()) {
+            service_nfs_context(legacy_session().context(), active.empty() ? 1 : 0);
+            for (auto it = active.begin(); it != active.end();) {
+                PendingCreate& create = *it;
+                if (create.phase == PendingCreate::Phase::creating && create.create_state.done) {
+                    if (create.create_state.status < 0) {
+                        throw std::runtime_error("nfs_create_async failed: " + create.create_state.error);
+                    }
+                    create.handle = static_cast<struct nfsfh*>(create.create_state.data);
+                    if (create.handle == nullptr) {
+                        throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
+                    }
+                    create.phase = PendingCreate::Phase::closing;
+                    create.close_state = {};
+                    create.close_state.queued_at = std::chrono::steady_clock::now();
+                    const int queue_result = nfs_close_async(legacy_session().context(),
+                                                             create.handle,
+                                                             generic_nfs_callback,
+                                                             &create.close_state);
+                    if (queue_result != 0) {
+                        throw std::runtime_error("nfs_close_async queue failed: " +
+                                                 std::string(nfs_get_error(legacy_session().context())));
+                    }
+                }
+                if (create.phase == PendingCreate::Phase::closing && create.close_state.done) {
+                    if (create.close_state.status < 0) {
+                        throw std::runtime_error("nfs_close_async failed: " + create.close_state.error);
+                    }
+                    create.handle = nullptr;
+                    it = active.erase(it);
+                    fill_window();
+                    continue;
+                }
+                ++it;
+            }
+            fill_window();
+        }
+    }
+
     void finish_file(const FileSpec& spec) override {
         const std::string rel_path = target_rel_path(spec.rel_path);
         const std::string remote_path = "/" + rel_path;
@@ -6412,14 +6520,20 @@ private:
         const AsyncCommandState open_state = run_async_command(
             legacy_session().context(),
             [&](AsyncCommandState* state) {
-                return nfs_create_async(legacy_session().context(),
-                                        remote_path.c_str(),
-                                        O_TRUNC,
-                                        static_cast<int>(mode),
-                                        generic_nfs_callback,
-                                        state);
+                return options_.assume_precreated_files
+                           ? nfs_open_async(legacy_session().context(),
+                                            remote_path.c_str(),
+                                            O_WRONLY,
+                                            generic_nfs_callback,
+                                            state)
+                           : nfs_create_async(legacy_session().context(),
+                                              remote_path.c_str(),
+                                              O_TRUNC,
+                                              static_cast<int>(mode),
+                                              generic_nfs_callback,
+                                              state);
             },
-            "nfs_create_async");
+            options_.assume_precreated_files ? "nfs_open_async" : "nfs_create_async");
         auto* handle = static_cast<struct nfsfh*>(open_state.data);
         open_handles_.emplace(rel_path, handle);
         return handle;
@@ -6445,14 +6559,23 @@ private:
         transaction.phase = InlineFileTransaction::Phase::creating;
         transaction.create_state = {};
         transaction.create_state.queued_at = std::chrono::steady_clock::now();
-        const int queue_result = nfs_create_async(legacy_session().context(),
-                                                  transaction.remote_path.c_str(),
-                                                  O_TRUNC,
-                                                  static_cast<int>(transaction.file->spec.mode),
-                                                  generic_nfs_callback,
-                                                  &transaction.create_state);
+        const int queue_result =
+            options_.assume_precreated_files
+                ? nfs_open_async(legacy_session().context(),
+                                 transaction.remote_path.c_str(),
+                                 O_WRONLY,
+                                 generic_nfs_callback,
+                                 &transaction.create_state)
+                : nfs_create_async(legacy_session().context(),
+                                   transaction.remote_path.c_str(),
+                                   O_TRUNC,
+                                   static_cast<int>(transaction.file->spec.mode),
+                                   generic_nfs_callback,
+                                   &transaction.create_state);
         if (queue_result != 0) {
-            throw std::runtime_error("nfs_create_async queue failed: " +
+            throw std::runtime_error(std::string(options_.assume_precreated_files
+                                                     ? "nfs_open_async queue failed: "
+                                                     : "nfs_create_async queue failed: ") +
                                      std::string(nfs_get_error(legacy_session().context())));
         }
     }
@@ -6560,11 +6683,17 @@ private:
                 try {
                     if (transaction.phase == InlineFileTransaction::Phase::creating && transaction.create_state.done) {
                         if (transaction.create_state.status < 0) {
-                            throw std::runtime_error("nfs_create_async failed: " + transaction.create_state.error);
+                            throw std::runtime_error(std::string(options_.assume_precreated_files
+                                                                     ? "nfs_open_async failed: "
+                                                                     : "nfs_create_async failed: ") +
+                                                     transaction.create_state.error);
                         }
                         transaction.handle = static_cast<struct nfsfh*>(transaction.create_state.data);
                         if (transaction.handle == nullptr) {
-                            throw std::runtime_error("nfs_create_async succeeded without returning a file handle");
+                            throw std::runtime_error(std::string(options_.assume_precreated_files
+                                                                     ? "nfs_open_async"
+                                                                     : "nfs_create_async") +
+                                                     " succeeded without returning a file handle");
                         }
                         if (transaction.file->data.empty()) {
                             queue_inline_close(transaction);
@@ -6780,6 +6909,19 @@ void TargetWriterBackend::ensure_directories(const std::vector<FileSpec>& specs)
 
 void TargetWriterBackend::write_files(const std::vector<WriteChunk>& files) {
     write_chunks(files);
+}
+
+void TargetWriterBackend::create_files(const std::vector<FileSpec>& files) {
+    std::vector<WriteChunk> empty_files;
+    empty_files.reserve(files.size());
+    for (const FileSpec& file : files) {
+        WriteChunk chunk;
+        chunk.spec = file;
+        chunk.offset = 0;
+        chunk.last_chunk = true;
+        empty_files.push_back(std::move(chunk));
+    }
+    write_files(empty_files);
 }
 
 void NfsBackend::visit_files(bool recursive, const std::function<void(FileSpec)>& visitor) const {

@@ -665,7 +665,8 @@ public:
                                                           std::size_t writer_async_window = 0,
                                                           std::size_t writer_file_window = 0,
                                                           std::size_t writer_reactors = 0,
-                                                          std::size_t reactors_per_ip = 1) const;
+                                                          std::size_t reactors_per_ip = 1,
+                                                          bool precreate_target_files = false) const;
     [[nodiscard]] TransferReport transfer_directory(const SenderRuntimeConfig& runtime) const;
     void run_receiver(const ReceiverRuntimeConfig& runtime) const;
     [[nodiscard]] static std::vector<FileSpec> scan_directory(const std::filesystem::path& source_root, bool recursive = true);

@@ -1511,7 +1511,7 @@ void print_usage() {
     std::cerr
         << "Usage:\n"
         << "  hypersync [--config <config.yaml>] receive --target <dir|nfs-url> [--bind-host <host>] [--priority-port <port>] [--data-port <port>] [--backpressure-window <bytes>] [--backpressure-pause-ms <ms>] [--skip-verify]\n"
-        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories]\n"
+        << "  hypersync [--config <config.yaml>] copy-target --target <dir|nfs-url> [--bind-host <host>] [--base-port <port>] [--lanes <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--data-writer-async-window <n>] [--data-writer-file-window <n>] [--data-writer-reactors <n>] [--reactors-per-ip <n>] [--skip-verify] [--no-target-fsync] [--assume-target-directories] [--target-precreate-files]\n"
         << "  hypersync [--config <config.yaml>] copy-source --source <nfs-url> --host <host> [--base-port <port>] [--lanes <n>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--data-reader-threads <n>] [--data-outstanding-requests <n>] [--data-buffer-slots <n>] [--data-queue-depth <n>] [--pack-small-files] [--no-pack-small-files] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync status --socket <path>\n"
         << "  hypersync tuning [--iface <name>] [--cpu-mask <mask>] [--peer <ip>] [--apply]\n"
@@ -2022,6 +2022,7 @@ int main(int argc, char** argv) {
             std::size_t writer_file_window = 0;
             std::size_t writer_reactors = 0;
             std::size_t reactors_per_ip = 1;
+            bool target_precreate_files = false;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--target") {
@@ -2058,6 +2059,8 @@ int main(int argc, char** argv) {
                     target_fsync = false;
                 } else if (args[i] == "--assume-target-directories") {
                     ensure_target_directories = false;
+                } else if (args[i] == "--target-precreate-files") {
+                    target_precreate_files = true;
                 } else if (args[i] == "--no-preserve-target-metadata") {
                     preserve_metadata = false;
                 } else {
@@ -2077,7 +2080,8 @@ int main(int argc, char** argv) {
                                                                 writer_async_window,
                                                                 writer_file_window,
                                                                 writer_reactors,
-                                                                reactors_per_ip);
+                                                                reactors_per_ip,
+                                                                target_precreate_files);
             std::cout << "pipeline=" << report.pipeline_description << '\n'
                       << "copy_target_result"
                       << " files_written=" << report.files_transferred

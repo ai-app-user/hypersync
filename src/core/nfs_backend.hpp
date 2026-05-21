@@ -221,6 +221,7 @@ public:
         bool stable_small_file_writes = false;
         bool tcp_cork_small_file_writes = false;
         bool direct_reactor_lane = false;
+        bool assume_precreated_files = false;
         std::size_t reactors_per_ip = 1;
         std::size_t reactor_count = 0;
         std::size_t max_concurrent_file_transactions = 64;
@@ -241,6 +242,7 @@ public:
     };
     virtual void write_chunks(const std::vector<WriteChunk>& chunks);
     virtual void write_files(const std::vector<WriteChunk>& files);
+    virtual void create_files(const std::vector<FileSpec>& files);
     virtual void finish_file(const FileSpec& spec) = 0;
     virtual void abort_file(std::string_view rel_path) noexcept = 0;
     [[nodiscard]] virtual std::uint64_t file_hash(std::string_view rel_path) const = 0;

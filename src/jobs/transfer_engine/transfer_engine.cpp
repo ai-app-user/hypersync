@@ -130,6 +130,17 @@ std::string nfs_url_with_server_expression(std::string_view root_url, std::strin
     return url;
 }
 
+FileSpec file_spec_from_data_trailer(const DataBufTrailer& trailer) {
+    FileSpec file;
+    file.rel_path = std::string(trailer.rel_path.view());
+    file.declared_size = trailer.file_size;
+    file.mtime = trailer.mtime;
+    file.mode = trailer.mode != 0U ? trailer.mode : 0644U;
+    file.uid = trailer.uid;
+    file.gid = trailer.gid;
+    return file;
+}
+
 enum class PriorityMessageType : std::uint32_t {
     session_start = 1,
     file_record = 2,
@@ -6078,6 +6089,7 @@ struct DirectTargetWriterStats {
 struct alignas(64) CopyTargetEngineTelemetry {
     std::atomic<std::int64_t> rx_queue_depth {0};
     std::atomic<std::int64_t> mkdir_queue_depth {0};
+    std::atomic<std::int64_t> file_create_queue_depth {0};
     std::atomic<std::int64_t> small_write_queue_depth {0};
     std::atomic<std::int64_t> medium_write_queue_depth {0};
     std::atomic<std::int64_t> large_write_queue_depth {0};
@@ -16502,7 +16514,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                         std::size_t writer_async_window,
                                                         std::size_t writer_file_window,
                                                         std::size_t writer_reactors,
-                                                        std::size_t reactors_per_ip) const {
+                                                        std::size_t reactors_per_ip,
+                                                        bool precreate_target_files) const {
     if (target_root.empty()) {
         throw std::runtime_error("--target is required");
     }
@@ -16524,6 +16537,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         base_writer_config.preserve_metadata = preserve_metadata;
         base_writer_config.fsync_on_finish = target_fsync;
         base_writer_config.ensure_parent_directories = false;
+        base_writer_config.assume_precreated_files = precreate_target_files;
         base_writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
         base_writer_config.reactor_count = writer_reactors == 0U ? 64U : writer_reactors;
         base_writer_config.max_concurrent_file_transactions = writer_file_window == 0U ? 64U : writer_file_window;
@@ -16555,11 +16569,16 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         const std::size_t small_queue_depth_per_shard =
             std::max<std::size_t>(1U, (262144U + small_threads - 1U) / small_threads);
         const std::size_t target_bulk_queue_depth_per_shard = std::max<std::size_t>(lane_queue_depth, 16384U);
+        const std::size_t file_create_threads = 16U;
+        const std::size_t file_create_queue_depth_per_shard =
+            std::max<std::size_t>(1U, (262144U + file_create_threads - 1U) / file_create_threads);
+        ShardedBufQueue file_create_queue(file_create_threads, file_create_queue_depth_per_shard);
         ShardedBufQueue small_queue(small_threads, small_queue_depth_per_shard);
         ShardedBufQueue medium_queue(medium_threads, target_bulk_queue_depth_per_shard);
         ShardedBufQueue large_queue(large_threads, target_bulk_queue_depth_per_shard);
 
         CopyTargetEngineTelemetry telemetry;
+        file_create_queue.set_depth_counter(&telemetry.file_create_queue_depth);
         small_queue.set_depth_counter(&telemetry.small_write_queue_depth);
         medium_queue.set_depth_counter(&telemetry.medium_write_queue_depth);
         large_queue.set_depth_counter(&telemetry.large_write_queue_depth);
@@ -16610,6 +16629,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             for (auto& lane : target_lanes) {
                 lane->queue.close();
             }
+            file_create_queue.close();
             small_queue.close();
             medium_queue.close();
             large_queue.close();
@@ -16683,6 +16703,118 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             return spill_target_buffer(spillway, handle);
         };
 
+        struct PrecreatedFileRegistry {
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::unordered_set<std::string> created;
+            std::exception_ptr error;
+
+            void mark_created(const std::string& rel_path) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    created.insert(rel_path);
+                }
+                cv.notify_all();
+            }
+
+            void fail(std::exception_ptr failure) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (!error) {
+                        error = failure;
+                    }
+                }
+                cv.notify_all();
+            }
+
+            void wait_created(const std::string& rel_path) {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] {
+                    return error || created.find(rel_path) != created.end();
+                });
+                if (error) {
+                    std::rethrow_exception(error);
+                }
+            }
+        };
+        PrecreatedFileRegistry precreated_files;
+
+        const auto create_buffer_files = [&](TargetWriterBackend& backend, const BufferHandle& handle) {
+            const DataBuffer& buffer = data_buffer(data_pool, handle);
+            std::vector<FileSpec> files;
+            if (is_packed_small_file_buffer(buffer)) {
+                files.reserve(packed_small_file_count(buffer));
+                const bool ok = visit_packed_small_files(buffer, [&](PackedSmallFileView view) {
+                    FileSpec file;
+                    file.rel_path = std::string(view.rel_path);
+                    file.declared_size = view.file_size;
+                    file.mtime = view.mtime;
+                    file.mode = view.mode != 0U ? view.mode : 0644U;
+                    file.uid = view.uid;
+                    file.gid = view.gid;
+                    files.push_back(std::move(file));
+                });
+                if (!ok) {
+                    throw std::runtime_error("copy-target precreation received malformed packed-small-file buffer");
+                }
+                backend.create_files(files);
+                return;
+            }
+
+            FileSpec file = file_spec_from_data_trailer(buffer.trailer);
+            if (file.rel_path.empty()) {
+                throw std::runtime_error("copy-target precreation received a regular data buffer without a relative path");
+            }
+            const std::string rel_path = file.rel_path;
+            if (buffer.trailer.data_offset == 0U) {
+                files.push_back(std::move(file));
+                backend.create_files(files);
+                precreated_files.mark_created(rel_path);
+            } else {
+                precreated_files.wait_created(rel_path);
+            }
+        };
+
+        const auto route_created_buffer = [&](const BufferHandle& handle) {
+            const DataBuffer& buffer = data_buffer(data_pool, handle);
+            if (is_packed_small_file_buffer(buffer)) {
+                const std::uint64_t fallback_key = buffer.trailer.folder_hash != 0U
+                                                       ? buffer.trailer.folder_hash
+                                                       : (buffer.trailer.file_id != 0U
+                                                              ? buffer.trailer.file_id
+                                                              : static_cast<std::uint64_t>(handle.index));
+                const std::uint64_t key = packed_small_parent_locality_hash(buffer, fallback_key);
+                if (push_sharded(small_queue, static_cast<std::size_t>(key % small_threads), handle)) {
+                    small_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
+                    return true;
+                }
+                return false;
+            }
+
+            const std::uint64_t file_size = buffer.trailer.file_size;
+            const std::uint64_t key = buffer.trailer.file_id != 0U
+                                          ? buffer.trailer.file_id
+                                          : hash64(buffer.trailer.rel_path.view());
+            if (file_size < 1024U * 1024U) {
+                if (try_push_or_spill(medium_queue,
+                                      medium_spillway,
+                                      static_cast<std::size_t>(key % medium_threads),
+                                      handle)) {
+                    medium_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
+                    return true;
+                }
+                return false;
+            }
+            if (try_push_or_spill(large_queue,
+                                  large_spillway,
+                                  static_cast<std::size_t>(key % large_threads),
+                                  handle)) {
+                large_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
+                return true;
+            }
+            return false;
+        };
+
         TargetDataWriterJob small_writer(small_writer_config, data_pool, small_queue);
         TargetDataWriterJob medium_writer(medium_writer_config, data_pool, medium_queue);
         TargetDataWriterJob large_writer(large_writer_config, data_pool, large_queue);
@@ -16752,6 +16884,55 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                        large_threads,
                                        std::string_view("large"));
 
+        std::vector<std::thread> file_creators;
+        file_creators.reserve(file_create_threads);
+        if (precreate_target_files) {
+            for (std::size_t creator_index = 0; creator_index < file_create_threads; ++creator_index) {
+                file_creators.emplace_back([&, creator_index]() {
+#if defined(__linux__)
+                    const unsigned int hardware_cpus = std::thread::hardware_concurrency();
+                    if (hardware_cpus != 0U) {
+                        cpu_set_t set;
+                        CPU_ZERO(&set);
+                        CPU_SET(static_cast<int>((8U + (creator_index % 8U)) % hardware_cpus), &set);
+                        (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+                    }
+#endif
+                    TargetWriterBackend::Options create_options;
+                    create_options.preserve_metadata = false;
+                    create_options.fsync_on_finish = false;
+                    create_options.ensure_parent_directories = false;
+                    create_options.max_concurrent_file_transactions =
+                        std::max<std::size_t>(1U, base_writer_config.max_concurrent_file_transactions);
+                    auto create_backend = make_target_writer_backend(target_root, creator_index, create_options);
+
+                    BufferHandle handle;
+                    try {
+                        while (!classifier_failed.load(std::memory_order_acquire) &&
+                               file_create_queue.pop_wait(creator_index, handle)) {
+                            bool transferred = false;
+                            try {
+                                create_buffer_files(*create_backend, handle);
+                                transferred = route_created_buffer(handle);
+                                classifier_buffers.fetch_add(1U, std::memory_order_relaxed);
+                                if (!transferred) {
+                                    data_pool.release(handle);
+                                }
+                            } catch (...) {
+                                if (!transferred) {
+                                    data_pool.release(handle);
+                                }
+                                throw;
+                            }
+                        }
+                    } catch (...) {
+                        precreated_files.fail(std::current_exception());
+                        remember_classifier_error(std::current_exception());
+                    }
+                });
+            }
+        }
+
         std::vector<std::thread> classifiers;
         classifiers.reserve(lanes);
         for (std::size_t lane_index = 0; lane_index < lanes; ++lane_index) {
@@ -16772,43 +16953,24 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                         try {
                             ensure_buffer_directories(*folder_backend, handle);
                             const DataBuffer& buffer = data_buffer(data_pool, handle);
-                            if (is_packed_small_file_buffer(buffer)) {
-                                const std::uint64_t fallback_key = buffer.trailer.folder_hash != 0U
-                                                                       ? buffer.trailer.folder_hash
-                                                                       : (buffer.trailer.file_id != 0U
-                                                                              ? buffer.trailer.file_id
-                                                                              : static_cast<std::uint64_t>(handle.index));
-                                const std::uint64_t key = packed_small_parent_locality_hash(buffer, fallback_key);
-                                transferred = push_sharded(small_queue,
-                                                           static_cast<std::size_t>(key % small_threads),
-                                                           handle);
-                                if (transferred) {
-                                    small_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
-                                }
+                            const std::uint64_t key = is_packed_small_file_buffer(buffer)
+                                                          ? packed_small_parent_locality_hash(
+                                                                buffer,
+                                                                buffer.trailer.folder_hash != 0U
+                                                                    ? buffer.trailer.folder_hash
+                                                                    : static_cast<std::uint64_t>(handle.index))
+                                                          : (buffer.trailer.file_id != 0U
+                                                                 ? buffer.trailer.file_id
+                                                                 : hash64(buffer.trailer.rel_path.view()));
+                            if (precreate_target_files) {
+                                transferred = file_create_queue.push_wait(
+                                    static_cast<std::size_t>(key % file_create_threads), handle);
                             } else {
-                                const std::uint64_t file_size = buffer.trailer.file_size;
-                                const std::uint64_t key = buffer.trailer.file_id != 0U
-                                                              ? buffer.trailer.file_id
-                                                              : hash64(buffer.trailer.rel_path.view());
-                                if (file_size < 1024U * 1024U) {
-                                    transferred = try_push_or_spill(medium_queue,
-                                                                    medium_spillway,
-                                                                    static_cast<std::size_t>(key % medium_threads),
-                                                                    handle);
-                                    if (transferred) {
-                                        medium_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
-                                    }
-                                } else {
-                                    transferred = try_push_or_spill(large_queue,
-                                                                    large_spillway,
-                                                                    static_cast<std::size_t>(key % large_threads),
-                                                                    handle);
-                                    if (transferred) {
-                                        large_buffers_routed.fetch_add(1U, std::memory_order_relaxed);
-                                    }
+                                transferred = route_created_buffer(handle);
+                                if (transferred) {
+                                    classifier_buffers.fetch_add(1U, std::memory_order_relaxed);
                                 }
                             }
-                            classifier_buffers.fetch_add(1U, std::memory_order_relaxed);
                             if (!transferred) {
                                 data_pool.release(handle);
                             }
@@ -16831,6 +16993,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         std::thread telemetry_thread([&]() {
             using namespace std::chrono_literals;
             const auto rx_capacity = static_cast<std::int64_t>(lanes * lane_queue_depth);
+            const auto create_capacity = static_cast<std::int64_t>(file_create_queue.capacity());
             const auto small_capacity = static_cast<std::int64_t>(small_queue.capacity());
             const auto medium_capacity = static_cast<std::int64_t>(medium_queue.capacity());
             const auto large_capacity = static_cast<std::int64_t>(large_queue.capacity());
@@ -16845,7 +17008,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                         : static_cast<double>(telemetry.mkdir_wait_ns.load(std::memory_order_relaxed)) /
                               static_cast<double>(mkdir_ack) / 1'000'000.0;
                 std::fprintf(stdout,
-                             "[T+%.1fs] RX_Q: [%lld/%lld] | MKDIR_Q: [%lld] (LAG: %llu issued=%llu ack=%llu avg_ms=%.3f) | SMALL_WR_Q: [%lld/%lld routed=%llu] | MED_SPILL: [%lld] | LRG_SPILL: [%lld] | MED_Q: [%lld/%lld] | LRG_Q: [%lld/%lld] | CLASSIFIED: %llu\n",
+                             "[T+%.1fs] RX_Q: [%lld/%lld] | MKDIR_Q: [%lld] (LAG: %llu issued=%llu ack=%llu avg_ms=%.3f) | CREATE_Q: [%lld/%lld] | SMALL_WR_Q: [%lld/%lld routed=%llu] | MED_SPILL: [%lld] | LRG_SPILL: [%lld] | MED_Q: [%lld/%lld] | LRG_Q: [%lld/%lld] | CLASSIFIED: %llu\n",
                              elapsed_since_start(),
                              static_cast<long long>(telemetry.rx_queue_depth.load(std::memory_order_relaxed)),
                              static_cast<long long>(rx_capacity),
@@ -16854,6 +17017,8 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                              static_cast<unsigned long long>(mkdir_issued),
                              static_cast<unsigned long long>(mkdir_ack),
                              mkdir_avg_ms,
+                             static_cast<long long>(telemetry.file_create_queue_depth.load(std::memory_order_relaxed)),
+                             static_cast<long long>(create_capacity),
                              static_cast<long long>(telemetry.small_write_queue_depth.load(std::memory_order_relaxed)),
                              static_cast<long long>(small_capacity),
                              static_cast<unsigned long long>(small_buffers_routed.load(std::memory_order_relaxed)),
@@ -16882,6 +17047,12 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                   << std::endl;
         for (auto& classifier : classifiers) {
             classifier.join();
+        }
+        file_create_queue.close();
+        for (auto& creator : file_creators) {
+            if (creator.joinable()) {
+                creator.join();
+            }
         }
         mark_target_buffer_spillway_input_done(medium_spillway);
         mark_target_buffer_spillway_input_done(large_spillway);
@@ -16932,11 +17103,19 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
         report.bytes_per_second =
             report.elapsed_seconds > 0.0 ? static_cast<double>(report.bytes_transferred) / report.elapsed_seconds
                                          : 0.0;
-        report.pipeline_description =
+        std::string prefix_pipeline =
             "[BufferReceiver-1 x" + std::to_string(lanes) +
             "]->(RecvDataBufQueue-" + std::to_string(lane_queue_depth) +
             " x" + std::to_string(lanes) + ")->[ReadyClassifier-NFS-1 x" +
-            std::to_string(lanes) + "]->(SmallReadyFileQueue-" +
+            std::to_string(lanes) + "]";
+        if (precreate_target_files) {
+            prefix_pipeline +=
+                "->(TargetFileCreateQueue-" + std::to_string(file_create_queue_depth_per_shard) +
+                " x" + std::to_string(file_create_threads) + ")->[TargetFileCreation-NFS-" +
+                std::to_string(file_create_threads) + "]";
+        }
+        report.pipeline_description =
+            prefix_pipeline + "->(SmallReadyFileQueue-" +
             std::to_string(small_queue_depth_per_shard) + " x" + std::to_string(small_threads) +
             " parent-hash)->[DataWriter-NFS/reactors=" +
             std::to_string(base_writer_config.reactor_count) + " window=" +

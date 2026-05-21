@@ -556,6 +556,7 @@ void TargetDataWriterJob::run_worker(std::size_t worker_index) {
     options.stable_small_file_writes = config_.stable_small_file_writes;
     options.tcp_cork_small_file_writes = config_.tcp_cork_small_file_writes;
     options.direct_reactor_lane = config_.direct_reactor_writes && is_nfs_url(config_.target_root);
+    options.assume_precreated_files = config_.assume_precreated_files;
     options.reactors_per_ip = std::max<std::size_t>(1U, config_.reactors_per_ip);
     options.reactor_count = config_.reactor_count;
     options.max_concurrent_file_transactions = config_.max_concurrent_file_transactions;

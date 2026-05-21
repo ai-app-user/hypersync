@@ -2029,3 +2029,22 @@ logical size: 335.99 TB
   - The explicit unstable-write and async-commit implementation is functionally valid for the deterministic dataset: all files were written and verified.
   - The target writer tail did not collapse. Throughput stayed in the same band as the earlier `48`-large-writer run (`29.51 -> 31.17 Gbit/s`), and queues remained shallow.
   - The remaining limiter is still inside the NFS writer/commit/close path or storage-side acknowledgement behavior, not target RX, classification, staging queues, or large/medium spillway pressure.
+
+## 2026-05-21 - Experimental Target File Precreation Gate
+
+- Implemented an opt-in `copy-target --target-precreate-files` mode to test distributed metadata creation decoupling without regressing the default copy path.
+  - New experimental pipeline shape:
+    `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(TargetFileCreateQueue-16384 x16)->[TargetFileCreation-NFS-16]->(SmallReadyFileQueue-16384 x16 parent-hash)->[DataWriter-NFS/reactors=64 window=64 batch=16]+(MediumReadyBufQueue-16384 x64)->[DataWriter-NFS-64]+(LargeReadyBufQueue-16384 x48)->[DataWriter-NFS-48 batch=8]`.
+  - `TargetFileCreation-NFS-16` creates/truncates placeholders before buffers reach the data writer queues.
+  - `DataWriter-NFS` can run in `assume_precreated_files` mode, replacing writer-side `nfs_create_async` with `nfs_open_async(O_WRONLY)`.
+  - The default `copy-target` path does not enable this mode because the first benchmark regressed.
+- Deterministic `copy-mix-v1` precreation run:
+  - Source result: `50,100` files, `110.75 GB`, `105,783` buffers, `4.650s`, `190.56 Gbit/s`.
+  - Target result: `50,100` files verified, `110.75 GB`, `105,783` buffers, `33.826s`, `26.19 Gbit/s`.
+  - Target telemetry log: `/tmp/hypersync-precreate-20260521T201359Z/target.out` on agnopo.
+  - Target lifecycle: receivers done `33.52s`, classifiers/precreators done `33.53s`, writers done `33.83s`.
+  - Queue highs: `RX_Q=80`, `CREATE_Q=47`, `SMALL_WR_Q=4`, `MED_SPILL=0`, `LRG_SPILL=0`, `MED_Q=0`, `LRG_Q=679`, `CLASSIFIED=105783`.
+- Conclusion:
+  - The gate is functionally correct and all files verified, but it was slower than the previous default path (`31.17 -> 26.19 Gbit/s`).
+  - Decoupling by create-then-open added an extra handle round trip: `CREATE+CLOSE` in the precreation lane followed by `OPEN+WRITE+COMMIT+CLOSE` in the writer lane.
+  - The low `CREATE_Q` and writer queue depths show there was no queue saturation; the cost is protocol lifecycle overhead. A future version would need to pass the created raw file handle/token into the writer reactors to avoid the extra `OPEN` before this design can beat the integrated create/write reactor path.

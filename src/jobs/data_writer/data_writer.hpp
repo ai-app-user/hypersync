@@ -73,6 +73,7 @@ struct TargetDataWriterConfig {
     bool tcp_cork_small_file_writes = false;
     bool direct_reactor_writes = false;
     bool direct_reactor_submit = false;
+    bool assume_precreated_files = false;
     std::size_t reactors_per_ip = 1;
     std::size_t reactor_count = 0;
     std::size_t max_concurrent_file_transactions = 64;
