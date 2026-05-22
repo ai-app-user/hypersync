@@ -17796,7 +17796,7 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                                                        data_buffer_slots_per_lane == 0U
                                                            ? lane_queue_depth * 2U + 2U
                                                            : data_buffer_slots_per_lane);
-    if (ensure_target_directories && is_nfs_url(target_root) && !shared_nothing) {
+    if (ensure_target_directories && !shared_nothing) {
         const std::size_t receiver_pool_slots =
             std::max<std::size_t>(lanes * (data_buffer_slots_per_lane + 2U),
                                   lanes * lane_queue_depth + 8192U);

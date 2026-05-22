@@ -2226,3 +2226,4 @@ logical size: 335.99 TB
 - Local release build passed after the change.
 - Linux/libnfs package build passed:
   - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-governor-20260521T002804Z`.
+- Follow-up: the integrated copy-target governor is now enabled for mounted target paths as well as direct NFS URLs, so transfer tests can avoid `172.x` transport/NFS URL arguments and still exercise the classifier/spillway/work-stealing target engine.
