@@ -2230,3 +2230,26 @@ logical size: 335.99 TB
 - Follow-up: copy-target writer-drain shutdown now joins telemetry before rethrowing writer errors, preventing `std::terminate` from masking real target-side drain failures during public-address mounted-path tests.
 - Follow-up: writer and NFS data-reader destructors now suppress stop-time exceptions. Explicit `wait()` still reports worker errors, but cleanup no longer masks them as destructor-triggered `std::terminate`.
 - Follow-up: copy-target writer error handling now treats stop requests as best-effort/no-throw so telemetry is joined before propagating the real writer drain error.
+
+## 2026-05-22 - Direct 16-IP NFS Source and Target Copy Probe
+
+- Confirmed the corrected deployment model for the production copy probe:
+  - Source host: `ubuntu@216.86.168.191` (`transfer1`).
+  - Target host: `ubuntu@160.211.81.199` (`agnopo`).
+  - Source NFS: `nfs://172.27.255.18-33/volumes/e27faf8c-36a5-4571-8324-4c38a5dce0a5/HaWoR`.
+  - Target NFS: `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/<run-id>`.
+- Direct target NFS rejects ownership preservation during writer shutdown:
+  - Error exposed after shutdown hardening: `nfs_chown_async failed: NFS: SETATTR failed with NFS3ERR_PERM(-1)`.
+  - Use `copy-target --no-preserve-target-metadata` for performance probes against this export unless ownership privileges are explicitly available.
+- Run `hypersync-libnfs-nopreserve-20260522T053308Z` used the direct 16-IP NFS URLs on both sides and completed with zero file write failures.
+- Source pipeline:
+  - `[MetaReader-NFS-8]->(FileQueue)->[DataReader-NFS-64]->(DataBufQueue-4096 x8)->[BufferStreamSender-1 x8]`.
+  - Result: `13,694` files found, `11,783` files read, `68.57 GB`, `68,142` buffers sent, `20.82s`, `26.34 Gbit/s`.
+  - Early active read/send intervals reached about `53-54 Gbit/s`; the final average includes scan/tail time and a permission-skipped source folder.
+- Target pipeline:
+  - `[BufferReceiver-1 x8]->(RecvDataBufQueue-4096 x8)->[ReadyClassifier-NFS-1 x8]->(SmallReadyFileQueue-4096 x64 parent-hash)->[DataWriter-NFS/reactors=64 window=64 batch=128]+(MediumReadyBufQueue-16384 x64)->[DataWriter-NFS-64 steal=SMALL,LRG]+(LargeReadyBufQueue-16384 x48)->[DataWriter-NFS-48 batch=16 steal=MED,SMALL governor=on]`.
+  - Result: `11,783` files written, `0` failed, `68.57 GB`, `68,142` buffers received, `35.23s`, `15.57 Gbit/s`.
+  - Telemetry stayed fluid: `RX_Q` mostly `0`, no medium/large spillway buildup, writer queues drained cleanly, and MKDIR average settled near `0.05 ms`.
+- Interpretation:
+  - Correctness and queue decoupling are good in the direct 16-IP run.
+  - The current production path is still far below the `~152 Gbit/s` shared-nothing transport ceiling and below the `~200 Gbit/s` target, so the next bottleneck is in the real NFS read/write lifecycle and dataset phase behavior, not TCP queue ingestion.
