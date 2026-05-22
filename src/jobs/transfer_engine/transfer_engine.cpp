@@ -18266,58 +18266,66 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                   << std::endl;
 
         std::thread telemetry_thread([&]() {
-            using namespace std::chrono_literals;
-            const auto rx_capacity = static_cast<std::int64_t>(lanes * lane_queue_depth);
-            const auto create_capacity = static_cast<std::int64_t>(file_create_queue.capacity());
-            const auto small_capacity = static_cast<std::int64_t>(small_queue.capacity());
-            const auto medium_capacity = static_cast<std::int64_t>(medium_queue.capacity());
-            const auto large_capacity = static_cast<std::int64_t>(large_queue.capacity());
-            while (!telemetry_done.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(200ms);
-                const auto mkdir_issued = telemetry.mkdir_requests_issued.load(std::memory_order_relaxed);
-                const auto mkdir_ack = telemetry.mkdir_completions_ack.load(std::memory_order_relaxed);
-                const auto mkdir_lag = mkdir_issued >= mkdir_ack ? mkdir_issued - mkdir_ack : 0U;
-                const double mkdir_avg_ms =
-                    mkdir_ack == 0U
-                        ? 0.0
-                        : static_cast<double>(telemetry.mkdir_wait_ns.load(std::memory_order_relaxed)) /
-                              static_cast<double>(mkdir_ack) / 1'000'000.0;
-                const TargetWriterStats small_snapshot = small_writer.stats();
-                const TargetWriterStats medium_snapshot = medium_writer.stats();
-                const TargetWriterStats large_snapshot = large_writer.stats();
-                const std::uint64_t total_bytes_written =
-                    small_snapshot.bytes_written + medium_snapshot.bytes_written + large_snapshot.bytes_written;
-                const double elapsed = elapsed_since_start();
-                const double sustained_gbit_s =
-                    elapsed > 0.0 ? static_cast<double>(total_bytes_written) * 8.0 / elapsed / 1'000'000'000.0 : 0.0;
-                std::fprintf(stdout,
-                             "[T+%.1fs] RX_Q: [%lld/%lld] | MKDIR_Q: [%lld] (LAG: %llu issued=%llu ack=%llu avg_ms=%.3f) | CREATE_Q: [%lld/%lld] | SMALL_Q: [%lld/%lld routed=%llu] | MED_Q: [%lld/%lld] | LRG_Q: [%lld/%lld] | MED_SPILL: [%lld] | LRG_SPILL: [%lld] | STEAL_OPS: [LRG_TO_MED=%llu,LRG_TO_SMALL=%llu,MED_TO_SMALL=%llu,MED_TO_LRG=%llu] | SUSTAINED: %.2f Gbit/s | CLASSIFIED: %llu\n",
-                             elapsed,
-                             static_cast<long long>(telemetry.rx_queue_depth.load(std::memory_order_relaxed)),
-                             static_cast<long long>(rx_capacity),
-                             static_cast<long long>(telemetry.mkdir_queue_depth.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(mkdir_lag),
-                             static_cast<unsigned long long>(mkdir_issued),
-                             static_cast<unsigned long long>(mkdir_ack),
-                             mkdir_avg_ms,
-                             static_cast<long long>(telemetry.file_create_queue_depth.load(std::memory_order_relaxed)),
-                             static_cast<long long>(create_capacity),
-                             static_cast<long long>(telemetry.small_write_queue_depth.load(std::memory_order_relaxed)),
-                             static_cast<long long>(small_capacity),
-                             static_cast<unsigned long long>(small_buffers_routed.load(std::memory_order_relaxed)),
-                             static_cast<long long>(telemetry.medium_write_queue_depth.load(std::memory_order_relaxed)),
-                             static_cast<long long>(medium_capacity),
-                             static_cast<long long>(telemetry.large_write_queue_depth.load(std::memory_order_relaxed)),
-                             static_cast<long long>(large_capacity),
-                             static_cast<long long>(telemetry.medium_spillway_size.load(std::memory_order_relaxed)),
-                             static_cast<long long>(telemetry.large_spillway_size.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(telemetry.large_to_medium_steals.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(telemetry.large_to_small_steals.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(telemetry.medium_to_small_steals.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(telemetry.medium_to_large_steals.load(std::memory_order_relaxed)),
-                             sustained_gbit_s,
-                             static_cast<unsigned long long>(classifier_buffers.load(std::memory_order_relaxed)));
-                std::fflush(stdout);
+            try {
+                using namespace std::chrono_literals;
+                const auto rx_capacity = static_cast<std::int64_t>(lanes * lane_queue_depth);
+                const auto create_capacity = static_cast<std::int64_t>(file_create_queue.capacity());
+                const auto small_capacity = static_cast<std::int64_t>(small_queue.capacity());
+                const auto medium_capacity = static_cast<std::int64_t>(medium_queue.capacity());
+                const auto large_capacity = static_cast<std::int64_t>(large_queue.capacity());
+                while (!telemetry_done.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(200ms);
+                    const auto mkdir_issued = telemetry.mkdir_requests_issued.load(std::memory_order_relaxed);
+                    const auto mkdir_ack = telemetry.mkdir_completions_ack.load(std::memory_order_relaxed);
+                    const auto mkdir_lag = mkdir_issued >= mkdir_ack ? mkdir_issued - mkdir_ack : 0U;
+                    const double mkdir_avg_ms =
+                        mkdir_ack == 0U
+                            ? 0.0
+                            : static_cast<double>(telemetry.mkdir_wait_ns.load(std::memory_order_relaxed)) /
+                                  static_cast<double>(mkdir_ack) / 1'000'000.0;
+                    const TargetWriterStats small_snapshot = small_writer.stats();
+                    const TargetWriterStats medium_snapshot = medium_writer.stats();
+                    const TargetWriterStats large_snapshot = large_writer.stats();
+                    const std::uint64_t total_bytes_written =
+                        small_snapshot.bytes_written + medium_snapshot.bytes_written + large_snapshot.bytes_written;
+                    const double elapsed = elapsed_since_start();
+                    const double sustained_gbit_s =
+                        elapsed > 0.0 ? static_cast<double>(total_bytes_written) * 8.0 / elapsed / 1'000'000'000.0 : 0.0;
+                    std::fprintf(stdout,
+                                 "[T+%.1fs] RX_Q: [%lld/%lld] | MKDIR_Q: [%lld] (LAG: %llu issued=%llu ack=%llu avg_ms=%.3f) | CREATE_Q: [%lld/%lld] | SMALL_Q: [%lld/%lld routed=%llu] | MED_Q: [%lld/%lld] | LRG_Q: [%lld/%lld] | MED_SPILL: [%lld] | LRG_SPILL: [%lld] | STEAL_OPS: [LRG_TO_MED=%llu,LRG_TO_SMALL=%llu,MED_TO_SMALL=%llu,MED_TO_LRG=%llu] | SUSTAINED: %.2f Gbit/s | CLASSIFIED: %llu\n",
+                                 elapsed,
+                                 static_cast<long long>(telemetry.rx_queue_depth.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(rx_capacity),
+                                 static_cast<long long>(telemetry.mkdir_queue_depth.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(mkdir_lag),
+                                 static_cast<unsigned long long>(mkdir_issued),
+                                 static_cast<unsigned long long>(mkdir_ack),
+                                 mkdir_avg_ms,
+                                 static_cast<long long>(telemetry.file_create_queue_depth.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(create_capacity),
+                                 static_cast<long long>(telemetry.small_write_queue_depth.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(small_capacity),
+                                 static_cast<unsigned long long>(small_buffers_routed.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(telemetry.medium_write_queue_depth.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(medium_capacity),
+                                 static_cast<long long>(telemetry.large_write_queue_depth.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(large_capacity),
+                                 static_cast<long long>(telemetry.medium_spillway_size.load(std::memory_order_relaxed)),
+                                 static_cast<long long>(telemetry.large_spillway_size.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(telemetry.large_to_medium_steals.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(telemetry.large_to_small_steals.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(telemetry.medium_to_small_steals.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(telemetry.medium_to_large_steals.load(std::memory_order_relaxed)),
+                                 sustained_gbit_s,
+                                 static_cast<unsigned long long>(classifier_buffers.load(std::memory_order_relaxed)));
+                    std::fflush(stdout);
+                }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "copy_target_telemetry_error error=%s\n", error.what());
+                std::fflush(stderr);
+            } catch (...) {
+                std::fprintf(stderr, "copy_target_telemetry_error error=unknown\n");
+                std::fflush(stderr);
             }
         });
         const auto stop_telemetry = [&]() {
@@ -18381,19 +18389,31 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             } catch (...) {
             }
         };
+        std::cerr << "copy_target_wait_writer name=small elapsed_s=" << elapsed_since_start() << std::endl;
         try {
             small_writer.wait();
+            std::cerr << "copy_target_wait_writer_done name=small elapsed_s=" << elapsed_since_start() << std::endl;
         } catch (...) {
+            std::cerr << "copy_target_wait_writer_error name=small error=" << current_exception_message()
+                      << " elapsed_s=" << elapsed_since_start() << std::endl;
             remember_writer_error(std::current_exception());
         }
+        std::cerr << "copy_target_wait_writer name=medium elapsed_s=" << elapsed_since_start() << std::endl;
         try {
             medium_writer.wait();
+            std::cerr << "copy_target_wait_writer_done name=medium elapsed_s=" << elapsed_since_start() << std::endl;
         } catch (...) {
+            std::cerr << "copy_target_wait_writer_error name=medium error=" << current_exception_message()
+                      << " elapsed_s=" << elapsed_since_start() << std::endl;
             remember_writer_error(std::current_exception());
         }
+        std::cerr << "copy_target_wait_writer name=large elapsed_s=" << elapsed_since_start() << std::endl;
         try {
             large_writer.wait();
+            std::cerr << "copy_target_wait_writer_done name=large elapsed_s=" << elapsed_since_start() << std::endl;
         } catch (...) {
+            std::cerr << "copy_target_wait_writer_error name=large error=" << current_exception_message()
+                      << " elapsed_s=" << elapsed_since_start() << std::endl;
             remember_writer_error(std::current_exception());
         }
         stop_telemetry();
