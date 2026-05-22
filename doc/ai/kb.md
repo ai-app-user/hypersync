@@ -2228,3 +2228,4 @@ logical size: 335.99 TB
   - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-governor-20260521T002804Z`.
 - Follow-up: the integrated copy-target governor is now enabled for mounted target paths as well as direct NFS URLs, so transfer tests can avoid `172.x` transport/NFS URL arguments and still exercise the classifier/spillway/work-stealing target engine.
 - Follow-up: copy-target writer-drain shutdown now joins telemetry before rethrowing writer errors, preventing `std::terminate` from masking real target-side drain failures during public-address mounted-path tests.
+- Follow-up: writer and NFS data-reader destructors now suppress stop-time exceptions. Explicit `wait()` still reports worker errors, but cleanup no longer masks them as destructor-triggered `std::terminate`.

@@ -321,7 +321,10 @@ TargetMetaWriterJob::TargetMetaWriterJob(TargetMetaWriterConfig config,
 }
 
 TargetMetaWriterJob::~TargetMetaWriterJob() {
-    stop();
+    try {
+        stop();
+    } catch (...) {
+    }
 }
 
 TargetWriterStats TargetMetaWriterJob::stats() const {
@@ -535,7 +538,10 @@ TargetDataWriterJob::TargetDataWriterJob(TargetDataWriterConfig config,
 }
 
 TargetDataWriterJob::~TargetDataWriterJob() {
-    stop();
+    try {
+        stop();
+    } catch (...) {
+    }
 }
 
 void TargetDataWriterJob::set_secondary_input(ShardedBufQueue& input, std::atomic<std::uint64_t>* counter) {

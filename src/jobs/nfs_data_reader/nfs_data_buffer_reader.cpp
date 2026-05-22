@@ -90,7 +90,10 @@ NfsDataBufferReaderJob::NfsDataBufferReaderJob(NfsDataReaderConfig config,
 }
 
 NfsDataBufferReaderJob::~NfsDataBufferReaderJob() {
-    stop();
+    try {
+        stop();
+    } catch (...) {
+    }
 }
 
 void NfsDataBufferReaderJob::set_bytes_read_callback(BytesReadCallback callback) {
