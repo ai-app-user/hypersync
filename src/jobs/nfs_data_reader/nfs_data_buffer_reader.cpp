@@ -105,6 +105,10 @@ void NfsDataBufferReaderJob::set_file_failed_callback(FileFailedCallback callbac
     file_failed_callback_ = std::move(callback);
 }
 
+void NfsDataBufferReaderJob::set_interleave_file_provider(InterleaveFileProvider provider) {
+    interleave_file_provider_ = std::move(provider);
+}
+
 NfsDataBufferReaderStats NfsDataBufferReaderJob::stats() const {
     NfsDataBufferReaderStats snapshot;
     snapshot.running = running();
@@ -223,7 +227,7 @@ void NfsDataBufferReaderJob::run_worker(std::size_t worker_index) {
                 }
                 record_files_failed(window_stats.files_failed);
             } else {
-                publish_file_chunks(reader, *file, worker_index);
+                publish_file_chunks(reader, *file, worker_index, &carried_file);
                 record_file_read();
             }
         } catch (const NfsDataReaderStopped&) {
@@ -254,7 +258,8 @@ void NfsDataBufferReaderJob::on_all_workers_finished() {
 
 void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
                                                  const FileSpec& file,
-                                                 std::size_t worker_index) {
+                                                 std::size_t worker_index,
+                                                 std::optional<FileSpec>* carried_file) {
     const RecBuf record = make_recbuf(file);
     const std::uint64_t logical_size = file_logical_size(file);
 
@@ -271,12 +276,43 @@ void NfsDataBufferReaderJob::publish_file_chunks(NfsDataReader& reader,
                                               throw NfsDataReaderStopped {};
                                           }
                                           record_bytes_read(bytes_read);
+                                          if (logical_size > config_.small_file_threshold && carried_file != nullptr) {
+                                              publish_interleaved_small_files(reader, worker_index, carried_file);
+                                          }
                                       },
                                       [this]() {
                                           return should_stop_now();
                                       });
     if (should_stop_now() && bytes_streamed < logical_size) {
         throw NfsDataReaderStopped {};
+    }
+}
+
+void NfsDataBufferReaderJob::publish_file_chunks_no_interleave(NfsDataReader& reader,
+                                                               const FileSpec& file,
+                                                               std::size_t worker_index) {
+    publish_file_chunks(reader, file, worker_index, nullptr);
+}
+
+void NfsDataBufferReaderJob::publish_interleaved_small_files(NfsDataReader& reader,
+                                                             std::size_t worker_index,
+                                                             std::optional<FileSpec>* carried_file) {
+    if (carried_file == nullptr || carried_file->has_value() || !config_.copy_data_from_nfs ||
+        !interleave_file_provider_) {
+        return;
+    }
+    static constexpr std::size_t kMaxInterleavedSmallFiles = 32U;
+    for (std::size_t count = 0; count < kMaxInterleavedSmallFiles && !should_stop_now(); ++count) {
+        std::optional<FileSpec> next_file = interleave_file_provider_();
+        if (!next_file.has_value()) {
+            return;
+        }
+        if (file_logical_size(*next_file) > config_.small_file_threshold) {
+            *carried_file = std::move(*next_file);
+            return;
+        }
+        publish_file_chunks_no_interleave(reader, *next_file, worker_index);
+        record_file_read();
     }
 }
 

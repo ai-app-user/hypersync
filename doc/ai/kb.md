@@ -2201,3 +2201,26 @@ logical size: 335.99 TB
   - Source side packed the full dataset into `2` manifest frames and reported about `50.8K files/s` for the source scan/manifest/result path.
 - WAN note:
   - Bulk manifest source now uses a `250 ms` connect timeout, matching copy mode. The old `50 ms` distributed-diff connect timeout is too tight for the `transfer1 -> agnopo` path with `~65-70 ms` RTT.
+
+## 2026-05-21 - Dynamic Mixed-Workload Balancing Governor
+
+- Added the first runtime balancing governor pass for heterogeneous mixed copy workloads.
+- Sender-side shared-nothing copy changes:
+  - Large-file chunking is clamped to `1 MiB` in `copy-source --shared-nothing`.
+  - `NfsDataBufferReaderJob` now has a nonblocking interleave provider hook.
+  - After publishing a large-file chunk, a lane can opportunistically interleave up to `32` small files before returning to the large stream.
+- Target-side copy changes:
+  - `TargetDataWriterJob` can now use prioritized nonblocking secondary/tertiary sharded inputs.
+  - Medium writers: primary `MED_Q`, then steal `SMALL_Q`, then `LRG_Q`.
+  - Large writers: primary `LRG_Q`, then steal `MED_Q`, then `SMALL_Q`.
+  - Small writers remain primary-only on `SMALL_Q` to protect IOPS priority.
+  - Integrated NFS copy target defaults moved toward the mixed-governor profile:
+    - Small writer threads: `64`.
+    - Small async window: `128` unless explicitly overridden.
+    - Medium writer threads: `64`.
+    - Large writer threads: `48`.
+    - Large async batch/window: `16`.
+- Telemetry now prints queue depths, spillway depths, steal counters, and sustained write bandwidth:
+  - `STEAL_OPS: [LRG_TO_MED=...,LRG_TO_SMALL=...,MED_TO_SMALL=...,MED_TO_LRG=...]`
+  - `SUSTAINED: <gbit/s>`.
+- Local release build passed after the change.

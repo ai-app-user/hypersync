@@ -1,6 +1,7 @@
 #include "jobs/data_writer/data_writer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -537,6 +538,16 @@ TargetDataWriterJob::~TargetDataWriterJob() {
     stop();
 }
 
+void TargetDataWriterJob::set_secondary_input(ShardedBufQueue& input, std::atomic<std::uint64_t>* counter) {
+    secondary_input_ = &input;
+    secondary_steal_counter_ = counter;
+}
+
+void TargetDataWriterJob::set_tertiary_input(ShardedBufQueue& input, std::atomic<std::uint64_t>* counter) {
+    tertiary_input_ = &input;
+    tertiary_steal_counter_ = counter;
+}
+
 TargetWriterStats TargetDataWriterJob::stats() const {
     TargetWriterStats snapshot;
     snapshot.running = running();
@@ -545,6 +556,14 @@ TargetWriterStats TargetDataWriterJob::stats() const {
     snapshot.files_written = files_written_.load(std::memory_order_acquire);
     snapshot.files_failed = files_failed_.load(std::memory_order_acquire);
     snapshot.bytes_written = bytes_written_.load(std::memory_order_acquire);
+    return snapshot;
+}
+
+TargetDataWriterStealStats TargetDataWriterJob::steal_stats() const {
+    TargetDataWriterStealStats snapshot;
+    snapshot.primary_pops = primary_pops_.load(std::memory_order_acquire);
+    snapshot.secondary_pops = secondary_pops_.load(std::memory_order_acquire);
+    snapshot.tertiary_pops = tertiary_pops_.load(std::memory_order_acquire);
     return snapshot;
 }
 
@@ -636,28 +655,109 @@ void TargetDataWriterJob::on_stop_requested() {
 
 bool TargetDataWriterJob::pop_input(std::size_t worker_index, BufferHandle& handle) {
     if (input_ != nullptr) {
-        return wait_for_input(worker_index, *input_, handle);
+        const bool ok = wait_for_input(worker_index, *input_, handle);
+        if (ok) {
+            primary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        }
+        return ok;
     }
     if (sharded_input_ == nullptr) {
         return false;
     }
     const std::size_t shard = sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
     if (sharded_input_->shard(shard).try_pop(handle)) {
+        primary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    if (secondary_input_ != nullptr && try_pop_from(*secondary_input_, worker_index, handle)) {
+        secondary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        if (secondary_steal_counter_ != nullptr) {
+            secondary_steal_counter_->fetch_add(1U, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    if (tertiary_input_ != nullptr && try_pop_from(*tertiary_input_, worker_index, handle)) {
+        tertiary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        if (tertiary_steal_counter_ != nullptr) {
+            tertiary_steal_counter_->fetch_add(1U, std::memory_order_relaxed);
+        }
         return true;
     }
     auto wait_scope = runtime_state_scope(worker_index, RuntimeState::wait_input_empty);
-    return sharded_input_->shard(shard).pop_wait(handle);
+    if (secondary_input_ != nullptr || tertiary_input_ != nullptr) {
+        while (!stop_requested()) {
+            if (try_pop_from(*sharded_input_, worker_index, handle)) {
+                primary_pops_.fetch_add(1U, std::memory_order_relaxed);
+                return true;
+            }
+            if (secondary_input_ != nullptr && try_pop_from(*secondary_input_, worker_index, handle)) {
+                secondary_pops_.fetch_add(1U, std::memory_order_relaxed);
+                if (secondary_steal_counter_ != nullptr) {
+                    secondary_steal_counter_->fetch_add(1U, std::memory_order_relaxed);
+                }
+                return true;
+            }
+            if (tertiary_input_ != nullptr && try_pop_from(*tertiary_input_, worker_index, handle)) {
+                tertiary_pops_.fetch_add(1U, std::memory_order_relaxed);
+                if (tertiary_steal_counter_ != nullptr) {
+                    tertiary_steal_counter_->fetch_add(1U, std::memory_order_relaxed);
+                }
+                return true;
+            }
+            const bool primary_done = sharded_input_->closed() && sharded_input_->empty();
+            const bool secondary_done =
+                secondary_input_ == nullptr || (secondary_input_->closed() && secondary_input_->empty());
+            const bool tertiary_done =
+                tertiary_input_ == nullptr || (tertiary_input_->closed() && tertiary_input_->empty());
+            if (primary_done && secondary_done && tertiary_done) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        return false;
+    }
+    const bool ok = sharded_input_->shard(shard).pop_wait(handle);
+    if (ok) {
+        primary_pops_.fetch_add(1U, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 bool TargetDataWriterJob::try_pop_input(std::size_t worker_index, BufferHandle& handle) {
     if (input_ != nullptr) {
-        return input_->try_pop(handle);
+        const bool ok = input_->try_pop(handle);
+        if (ok) {
+            primary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        }
+        return ok;
     }
     if (sharded_input_ == nullptr) {
         return false;
     }
-    const std::size_t shard = sharded_input_->shard_count() == 0U ? 0U : worker_index % sharded_input_->shard_count();
-    return sharded_input_->try_pop(shard, handle);
+    if (try_pop_from(*sharded_input_, worker_index, handle)) {
+        primary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        return true;
+    }
+    if (secondary_input_ != nullptr && try_pop_from(*secondary_input_, worker_index, handle)) {
+        secondary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        if (secondary_steal_counter_ != nullptr) {
+            secondary_steal_counter_->fetch_add(1U, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    if (tertiary_input_ != nullptr && try_pop_from(*tertiary_input_, worker_index, handle)) {
+        tertiary_pops_.fetch_add(1U, std::memory_order_relaxed);
+        if (tertiary_steal_counter_ != nullptr) {
+            tertiary_steal_counter_->fetch_add(1U, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool TargetDataWriterJob::try_pop_from(ShardedBufQueue& input, std::size_t worker_index, BufferHandle& handle) {
+    const std::size_t shard = input.shard_count() == 0U ? 0U : worker_index % input.shard_count();
+    return input.try_pop(shard, handle);
 }
 
 void TargetDataWriterJob::process_buffer(TargetWriterBackend& backend, const BufferHandle& handle) {

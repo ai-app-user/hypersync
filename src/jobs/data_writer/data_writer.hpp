@@ -107,6 +107,12 @@ struct TargetWriterStats {
     std::uint64_t bytes_written = 0;
 };
 
+struct TargetDataWriterStealStats {
+    std::uint64_t primary_pops = 0;
+    std::uint64_t secondary_pops = 0;
+    std::uint64_t tertiary_pops = 0;
+};
+
 // Consumes data buffers, creates their parent directories through the selected
 // target backend, and forwards the original buffers unchanged to the writer
 // queue. This keeps copy-target directory creation out of the file write hot
@@ -179,7 +185,11 @@ public:
                         ShardedBufQueue& input);
     ~TargetDataWriterJob() override;
 
+    void set_secondary_input(ShardedBufQueue& input, std::atomic<std::uint64_t>* counter = nullptr);
+    void set_tertiary_input(ShardedBufQueue& input, std::atomic<std::uint64_t>* counter = nullptr);
+
     [[nodiscard]] TargetWriterStats stats() const;
+    [[nodiscard]] TargetDataWriterStealStats steal_stats() const;
 
 protected:
     void run_worker(std::size_t worker_index) override;
@@ -188,6 +198,7 @@ protected:
 private:
     [[nodiscard]] bool pop_input(std::size_t worker_index, BufferHandle& handle);
     [[nodiscard]] bool try_pop_input(std::size_t worker_index, BufferHandle& handle);
+    [[nodiscard]] bool try_pop_from(ShardedBufQueue& input, std::size_t worker_index, BufferHandle& handle);
     void process_buffer(TargetWriterBackend& backend, const BufferHandle& handle);
     void process_regular_batch(TargetWriterBackend& backend, const std::vector<BufferHandle>& handles);
     void process_packed_small_file_batch(TargetWriterBackend& backend, const std::vector<BufferHandle>& handles);
@@ -203,10 +214,17 @@ private:
     RawBufferPool& data_pool_;
     BufQueue* input_ = nullptr;
     ShardedBufQueue* sharded_input_ = nullptr;
+    ShardedBufQueue* secondary_input_ = nullptr;
+    ShardedBufQueue* tertiary_input_ = nullptr;
+    std::atomic<std::uint64_t>* secondary_steal_counter_ = nullptr;
+    std::atomic<std::uint64_t>* tertiary_steal_counter_ = nullptr;
     std::atomic<std::uint64_t> buffers_processed_ {0};
     std::atomic<std::uint64_t> files_written_ {0};
     std::atomic<std::uint64_t> files_failed_ {0};
     std::atomic<std::uint64_t> bytes_written_ {0};
+    std::atomic<std::uint64_t> primary_pops_ {0};
+    std::atomic<std::uint64_t> secondary_pops_ {0};
+    std::atomic<std::uint64_t> tertiary_pops_ {0};
 };
 
 }  // namespace hypersync

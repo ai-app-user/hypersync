@@ -38,6 +38,7 @@ public:
     using FileFailedCallback = std::function<void(const FileSpec&)>;
     using BufferConsumer = std::function<bool(std::size_t worker_index, const BufferHandle& handle)>;
     using StopPredicate = std::function<bool()>;
+    using InterleaveFileProvider = std::function<std::optional<FileSpec>()>;
 
     NfsDataBufferReaderJob(NfsDataReaderConfig config,
                            RawBufferPool& data_pool,
@@ -59,6 +60,7 @@ public:
     void set_bytes_read_callback(BytesReadCallback callback);
     void set_file_read_callback(FileReadCallback callback);
     void set_file_failed_callback(FileFailedCallback callback);
+    void set_interleave_file_provider(InterleaveFileProvider provider);
 
     [[nodiscard]] NfsDataBufferReaderStats stats() const;
 
@@ -68,7 +70,14 @@ protected:
     void on_all_workers_finished() override;
 
 private:
-    void publish_file_chunks(NfsDataReader& reader, const FileSpec& file, std::size_t worker_index);
+    void publish_file_chunks(NfsDataReader& reader,
+                             const FileSpec& file,
+                             std::size_t worker_index,
+                             std::optional<FileSpec>* carried_file = nullptr);
+    void publish_file_chunks_no_interleave(NfsDataReader& reader, const FileSpec& file, std::size_t worker_index);
+    void publish_interleaved_small_files(NfsDataReader& reader,
+                                         std::size_t worker_index,
+                                         std::optional<FileSpec>* carried_file);
     [[nodiscard]] bool publish_buffer(std::size_t worker_index, const BufferHandle& handle);
     [[nodiscard]] std::size_t output_shard_for(const DataBuffer& buffer) const;
     void complete_trailer(const RecBuf& record,
@@ -88,6 +97,7 @@ private:
     ShardedBufQueue* sharded_output_ = nullptr;
     BufferConsumer direct_output_;
     FileProvider file_provider_;
+    InterleaveFileProvider interleave_file_provider_;
     StopPredicate stop_predicate_;
     BytesReadCallback bytes_read_callback_;
     FileReadCallback file_read_callback_;
