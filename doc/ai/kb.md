@@ -2229,3 +2229,4 @@ logical size: 335.99 TB
 - Follow-up: the integrated copy-target governor is now enabled for mounted target paths as well as direct NFS URLs, so transfer tests can avoid `172.x` transport/NFS URL arguments and still exercise the classifier/spillway/work-stealing target engine.
 - Follow-up: copy-target writer-drain shutdown now joins telemetry before rethrowing writer errors, preventing `std::terminate` from masking real target-side drain failures during public-address mounted-path tests.
 - Follow-up: writer and NFS data-reader destructors now suppress stop-time exceptions. Explicit `wait()` still reports worker errors, but cleanup no longer masks them as destructor-triggered `std::terminate`.
+- Follow-up: copy-target writer error handling now treats stop requests as best-effort/no-throw so telemetry is joined before propagating the real writer drain error.

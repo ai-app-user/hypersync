@@ -18368,9 +18368,18 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             if (!writer_error) {
                 writer_error = error;
             }
-            small_writer.stop();
-            medium_writer.stop();
-            large_writer.stop();
+            try {
+                small_writer.stop();
+            } catch (...) {
+            }
+            try {
+                medium_writer.stop();
+            } catch (...) {
+            }
+            try {
+                large_writer.stop();
+            } catch (...) {
+            }
         };
         try {
             small_writer.wait();
