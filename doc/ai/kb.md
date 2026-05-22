@@ -2253,3 +2253,42 @@ logical size: 335.99 TB
 - Interpretation:
   - Correctness and queue decoupling are good in the direct 16-IP run.
   - The current production path is still far below the `~152 Gbit/s` shared-nothing transport ceiling and below the `~200 Gbit/s` target, so the next bottleneck is in the real NFS read/write lifecycle and dataset phase behavior, not TCP queue ingestion.
+
+## 2026-05-22 - Regression Gate Rerun: Read, Write, Transport
+
+- Rule reinforcement:
+  - Performance-proven jobs and pipelines need explicit recorded baselines before future refactors touch them.
+  - If a proven job changes, record the reason, the expected impact, and a before/after rerun against the relevant baseline.
+  - Remote performance runs must use `sudo -n` on both ends.
+- Current recorded gates:
+  - NFS read gate: real NFS `benchmark-data` should show active samples near the recorded `193-196 Gbit/s` range on a large enough dataset, and should stay capable of high file-rate read generation.
+  - NFS write gate, small-only: saved-profile generator to NFS should stay near the recorded direct-submit small writer result of `83.5K files/s` / `41.8 Gbit/s` over a 10s run.
+  - NFS write gate, mixed: saved-profile generator to NFS should stay near the recorded mixed replay result of `189.47 Gbit/s` full-run average, `193.61 Gbit/s` final sample, and about `61.8K small files/s`.
+  - WAN transport gate: shared-nothing transport receiver truth should stay near the recorded `152.36 Gbit/s` for `64` lanes and `128 GiB`.
+- Rerun package:
+  - transfer1: `/mnt/local-nvme/wsync-codex/deployments/hypersync-shutdown-debug-20260522T053025Z`, `hypersync 0.0.4`.
+  - agnopo: `/tmp/wsync-codex/deployments/hypersync-shutdown-debug-20260522T053025Z`, `hypersync 0.0.4`.
+- Transport rerun, transfer1 -> agnopo:
+  - Pipeline: `[DirectSocketGeneratorSender-1 x64]->TCP WAN->[DirectSocketReceiverDiscard-1 x64]`.
+  - Command shape: `sudo -n numactl --cpunodebind=0 --membind=0 ./hypersync benchmark-transport --role sender|receiver --transport tcp --shared-nothing --transports 64 --buffers-per-transport 2048 --buffer-size 1048576`.
+  - Receiver truth: `137,438,953,472` bytes in `9.160s`, `120.03 Gbit/s`.
+  - Status: below recorded `152.36 Gbit/s`; treat as a regression or transient WAN/host-performance drop until repeated.
+- NFS read rerun on agnopo:
+  - Source: `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/hypersync-copy-shared-nothing-20260521T234934Z`.
+  - Pipeline: `[MetaReader-NFS-8]->(FileQueue)->[DataReader-NFS-112]->(DataBufQueue)->[BufferDiscarder]`.
+  - Active 5s sample: `105.98 GB` read at `169.56 Gbit/s`, `50,095` files read.
+  - Final: `110.75 GB` in `5.64s`, `157.22 Gbit/s`, zero failures.
+  - Status: healthy but below the older `193-196 Gbit/s` active NFS read record; the deterministic tree is only `110 GB`, so repeat on a larger large-file tree before declaring code regression.
+- Small-only NFS write rerun on agnopo:
+  - Source: `synthetic-profile:///tmp/wsync-codex/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt?payload=prng&files-per-batch=1024`.
+  - Target: direct 16-IP NFS under `regress-small-write-direct-20260522T170736Z`.
+  - Pipeline: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue)->[FolderCreation-NFS]->(ReadyFileQueue)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
+  - Result: `745,923` files, `46.71 GB`, zero failures, `10.22s`, `73.01K files/s`, `36.58 Gbit/s`.
+  - Status: below the recorded `83.5K files/s` / `41.8 Gbit/s` small-only baseline but still in the same architectural band.
+- Mixed NFS write rerun on agnopo:
+  - Source: same saved profile with PRNG payload.
+  - Target: direct 16-IP NFS under `regress-mixed-write-direct-20260522T170806Z`.
+  - Pipeline: `[FolderSeeder/MetaWork-1]->[MetaReader-SYN-96]->[ReadyClassifier+Spillway+Governor]->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + medium/large governed writer lanes`.
+  - 30s sample: `133.09 Gbit/s`, `41.89K small files/s`, total `47.27K files/s`.
+  - Final: `1,432,810` files, `526.20 GB`, zero failures, `32.53s`, `129.42 Gbit/s`, `39.04K small files/s`.
+  - Status: below the recorded `189.47 Gbit/s` mixed baseline and below the `61.8K small files/s` mixed small-lane result; this needs follow-up before treating the current tree as performance-clean.
