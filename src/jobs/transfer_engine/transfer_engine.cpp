@@ -18363,10 +18363,34 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
             stop_telemetry();
             std::rethrow_exception(classifier_error);
         }
-        small_writer.wait();
-        medium_writer.wait();
-        large_writer.wait();
+        std::exception_ptr writer_error;
+        const auto remember_writer_error = [&](std::exception_ptr error) {
+            if (!writer_error) {
+                writer_error = error;
+            }
+            small_writer.stop();
+            medium_writer.stop();
+            large_writer.stop();
+        };
+        try {
+            small_writer.wait();
+        } catch (...) {
+            remember_writer_error(std::current_exception());
+        }
+        try {
+            medium_writer.wait();
+        } catch (...) {
+            remember_writer_error(std::current_exception());
+        }
+        try {
+            large_writer.wait();
+        } catch (...) {
+            remember_writer_error(std::current_exception());
+        }
         stop_telemetry();
+        if (writer_error) {
+            std::rethrow_exception(writer_error);
+        }
         std::cerr << "copy_target_writers_done"
                   << " elapsed_s=" << elapsed_since_start()
                   << std::endl;
