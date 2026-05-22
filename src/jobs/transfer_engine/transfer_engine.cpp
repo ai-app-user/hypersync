@@ -16250,7 +16250,7 @@ DistributedDiffRunReport TransferEngine::run_bulk_manifest_diff_source(
     const std::size_t worker_count = std::max<std::size_t>(1U, reader_config.worker_count);
     const std::size_t async_depth = std::max<std::size_t>(1U, reader_config.async_directory_depth);
 
-    ScopedFd fd = connect_tcp(target_host, target_port, 200, 50);
+    ScopedFd fd = connect_tcp(target_host, target_port, 60, 250);
     DistributedDiffSettings settings;
     settings.compare_mode = compare_mode;
     settings.recursive = recursive;
