@@ -7,6 +7,13 @@ This document defines general development principles for the application. It sho
 - Keep requirements, UX, design, implementation, and tests separate.
 - Use `dev` as the default working branch for every project repository. Push
   normal iteration commits to `dev` after each completed iteration.
+- Every `dev` iteration commit must bump the development build version before
+  pushing. Use the release version plus an always-increasing build suffix,
+  formatted as `x.y.z.<build>` (for example `0.0.4.1`, `0.0.4.2`, ...).
+  The build suffix increases independently from release promotions to `main`;
+  it must not reset just because `main` has not changed. Record benchmark
+  results with the exact reported `hypersync --version` value so good and bad
+  performance runs map back to a friendly build identifier.
 - Merge or push changes back to `main` only when the maintainer explicitly asks
   for a main merge or release promotion. Do not treat successful tests or a
   finished task as implicit permission to update `main`.
@@ -113,6 +120,10 @@ Project files should stay predictable:
 - When the maintainer sends exactly `sync`, update `doc/ai/chat.md` and
   `doc/ai/kb.md` with the latest conversation and current important facts,
   then commit and push those context updates to `dev`.
+- When committing to `dev`, update the development build version in the project
+  version source and any version smoke expectations in the same commit. Release
+  docs/install defaults may stay on the last stable `x.y.z` unless the
+  maintainer explicitly asks for a release promotion.
 - Update `hypersync/doc/requirement.md` when scope, status, or product behavior changes.
 - Update `hypersync/doc/ux.md` when command names, options, config shape, installation, or runtime behavior changes.
 - Update design documentation when architecture, job composition, data flow, or major tradeoffs change.

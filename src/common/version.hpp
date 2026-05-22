@@ -3,7 +3,7 @@
 
 namespace hypersync {
 
-inline constexpr const char* kVersion = "0.0.4";
+inline constexpr const char* kVersion = "0.0.4.1";
 
 }  // namespace hypersync
 
