@@ -2192,3 +2192,12 @@ logical size: 335.99 TB
   - Target: 3 files.
   - Result: same `1`, changed `1`, new `0`, target-only `1`, bytes planned `3`.
   - Report CSV was generated successfully.
+- WAN/NFS validation used package-only deployment:
+  - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-bulk-manifest-20260521T0018Z`.
+  - agnopo bundle: `/tmp/wsync-codex/deployments/hypersync-bulk-manifest-20260521T0018Z`.
+  - Dataset: source `/mnt/local-nvme/wsync-codex/datasets/copy-mix-v1`; target `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/hypersync-copy-shared-nothing-20260521T234934Z`.
+  - `--compare size-time`: `50,100` files compared, same `0`, changed `50,100`, new `0`, target-only `0`, bytes planned `110,753,177,512`. This confirms the copied target has matching paths/sizes but different mtimes.
+  - `--compare size`: `50,100` files compared, same `50,100`, changed `0`, new `0`, target-only `0`, bytes planned `0`.
+  - Source side packed the full dataset into `2` manifest frames and reported about `50.8K files/s` for the source scan/manifest/result path.
+- WAN note:
+  - Bulk manifest source now uses a `250 ms` connect timeout, matching copy mode. The old `50 ms` distributed-diff connect timeout is too tight for the `transfer1 -> agnopo` path with `~65-70 ms` RTT.
