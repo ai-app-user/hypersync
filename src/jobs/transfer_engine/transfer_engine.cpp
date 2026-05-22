@@ -18365,9 +18365,27 @@ TransferReport TransferEngine::run_copy_target_pipeline(const std::string& targe
                   << " elapsed_s=" << elapsed_since_start()
                   << std::endl;
         if (classifier_error) {
-            small_writer.stop();
-            medium_writer.stop();
-            large_writer.stop();
+            std::cerr << "copy_target_classifier_error_shutdown"
+                      << " elapsed_s=" << elapsed_since_start()
+                      << std::endl;
+            try {
+                small_writer.stop();
+            } catch (...) {
+                std::cerr << "copy_target_stop_writer_error name=small error=" << current_exception_message()
+                          << " elapsed_s=" << elapsed_since_start() << std::endl;
+            }
+            try {
+                medium_writer.stop();
+            } catch (...) {
+                std::cerr << "copy_target_stop_writer_error name=medium error=" << current_exception_message()
+                          << " elapsed_s=" << elapsed_since_start() << std::endl;
+            }
+            try {
+                large_writer.stop();
+            } catch (...) {
+                std::cerr << "copy_target_stop_writer_error name=large error=" << current_exception_message()
+                          << " elapsed_s=" << elapsed_since_start() << std::endl;
+            }
             stop_telemetry();
             std::rethrow_exception(classifier_error);
         }
