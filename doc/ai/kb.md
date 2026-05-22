@@ -2168,3 +2168,27 @@ logical size: 335.99 TB
   - Shared-nothing production copy improves the deterministic target result from the previous integrated NFS copy best (`31.17 Gbit/s`) to `59.62 Gbit/s`, roughly `1.9x`.
   - It is still far below the shared-nothing transport null ceiling (`152.36 Gbit/s`) and synthetic local NFS writer ceilings, so the remaining bottleneck is target-side per-lane `DataWriter-NFS-1` write lifecycle depth/implementation, not TCP transport.
   - Precreating directories did not improve throughput, so directory creation is not the primary limiter for this dataset.
+
+## 2026-05-21 - Bulk Manifest Sync/Diff First Cut
+
+- Added `--bulk-manifest` mode to existing distributed diff commands:
+  - Target: `diff-target --bulk-manifest --target <dir|nfs-url> --port <port>`.
+  - Source: `diff-source --bulk-manifest --source <dir|nfs-url> --target-host <host> --port <port> --folder-report <csv>`.
+- Pipeline:
+  - Target: `[TargetMetaReader-8]->(DestinationStateMap/hash-sharded)->[ManifestReceiver/Comparer-1]`.
+  - Source: `[MetaReader-8]->(FileQueue-262144)->[ManifestPacker-1MiB]->TCP->[ManifestReceiver/Comparer-1]`.
+- Manifest frame format:
+  - Reuses the existing `HYDIFF01` distributed diff frame header.
+  - Adds `source_manifest` and `bulk_summary` frame types.
+  - Each source manifest payload is up to `1 MiB` and contains fixed 24-byte tokens:
+    `[path_hash:u64][size:u64][mtime:u64]`.
+- Comparison behavior:
+  - Target scans destination first into an in-memory hash-sharded state map.
+  - Source metadata is sent as bulk manifest buffers, never as per-file request/response tokens.
+  - Target compares each token locally and sends back one coalesced summary.
+  - `--compare size` checks size only; `--compare time`, `--compare mtime`, `--compare content`, and `--compare size-time` check size + mtime in this manifest mode.
+- Local loopback validation:
+  - Source: 2 files.
+  - Target: 3 files.
+  - Result: same `1`, changed `1`, new `0`, target-only `1`, bytes planned `3`.
+  - Report CSV was generated successfully.

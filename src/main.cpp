@@ -1518,8 +1518,8 @@ void print_usage() {
         << "  hypersync [--config <config.yaml>] send|sync|copy --source <dir|nfs-url> [--host <host>] [--priority-port <port>] [--data-port <port>] [--cache-path <dir>] [--cache-threshold <bytes>] [--skip-verify]\n"
         << "  hypersync [--config <config.yaml>] scan --source <dir|nfs-url> --output <scan.csv|txt|parquet> [--scan-side S|T] [--output-format text|csv|parquet] [--records all|files|folders] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] diff (--source <dir|nfs-url> --target <dir|nfs-url> | --source-scan <scan.csv> --target-scan <scan.csv>) [--compare size|time|content] [--summary-only] [--output <diff.csv>] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--checker-threads <n>] [--checker-request-queue-depth <n>] [--checker-batch-queue-depth <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] diff-target --target <dir|nfs-url> [--listen-host <host>] --port <port> [--compare size|time|content] [--non-recursive] [--target-threads <n>] [--metadata-async-depth <n>] [--pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--stats-interval-seconds <n>]\n"
-        << "  hypersync [--config <config.yaml>] diff-source --source <dir|nfs-url> --target-host <host> --port <port> --folder-report <report.csv> [--compare size|time|content] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff-target --target <dir|nfs-url> [--listen-host <host>] --port <port> [--bulk-manifest] [--compare size|time|content|size-time] [--non-recursive] [--target-threads <n>] [--metadata-async-depth <n>] [--pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--stats-interval-seconds <n>]\n"
+        << "  hypersync [--config <config.yaml>] diff-source --source <dir|nfs-url> --target-host <host> --port <port> --folder-report <report.csv> [--bulk-manifest] [--compare size|time|content|size-time] [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
         << "  hypersync [--config <config.yaml>] dry-run --source <dir|nfs-url> [--source-scan <scan.csv>] [--target-scan <scan.csv>] [--output <diff.csv>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-meta --source <dir|nfs-url> [--non-recursive] [--discard-after-checker|--metadata-stats-discarder] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--metadata-output <path>] [--metadata-output-format text|csv|parquet] [--metadata-records all|files|folders] [--metadata-output-partitions <n>] [--metadata-output-partition-mode single|processes|transport-discard|route-discard|sharded-discard] [--record-buffer-slots <n>] [--pipeline-autoscale|--no-pipeline-autoscale] [--autoscale-profile <name>] [--autoscale-settings <path>] [--autoscale-interval-ms <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>] [--status-socket <path>]\n"
         << "  hypersync [--config <config.yaml>] benchmark-open --source <dir|nfs-url> [--non-recursive] [--meta-reader-threads <n>] [--metadata-async-depth <n>] [--open-threads <n>] [--max-files-queued <n>] [--max-duration-seconds <n>] [--stats-interval-seconds <n>]\n"
@@ -2381,6 +2381,7 @@ int main(int argc, char** argv) {
             std::string autoscale_profile;
             std::filesystem::path autoscale_settings_path;
             std::uint64_t autoscale_interval_ms = 1000;
+            bool bulk_manifest = false;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--target") {
@@ -2411,6 +2412,8 @@ int main(int argc, char** argv) {
                 } else if (args[i] == "--autoscale-interval-ms") {
                     autoscale_interval_ms = parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
                                                                 "--autoscale-interval-ms");
+                } else if (args[i] == "--bulk-manifest") {
+                    bulk_manifest = true;
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -2420,6 +2423,17 @@ int main(int argc, char** argv) {
             }
             if (port == 0U) {
                 throw std::runtime_error("--port is required");
+            }
+            if (bulk_manifest) {
+                engine.run_bulk_manifest_diff_target(target_root,
+                                                     listen_host,
+                                                     port,
+                                                     compare_mode,
+                                                     recursive,
+                                                     target_threads == 0U ? 8U : target_threads,
+                                                     metadata_async_depth,
+                                                     stats_interval_seconds);
+                return 0;
             }
             engine.run_distributed_diff_target(target_root,
                                                listen_host,
@@ -2451,6 +2465,7 @@ int main(int argc, char** argv) {
             std::string autoscale_profile;
             std::filesystem::path autoscale_settings_path;
             std::uint64_t autoscale_interval_ms = 1000;
+            bool bulk_manifest = false;
 
             for (std::size_t i = 1; i < args.size(); ++i) {
                 if (args[i] == "--source") {
@@ -2488,6 +2503,8 @@ int main(int argc, char** argv) {
                 } else if (args[i] == "--autoscale-interval-ms") {
                     autoscale_interval_ms = parse_size_t_option(require_option(args, i, "--autoscale-interval-ms"),
                                                                 "--autoscale-interval-ms");
+                } else if (args[i] == "--bulk-manifest") {
+                    bulk_manifest = true;
                 } else {
                     throw std::runtime_error("unknown option: " + args[i]);
                 }
@@ -2504,20 +2521,31 @@ int main(int argc, char** argv) {
             if (folder_report_path.empty()) {
                 throw std::runtime_error("--folder-report is required");
             }
-            const auto report = engine.run_distributed_diff_source(source_root,
-                                                                   target_host,
-                                                                   port,
-                                                                   folder_report_path,
-                                                                   compare_mode,
-                                                                   recursive,
-                                                                   meta_reader_threads,
-                                                                   metadata_async_depth,
-                                                                   max_duration_seconds,
-                                                                   stats_interval_seconds,
-                                                                   pipeline_autoscale,
-                                                                   autoscale_profile,
-                                                                   autoscale_settings_path,
-                                                                   autoscale_interval_ms);
+            const auto report = bulk_manifest
+                ? engine.run_bulk_manifest_diff_source(source_root,
+                                                       target_host,
+                                                       port,
+                                                       folder_report_path,
+                                                       compare_mode,
+                                                       recursive,
+                                                       meta_reader_threads,
+                                                       metadata_async_depth,
+                                                       max_duration_seconds,
+                                                       stats_interval_seconds)
+                : engine.run_distributed_diff_source(source_root,
+                                                     target_host,
+                                                     port,
+                                                     folder_report_path,
+                                                     compare_mode,
+                                                     recursive,
+                                                     meta_reader_threads,
+                                                     metadata_async_depth,
+                                                     max_duration_seconds,
+                                                     stats_interval_seconds,
+                                                     pipeline_autoscale,
+                                                     autoscale_profile,
+                                                     autoscale_settings_path,
+                                                     autoscale_interval_ms);
             std::cout << "distributed_diff"
                       << " folders_sent=" << report.folders_sent
                       << " folders_reported=" << report.folders_reported

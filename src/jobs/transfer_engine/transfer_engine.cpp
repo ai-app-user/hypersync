@@ -3522,6 +3522,8 @@ enum class DistributedDiffFrameType : std::uint32_t {
     folder_result = 4,
     target_done = 5,
     error = 6,
+    source_manifest = 7,
+    bulk_summary = 8,
 };
 
 struct DistributedDiffFrame {
@@ -3591,6 +3593,16 @@ inline constexpr std::size_t kDistributedDiffMaxPayloadBytes = 512U * 1024U * 10
 
 std::uint64_t now_unix_ns() {
     return unix_time_nanoseconds(std::chrono::system_clock::now());
+}
+
+std::string current_exception_message() {
+    try {
+        throw;
+    } catch (const std::exception& ex) {
+        return ex.what();
+    } catch (...) {
+        return "unknown error";
+    }
 }
 
 void append_u8(std::string& out, std::uint8_t value) {
@@ -3734,6 +3746,163 @@ std::string child_name_for_folder(std::string_view folder_path, std::string_view
     settings.recursive = read_u8_field(payload, offset) != 0U;
     settings.allow_target_only = read_u8_field(payload, offset) != 0U;
     return settings;
+}
+
+inline constexpr std::size_t kBulkManifestPayloadBytes = 1024U * 1024U;
+inline constexpr std::size_t kBulkManifestTokenBytes = sizeof(std::uint64_t) * 3U;
+
+struct BulkManifestToken {
+    std::uint64_t path_hash = 0;
+    std::uint64_t size = 0;
+    std::uint64_t mtime = 0;
+};
+
+struct BulkTargetState {
+    std::uint64_t size = 0;
+    std::uint64_t mtime = 0;
+    bool seen = false;
+};
+
+struct BulkTargetStateShard {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, BulkTargetState> entries;
+};
+
+struct BulkTargetStateMap {
+    std::vector<std::unique_ptr<BulkTargetStateShard>> shards;
+    std::atomic<std::uint64_t> files {0};
+    std::atomic<std::uint64_t> logical_size_bytes {0};
+
+    explicit BulkTargetStateMap(std::size_t shard_count = 256U) {
+        const std::size_t count = std::max<std::size_t>(1U, shard_count);
+        shards.reserve(count);
+        for (std::size_t index = 0; index < count; ++index) {
+            shards.push_back(std::make_unique<BulkTargetStateShard>());
+        }
+    }
+
+    [[nodiscard]] BulkTargetStateShard& shard_for(std::uint64_t path_hash) const {
+        return *shards[static_cast<std::size_t>(path_hash % shards.size())];
+    }
+
+    void insert(const FileSpec& file) {
+        const std::uint64_t size = file_spec_logical_size(file);
+        const std::uint64_t path_hash = hash64(normalize_path(file.rel_path));
+        BulkTargetStateShard& shard = shard_for(path_hash);
+        {
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.entries[path_hash] = BulkTargetState{size, file.mtime, false};
+        }
+        files.fetch_add(1U, std::memory_order_relaxed);
+        logical_size_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::optional<BulkTargetState> mark_seen(std::uint64_t path_hash) const {
+        BulkTargetStateShard& shard = shard_for(path_hash);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        auto it = shard.entries.find(path_hash);
+        if (it == shard.entries.end()) {
+            return std::nullopt;
+        }
+        it->second.seen = true;
+        return it->second;
+    }
+
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> target_only_counts() const {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+        for (const auto& shard_ptr : shards) {
+            std::lock_guard<std::mutex> lock(shard_ptr->mutex);
+            for (const auto& [_, entry] : shard_ptr->entries) {
+                if (!entry.seen) {
+                    ++count;
+                    bytes += entry.size;
+                }
+            }
+        }
+        return {count, bytes};
+    }
+};
+
+void append_bulk_manifest_token(std::string& payload, const FileSpec& file) {
+    append_u64_be(payload, hash64(normalize_path(file.rel_path)));
+    append_u64_be(payload, file_spec_logical_size(file));
+    append_u64_be(payload, file.mtime);
+}
+
+BulkManifestToken read_bulk_manifest_token(std::string_view payload, std::size_t& offset) {
+    BulkManifestToken token;
+    token.path_hash = read_u64_be_field(payload, offset);
+    token.size = read_u64_be_field(payload, offset);
+    token.mtime = read_u64_be_field(payload, offset);
+    return token;
+}
+
+bool bulk_manifest_token_matches(const BulkManifestToken& source,
+                                 const BulkTargetState& target,
+                                 const std::string& compare_mode) {
+    if (compare_mode == "size") {
+        return source.size == target.size;
+    }
+    if (compare_mode == "time" || compare_mode == "mtime") {
+        return source.size == target.size && source.mtime == target.mtime;
+    }
+    if (compare_mode == "content") {
+        return source.size == target.size && source.mtime == target.mtime;
+    }
+    return source.size == target.size && source.mtime == target.mtime;
+}
+
+void mark_data_file_input_done(DataReadFileQueue& queue);
+void scan_data_read_metadata_worker(const std::string& source_root,
+                                    bool recursive,
+                                    std::size_t async_directory_depth,
+                                    std::size_t readdirplus_page_bytes,
+                                    std::uint64_t min_file_size_bytes,
+                                    std::uint64_t max_file_size_bytes,
+                                    FlatMetadataWorkQueue& folder_queue,
+                                    DataReadFileQueue& file_queue,
+                                    DataReadBenchmarkStats& stats,
+                                    RawBufferPool* target_metadata_pool,
+                                    BufQueue* target_metadata_queue);
+
+void scan_metadata_to_file_queue(const std::string& root,
+                                 bool recursive,
+                                 std::size_t worker_count,
+                                 std::size_t async_depth,
+                                 std::size_t readdirplus_page_bytes,
+                                 DataReadFileQueue& file_queue,
+                                 DataReadBenchmarkStats& stats,
+                                 std::optional<std::chrono::steady_clock::time_point> stop_at = std::nullopt) {
+    FlatMetadataWorkQueue folder_queue;
+    folder_queue.folders.push_back(FileSpec{});
+    folder_queue.stop_at = stop_at;
+    file_queue.stop_at = stop_at;
+    stats.folders_found.store(1U, std::memory_order_relaxed);
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (std::size_t index = 0; index < worker_count; ++index) {
+        workers.emplace_back(scan_data_read_metadata_worker,
+                             root,
+                             recursive,
+                             std::max<std::size_t>(1U, async_depth),
+                             readdirplus_page_bytes,
+                             0,
+                             0,
+                             std::ref(folder_queue),
+                             std::ref(file_queue),
+                             std::ref(stats),
+                             nullptr,
+                             nullptr);
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    mark_data_file_input_done(file_queue);
+    if (folder_queue.error) {
+        std::rethrow_exception(folder_queue.error);
+    }
 }
 
 void append_file_spec_compact(std::string& payload, const FileSpec& spec, std::string_view folder_path) {
@@ -16059,6 +16228,145 @@ FakeRemoteDiffBenchmarkReport TransferEngine::benchmark_fake_remote_diff_pipelin
     return report;
 }
 
+DistributedDiffRunReport TransferEngine::run_bulk_manifest_diff_source(
+    const std::filesystem::path& source_root,
+    const std::string& target_host,
+    std::uint16_t target_port,
+    const std::filesystem::path& folder_report_path,
+    const std::string& compare_mode,
+    bool recursive,
+    std::size_t meta_reader_threads,
+    std::size_t metadata_async_depth,
+    double max_duration_seconds,
+    std::uint32_t stats_interval_seconds) const {
+    const auto started_at = std::chrono::steady_clock::now();
+    NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
+    if (meta_reader_threads != 0U) {
+        reader_config.worker_count = meta_reader_threads;
+    }
+    if (metadata_async_depth != 0U) {
+        reader_config.async_directory_depth = metadata_async_depth;
+    }
+    const std::size_t worker_count = std::max<std::size_t>(1U, reader_config.worker_count);
+    const std::size_t async_depth = std::max<std::size_t>(1U, reader_config.async_directory_depth);
+
+    ScopedFd fd = connect_tcp(target_host, target_port, 200, 50);
+    DistributedDiffSettings settings;
+    settings.compare_mode = compare_mode;
+    settings.recursive = recursive;
+    settings.allow_target_only = true;
+    write_distributed_diff_frame(fd.get(), DistributedDiffFrameType::config, serialize_distributed_diff_settings(settings));
+
+    DataReadFileQueue file_queue;
+    file_queue.max_entries = std::max<std::size_t>(262144U, worker_count * async_depth * 32U);
+    DataReadBenchmarkStats stats;
+    const std::optional<std::chrono::steady_clock::time_point> stop_at =
+        max_duration_seconds > 0.0
+            ? std::optional<std::chrono::steady_clock::time_point>(
+                  started_at + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                   std::chrono::duration<double>(max_duration_seconds)))
+            : std::nullopt;
+
+    std::exception_ptr scan_error;
+    std::thread scanner([&]() {
+        try {
+            scan_metadata_to_file_queue(source_root.string(),
+                                        recursive,
+                                        worker_count,
+                                        async_depth,
+                                        reader_config.readdirplus_page_bytes,
+                                        file_queue,
+                                        stats,
+                                        stop_at);
+        } catch (...) {
+            scan_error = std::current_exception();
+            fail_data_file_work(file_queue, scan_error);
+        }
+    });
+
+    DistributedDiffRunReport report;
+    std::uint64_t source_files_sent = 0;
+    std::uint64_t source_bytes_sent = 0;
+    std::string manifest;
+    manifest.reserve(kBulkManifestPayloadBytes);
+    std::uint64_t manifests_sent = 0;
+    auto flush_manifest = [&]() {
+        if (manifest.empty()) {
+            return;
+        }
+        write_distributed_diff_frame(fd.get(), DistributedDiffFrameType::source_manifest, manifest);
+        ++manifests_sent;
+        manifest.clear();
+    };
+
+    auto last_report = started_at;
+    while (true) {
+        std::vector<FileSpec> files = take_data_file_work_batch(file_queue, 4096U);
+        if (files.empty()) {
+            break;
+        }
+        for (const FileSpec& file : files) {
+            if (manifest.size() + kBulkManifestTokenBytes > kBulkManifestPayloadBytes) {
+                flush_manifest();
+            }
+            append_bulk_manifest_token(manifest, file);
+            ++source_files_sent;
+            source_bytes_sent += file_spec_logical_size(file);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (stats_interval_seconds != 0U &&
+            std::chrono::duration<double>(now - last_report).count() >= stats_interval_seconds) {
+            const double elapsed = std::chrono::duration<double>(now - started_at).count();
+            std::cerr << "bulk_manifest_diff_source_progress"
+                      << " files_sent=" << source_files_sent
+                      << " manifests_sent=" << manifests_sent
+                      << " files_per_second="
+                      << (elapsed > 0.0 ? static_cast<double>(source_files_sent) / elapsed : 0.0)
+                      << " elapsed_seconds=" << elapsed << '\n';
+            last_report = now;
+        }
+    }
+    flush_manifest();
+    if (scanner.joinable()) {
+        scanner.join();
+    }
+    if (scan_error) {
+        std::rethrow_exception(scan_error);
+    }
+    if (file_queue.error) {
+        std::rethrow_exception(file_queue.error);
+    }
+
+    write_distributed_diff_frame(fd.get(), DistributedDiffFrameType::source_done, {});
+    auto summary_frame = read_distributed_diff_frame(fd.get());
+    if (!summary_frame.has_value()) {
+        throw std::runtime_error("bulk manifest diff target closed before summary");
+    }
+    if (summary_frame->type == DistributedDiffFrameType::error) {
+        throw std::runtime_error(summary_frame->payload);
+    }
+    if (summary_frame->type != DistributedDiffFrameType::bulk_summary) {
+        throw std::runtime_error("bulk manifest diff target returned unexpected frame");
+    }
+    const DistributedFolderDiffSummary summary = deserialize_folder_diff_summary(summary_frame->payload);
+    merge_distributed_diff_summary(report, summary);
+    report.folders_sent = manifests_sent;
+    report.source_logical_size_bytes = source_bytes_sent;
+    report.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+    report.files_per_second =
+        report.elapsed_seconds > 0.0 ? static_cast<double>(report.files_compared) / report.elapsed_seconds : 0.0;
+    report.folders_per_second =
+        report.elapsed_seconds > 0.0 ? static_cast<double>(manifests_sent) / report.elapsed_seconds : 0.0;
+
+    std::ofstream out(folder_report_path);
+    if (!out) {
+        throw std::runtime_error("failed to open bulk manifest diff report: " + folder_report_path.string());
+    }
+    write_folder_diff_csv_header(out);
+    write_folder_diff_csv_row(out, summary);
+    return report;
+}
+
 DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     const std::filesystem::path& source_root,
     const std::string& target_host,
@@ -16397,6 +16705,177 @@ DistributedDiffRunReport TransferEngine::run_distributed_diff_source(
     report.files_per_second =
         report.elapsed_seconds > 0.0 ? static_cast<double>(report.files_compared) / report.elapsed_seconds : 0.0;
     return report;
+}
+
+void TransferEngine::run_bulk_manifest_diff_target(const std::filesystem::path& target_root,
+                                                   const std::string& listen_host,
+                                                   std::uint16_t listen_port,
+                                                   const std::string& compare_mode,
+                                                   bool recursive,
+                                                   std::size_t target_threads,
+                                                   std::size_t metadata_async_depth,
+                                                   std::uint32_t stats_interval_seconds) const {
+    const auto started_at = std::chrono::steady_clock::now();
+    NfsMetaReaderConfig reader_config = load_nfs_meta_reader_config(config_store_);
+    const std::size_t worker_count =
+        std::max<std::size_t>(1U, target_threads != 0U ? target_threads : 8U);
+    const std::size_t async_depth =
+        std::max<std::size_t>(1U, metadata_async_depth != 0U ? metadata_async_depth : reader_config.async_directory_depth);
+
+    ScopedFd listener = listen_tcp(listen_host, listen_port, static_cast<int>(worker_count + 1U));
+    std::cout << "bulk_manifest_diff_target_listening host=" << listen_host
+              << " port=" << listen_port
+              << " target=" << target_root.string()
+              << " threads=" << worker_count
+              << " metadata_async_depth=" << async_depth << std::endl;
+    ScopedFd fd = accept_tcp(listener.get());
+
+    auto settings_frame = read_distributed_diff_frame(fd.get());
+    if (!settings_frame.has_value() || settings_frame->type != DistributedDiffFrameType::config) {
+        throw std::runtime_error("bulk manifest diff target expected config frame");
+    }
+    DistributedDiffSettings settings = deserialize_distributed_diff_settings(settings_frame->payload);
+    if (compare_mode != "size-time") {
+        settings.compare_mode = compare_mode;
+    }
+    settings.recursive = recursive;
+
+    BulkTargetStateMap state(512U);
+    DataReadFileQueue target_files;
+    target_files.max_entries = 262144U;
+    DataReadBenchmarkStats scan_stats;
+    std::exception_ptr scan_error;
+    std::thread scanner([&]() {
+        try {
+            scan_metadata_to_file_queue(target_root.string(),
+                                        settings.recursive,
+                                        worker_count,
+                                        async_depth,
+                                        reader_config.readdirplus_page_bytes,
+                                        target_files,
+                                        scan_stats);
+        } catch (...) {
+            scan_error = std::current_exception();
+            fail_data_file_work(target_files, scan_error);
+        }
+    });
+
+    std::vector<std::thread> builders;
+    builders.reserve(worker_count);
+    for (std::size_t index = 0; index < worker_count; ++index) {
+        builders.emplace_back([&]() {
+            while (true) {
+                std::vector<FileSpec> files = take_data_file_work_batch(target_files, 4096U);
+                if (files.empty()) {
+                    break;
+                }
+                for (const FileSpec& file : files) {
+                    state.insert(file);
+                }
+            }
+        });
+    }
+    if (scanner.joinable()) {
+        scanner.join();
+    }
+    for (std::thread& builder : builders) {
+        builder.join();
+    }
+    if (scan_error) {
+        std::rethrow_exception(scan_error);
+    }
+    if (target_files.error) {
+        std::rethrow_exception(target_files.error);
+    }
+
+    DistributedFolderDiffSummary summary;
+    summary.rel_path = "";
+    summary.target_scan_started_unix_ns = now_unix_ns();
+    summary.target_file_count = state.files.load(std::memory_order_relaxed);
+    summary.target_logical_size_bytes = state.logical_size_bytes.load(std::memory_order_relaxed);
+    summary.target_scan_finished_unix_ns = now_unix_ns();
+
+    std::uint64_t manifests_received = 0;
+    auto last_report = std::chrono::steady_clock::now();
+    try {
+        while (true) {
+            auto frame = read_distributed_diff_frame(fd.get());
+            if (!frame.has_value()) {
+                throw std::runtime_error("bulk manifest diff source closed before source_done");
+            }
+            if (frame->type == DistributedDiffFrameType::source_done) {
+                break;
+            }
+            if (frame->type != DistributedDiffFrameType::source_manifest) {
+                throw std::runtime_error("bulk manifest diff target received unexpected frame");
+            }
+            if (frame->payload.size() % kBulkManifestTokenBytes != 0U) {
+                throw std::runtime_error("bulk manifest payload has a partial token");
+            }
+            ++manifests_received;
+            std::size_t offset = 0;
+            while (offset < frame->payload.size()) {
+                const BulkManifestToken token = read_bulk_manifest_token(frame->payload, offset);
+                ++summary.source_file_count;
+                summary.source_logical_size_bytes += token.size;
+                const std::optional<BulkTargetState> target = state.mark_seen(token.path_hash);
+                if (!target.has_value()) {
+                    ++summary.files_new;
+                    summary.new_logical_size_bytes += token.size;
+                    summary.bytes_planned += token.size;
+                } else if (bulk_manifest_token_matches(token, *target, settings.compare_mode)) {
+                    ++summary.files_same;
+                    summary.same_logical_size_bytes += token.size;
+                } else {
+                    ++summary.files_changed;
+                    summary.changed_logical_size_bytes += token.size;
+                    summary.bytes_planned += token.size;
+                }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (stats_interval_seconds != 0U &&
+                std::chrono::duration<double>(now - last_report).count() >= stats_interval_seconds) {
+                const double elapsed = std::chrono::duration<double>(now - started_at).count();
+                std::cout << "bulk_manifest_diff_target_stats"
+                          << " manifests_received=" << manifests_received
+                          << " source_files=" << summary.source_file_count
+                          << " target_files=" << summary.target_file_count
+                          << " same=" << summary.files_same
+                          << " changed=" << summary.files_changed
+                          << " new=" << summary.files_new
+                          << " files_per_second="
+                          << (elapsed > 0.0 ? static_cast<double>(summary.source_file_count) / elapsed : 0.0)
+                          << " elapsed_seconds=" << elapsed << std::endl;
+                last_report = now;
+            }
+        }
+        const auto [target_only_count, target_only_bytes] = state.target_only_counts();
+        summary.files_target_only = target_only_count;
+        summary.target_only_logical_size_bytes = target_only_bytes;
+        summary.result_sent_unix_ns = now_unix_ns();
+        write_distributed_diff_frame(fd.get(),
+                                     DistributedDiffFrameType::bulk_summary,
+                                     serialize_folder_diff_summary(summary));
+        write_distributed_diff_frame(fd.get(), DistributedDiffFrameType::target_done, {});
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
+        std::cout << "bulk_manifest_diff_target_done"
+                  << " manifests_received=" << manifests_received
+                  << " source_files=" << summary.source_file_count
+                  << " target_files=" << summary.target_file_count
+                  << " same=" << summary.files_same
+                  << " changed=" << summary.files_changed
+                  << " new=" << summary.files_new
+                  << " target_only=" << summary.files_target_only
+                  << " bytes_planned=" << summary.bytes_planned
+                  << " elapsed_seconds=" << elapsed << std::endl;
+    } catch (...) {
+        try {
+            const std::string message = current_exception_message();
+            write_distributed_diff_frame(fd.get(), DistributedDiffFrameType::error, message);
+        } catch (...) {
+        }
+        throw;
+    }
 }
 
 void TransferEngine::run_distributed_diff_target(const std::filesystem::path& target_root,

@@ -629,6 +629,17 @@ public:
         std::string autoscale_profile = {},
         std::filesystem::path autoscale_settings_path = {},
         std::uint64_t autoscale_interval_ms = 1000) const;
+    [[nodiscard]] DistributedDiffRunReport run_bulk_manifest_diff_source(
+        const std::filesystem::path& source_root,
+        const std::string& target_host,
+        std::uint16_t target_port,
+        const std::filesystem::path& folder_report_path,
+        const std::string& compare_mode = "size-time",
+        bool recursive = true,
+        std::size_t meta_reader_threads = 0,
+        std::size_t metadata_async_depth = 0,
+        double max_duration_seconds = 0.0,
+        std::uint32_t stats_interval_seconds = 5) const;
     void run_distributed_diff_target(const std::filesystem::path& target_root,
                                      const std::string& listen_host,
                                      std::uint16_t listen_port,
@@ -641,6 +652,14 @@ public:
                                      std::string autoscale_profile = {},
                                      std::filesystem::path autoscale_settings_path = {},
                                      std::uint64_t autoscale_interval_ms = 1000) const;
+    void run_bulk_manifest_diff_target(const std::filesystem::path& target_root,
+                                       const std::string& listen_host,
+                                       std::uint16_t listen_port,
+                                       const std::string& compare_mode = "size-time",
+                                       bool recursive = true,
+                                       std::size_t target_threads = 8,
+                                       std::size_t metadata_async_depth = 0,
+                                       std::uint32_t stats_interval_seconds = 5) const;
     [[nodiscard]] TransferReport run_copy_source_pipeline(const std::filesystem::path& source_root,
                                                           const std::string& target_host,
                                                           std::uint16_t base_port,
