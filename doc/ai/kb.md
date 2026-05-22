@@ -2224,3 +2224,5 @@ logical size: 335.99 TB
   - `STEAL_OPS: [LRG_TO_MED=...,LRG_TO_SMALL=...,MED_TO_SMALL=...,MED_TO_LRG=...]`
   - `SUSTAINED: <gbit/s>`.
 - Local release build passed after the change.
+- Linux/libnfs package build passed:
+  - transfer1 bundle: `/mnt/local-nvme/wsync-codex/deployments/hypersync-governor-20260521T002804Z`.
