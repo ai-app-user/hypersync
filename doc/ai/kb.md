@@ -2302,3 +2302,20 @@ logical size: 335.99 TB
   - Existing explicit CLI values still win.
 - This change intentionally does not touch the newer TCP WAN transfer jobs or the shared-nothing transport benchmark.
 - Reason: the best recorded generator/write pipelines were `DataReader-SYN-768/direct-submit -> DataWriter-NFS/reactors=64 window=64` with `FolderCreation-NFS-8`; the slower rerun accidentally exposed that the current default path could still fall back to the older queued writer shape or a generic folder-creator count.
+
+## 2026-05-23 - agnopo Reboot Recovery and Tuning
+
+- agnopo was rebooted and came back at public SSH endpoint `ubuntu@160.211.77.7`; hostname reports `artem-nopo-target`.
+- Deployed the latest known-good folder-ready package to:
+  - `/tmp/wsync-codex/deployments/hypersync-restore-defaults-20260523T183003Z/hypersync-restore-defaults-20260523T183003Z`.
+  - Deployed binary reports `hypersync 0.0.4.2`.
+- Remounted the target NFS volume on agnopo:
+  - Mount point: `/mnt/8ed98ee4-b263-4319-be97-2093377beb65`.
+  - Source: `172.27.255.2:/volumes/8ed98ee4-b263-4319-be97-2093377beb65`.
+  - Options verified by `findmnt`: `vers=3`, `rsize=1048576`, `wsize=1048576`, `nconnect=32`, `noatime`, `nodiratime`, `remoteports=172.27.255.2-172.27.255.17`, `spread_reads`, `spread_writes`, `localports_failover`, `rdirplus=force`, and `forcerdirplus`.
+  - `df -h` reported `1000T` total, `976T` available.
+- Re-applied host tuning with sudo:
+  - Command shape: `sudo -n ./hypersync tuning --iface ens3 --peer 172.27.255.2 --apply`.
+  - Report-only verification immediately after apply returned `mismatches=0`.
+  - Verified settings included MTU `9000`, driver `mlx5_core`, RX/TX rings `8192/8192`, RX coalescing `adaptive-rx off rx-usecs 12`, BBR/fq, `tcp_mtu_probing=1`, socket buffer caps `2147483647`, RPC slot current/max `65536`, PMTU 9000 to the NFS peer, and NFS BDI read-ahead `16384 KiB`.
+- Development build bumped to `hypersync 0.0.4.3` for this recovery-state documentation commit; the already-deployed reboot-recovery binary remains `0.0.4.2` until the next deployment package is built.
