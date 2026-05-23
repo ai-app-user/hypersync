@@ -2319,3 +2319,30 @@ logical size: 335.99 TB
   - Report-only verification immediately after apply returned `mismatches=0`.
   - Verified settings included MTU `9000`, driver `mlx5_core`, RX/TX rings `8192/8192`, RX coalescing `adaptive-rx off rx-usecs 12`, BBR/fq, `tcp_mtu_probing=1`, socket buffer caps `2147483647`, RPC slot current/max `65536`, PMTU 9000 to the NFS peer, and NFS BDI read-ahead `16384 KiB`.
 - Development build bumped to `hypersync 0.0.4.3` for this recovery-state documentation commit; the already-deployed reboot-recovery binary remains `0.0.4.2` until the next deployment package is built.
+
+## 2026-05-23 - Regression Gate Rerun After agnopo Reboot
+
+- Development build under test: `hypersync 0.0.4.3`, hypersync `ffeec55`, piper `78cd1d3`.
+- Deployment:
+  - transfer1 package: `/mnt/local-nvme/wsync-codex/deployments/hypersync-regression-gates-20260523T191058Z`.
+  - agnopo package: `/tmp/wsync-codex/deployments/hypersync-regression-gates-20260523T191058Z`.
+  - agnopo was mounted and tuned first; `hypersync tuning --iface ens3 --peer 172.27.255.2` reported `mismatches=0`.
+- WAN transport gate, transfer1 -> agnopo:
+  - Pipeline: `[DirectSocketGeneratorSender-1 x64]->TCP WAN->[DirectSocketReceiverDiscard-1 x64]`.
+  - Receiver truth: `137,438,953,472` bytes in `8.60091s`, `127.84 Gbit/s`.
+  - Status: better than the previous `120.03 Gbit/s` rerun, but still below the recorded `152.36 Gbit/s` shared-nothing transport gate. Not fully recovered.
+- NFS read gate on agnopo:
+  - Source: `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/hypersync-copy-shared-nothing-20260521T234934Z`.
+  - Pipeline: `[MetaReader-NFS-8]->(FileQueue)->[DataReader-NFS-112]->(DataBufQueue)->[BufferDiscarder]`.
+  - Active sample: `170.84 Gbit/s`; final: `110.75 GB` in `5.77s`, `153.46 Gbit/s`, zero failures.
+  - Status: essentially consistent with the last rerun and healthy for this short `110 GB` tree, but still below the older `193-196 Gbit/s` active-read record. Use a larger large-file tree before declaring a code regression.
+- Small-only NFS write gate on agnopo:
+  - Source: saved profile with `payload=prng&files-per-batch=1024`, filtered with `--max-file-size-bytes 131072`.
+  - Pipeline: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue)->[FolderCreation-NFS-8]->(ReadyFileQueue)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
+  - Result: `819,629` files, `51.31 GB`, zero failures, `10.23s`, `80.10K files/s`, `40.12 Gbit/s`.
+  - Status: recovered into the recorded small-write band, close to the `83.5K files/s` / `41.8 Gbit/s` peak.
+- Mixed NFS write gate on agnopo:
+  - 30s/default-queue run: `1,750,626` files, `624.80 GB`, zero failures, `32.66s`, `153.04 Gbit/s`, `47.63K small files/s`.
+  - 60s/deep-ready-queue rerun with `--max-files-queued 500000`: `1,785,801` files, `628.86 GB`, zero failures, `62.50s`, `80.49 Gbit/s`, `25.36K small files/s`. The deep queue caused a long initial staging delay and is not the current best path.
+  - Status: improved from the previous bad mixed rerun (`129.42 Gbit/s`) but still below the recorded `189.47 Gbit/s` / `61.8K small files/s` mixed gate. Mixed remains a real regression to investigate.
+- Development build bumped to `hypersync 0.0.4.4` for this documentation commit; the tested deployed binary remains `0.0.4.3`.
