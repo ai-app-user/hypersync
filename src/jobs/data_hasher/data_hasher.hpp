@@ -7,7 +7,7 @@
 #include <string>
 
 #include "common/buffer_pool.hpp"
-#include "common/content_hash.hpp"
+#include "utils/content_hash.hpp"
 #include "jobs/buffer_transform_job.hpp"
 
 namespace hypersync {

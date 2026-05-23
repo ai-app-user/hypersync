@@ -249,6 +249,8 @@ Reusable lower layers live in sibling projects:
 
 - Piper owns generic pipeline infrastructure: buffer pools, queues, generic
   jobs, monitoring, and autoscaling.
+- Utils owns generic helper functions and small reusable algorithms such as
+  content hashing over byte buffers.
 - Connector owns generic buffer transport over sockets: TCP/Unix socket helpers
   and buffer sender/receiver jobs that know only buffers and lengths.
 - Filer owns filesystem I/O jobs and backend adapters: metadata/data readers,

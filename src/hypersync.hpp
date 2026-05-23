@@ -3,7 +3,6 @@
 
 #include "common/buffer_pool.hpp"
 #include "common/config.hpp"
-#include "common/content_hash.hpp"
 #include "common/filesystem_utils.hpp"
 #include "common/fixed_string.hpp"
 #include "common/hash_utils.hpp"
@@ -19,6 +18,7 @@
 #include "common/types.hpp"
 #include "common/version.hpp"
 #include "common/watermarks.hpp"
+#include "utils/content_hash.hpp"
 #include "core/diff_result_buffer_codec.hpp"
 #include "core/data_buffer_codec.hpp"
 #include "core/flat_folder_buffer_codec.hpp"

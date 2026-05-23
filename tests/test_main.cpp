@@ -4633,7 +4633,7 @@ void test_main_cli_version_smoke() {
     const fs::path stdout_path = output.path / "version.txt";
 
     EXPECT_TRUE(command_succeeds(app + " --version > " + stdout_path.string() + " 2>&1"));
-    EXPECT_EQ(hypersync::read_file_contents(stdout_path), "hypersync 0.0.4.8\n");
+    EXPECT_EQ(hypersync::read_file_contents(stdout_path), "hypersync 0.0.4.9\n");
 }
 
 void test_main_cli_send_and_receive_smoke() {

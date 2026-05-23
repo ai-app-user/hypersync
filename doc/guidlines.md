@@ -76,6 +76,10 @@ The repository should keep top-level concerns clear:
 - `piper/`: reusable asynchronous pipeline infrastructure. It owns generic
   buffer pools, queues, generic job base classes, generic buffer jobs,
   config parsing, and helper monitoring code.
+- `utils/`: generic helper functions and small reusable algorithms. It owns
+  content hashing and similar primitive/string/buffer utilities; it must not
+  understand pipeline topology, sockets, file metadata, NFS, DB output, profiler
+  policy, or product scenarios.
 - `connector/`: reusable socket transport for opaque buffers. It owns TCP/Unix
   socket helpers and buffer sender/receiver jobs; it must not understand file
   metadata, file data semantics, hashing, NFS, profiler policy, or product
@@ -87,11 +91,11 @@ The repository should keep top-level concerns clear:
   schemas, hashing/sync/copy/scanner scenarios, profiler logic, CLI commands,
   product config, product documentation, and integration/functional/performance
   tests.
-- `piper/src/`, `connector/src/`, `filer/src/`, and `hypersync/src/`: production
-  source code for each library or product.
-- `piper/doc/`, `connector/doc/`, `filer/doc/`, and `hypersync/doc/`: design,
-  requirements, UX, and operational documentation at the correct ownership
-  boundary.
+- `piper/src/`, `utils/src/`, `connector/src/`, `filer/src/`, and
+  `hypersync/src/`: production source code for each library or product.
+- `piper/doc/`, `utils/doc/`, `connector/doc/`, `filer/doc/`, and
+  `hypersync/doc/`: design, requirements, UX, and operational documentation at
+  the correct ownership boundary.
 - `piper/tests/`, `filer/tests/`, and `hypersync/tests/`: tests owned by each
   component.
 - `hypersync/config/`: default and example product configuration files.
