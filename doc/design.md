@@ -248,7 +248,9 @@ performance gates, and product configuration.
 Reusable lower layers live in sibling projects:
 
 - Piper owns generic pipeline infrastructure: buffer pools, queues, generic
-  jobs, transport helpers, monitoring, and autoscaling.
+  jobs, monitoring, and autoscaling.
+- Connector owns generic buffer transport over sockets: TCP/Unix socket helpers
+  and buffer sender/receiver jobs that know only buffers and lengths.
 - Filer owns filesystem I/O jobs and backend adapters: metadata/data readers,
   target metadata/data writers, and NFS/NULL backend mechanics.
 
