@@ -13966,6 +13966,12 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     writer_config.direct_reactor_submit = direct_reactor_submit;
     writer_config.reactor_count = data_writer_reactors;
     writer_config.reactors_per_ip = std::max<std::size_t>(1U, reactors_per_ip);
+    const bool folder_ready_payload_write = folder_ready_write || folder_ready_mixed_write;
+    const bool folder_ready_nfs_packed_write =
+        folder_ready_payload_write && is_nfs_url(target_root) && data_config.pack_small_files;
+    if (folder_ready_nfs_packed_write && !direct_reactor_writes) {
+        writer_config.direct_reactor_submit = true;
+    }
     if ((folder_ready_write || folder_ready_mixed_write) && writer_config.direct_reactor_submit &&
         writer_config.reactor_count == 0U) {
         writer_config.reactor_count = 64U;
@@ -13979,6 +13985,8 @@ DataReadBenchmarkReport TransferEngine::benchmark_data_write_pipeline(const std:
     }
     if (data_writer_threads != 0U) {
         writer_config.worker_count = data_writer_threads;
+    } else if (folder_ready_payload_write) {
+        writer_config.worker_count = 8U;
     }
     if (data_writer_async_window != 0U) {
         writer_config.async_window = data_writer_async_window;

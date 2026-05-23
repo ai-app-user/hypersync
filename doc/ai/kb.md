@@ -2292,3 +2292,13 @@ logical size: 335.99 TB
   - 30s sample: `133.09 Gbit/s`, `41.89K small files/s`, total `47.27K files/s`.
   - Final: `1,432,810` files, `526.20 GB`, zero failures, `32.53s`, `129.42 Gbit/s`, `39.04K small files/s`.
   - Status: below the recorded `189.47 Gbit/s` mixed baseline and below the `61.8K small files/s` mixed small-lane result; this needs follow-up before treating the current tree as performance-clean.
+
+## 2026-05-23 - Restore Folder-Ready Writer Defaults to Proven Shape
+
+- Development build bumped to `hypersync 0.0.4.2`.
+- Restored the folder-ready NFS packed writer defaults used by the best generator/write runs:
+  - `benchmark-data-write --mode folder-ready-write` and `--mode folder-ready-mixed-write` now automatically use direct-submit when the target is NFS and packed small-file buffers are enabled, unless the caller explicitly asks for direct reactor lanes.
+  - Folder-ready write modes default the folder-creation lane to `8` workers when `--data-writer-threads` is omitted.
+  - Existing explicit CLI values still win.
+- This change intentionally does not touch the newer TCP WAN transfer jobs or the shared-nothing transport benchmark.
+- Reason: the best recorded generator/write pipelines were `DataReader-SYN-768/direct-submit -> DataWriter-NFS/reactors=64 window=64` with `FolderCreation-NFS-8`; the slower rerun accidentally exposed that the current default path could still fall back to the older queued writer shape or a generic folder-creator count.

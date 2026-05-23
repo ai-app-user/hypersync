@@ -76,6 +76,7 @@ use_cases:
     notes:
       - "The small hot path is the current known-good generator pipeline."
       - "Use saved_replay_source_url when testing the generator against the captured whole-source profile, rather than the default synthetic distribution."
+      - "Folder-ready NFS packed writes default to direct-submit, 64 reactors, window 64, and 8 folder-creation threads because those are the recorded best/default generator settings."
       - "Independent small and large generator lanes proved higher aggregate hardware headroom, but integrated mixed mode remains the production-realistic target."
 
   copy:
