@@ -2346,3 +2346,32 @@ logical size: 335.99 TB
   - 60s/deep-ready-queue rerun with `--max-files-queued 500000`: `1,785,801` files, `628.86 GB`, zero failures, `62.50s`, `80.49 Gbit/s`, `25.36K small files/s`. The deep queue caused a long initial staging delay and is not the current best path.
   - Status: improved from the previous bad mixed rerun (`129.42 Gbit/s`) but still below the recorded `189.47 Gbit/s` / `61.8K small files/s` mixed gate. Mixed remains a real regression to investigate.
 - Development build bumped to `hypersync 0.0.4.4` for this documentation commit; the tested deployed binary remains `0.0.4.3`.
+
+## 2026-05-23 - Longer Regression Gate Runs After agnopo Reboot
+
+- Development build under test remained deployed `hypersync 0.0.4.3`; `0.0.4.4` was documentation-only.
+- Preflight: agnopo `hypersync tuning --iface ens3 --peer 172.27.255.2` still reported `mismatches=0`.
+- Longer WAN transport gate:
+  - `64` shared-nothing lanes, `1 MiB` buffers.
+  - `8192` buffers/lane (`512 GiB` total): sender reported completion, but receiver did not exit cleanly and had to be killed. Do not count sender-side `237.73 Gbit/s`; receiver truth was unavailable.
+  - `4096` buffers/lane (`256 GiB` total): sender reported completion, receiver failed with `recv failed: Connection reset by peer`.
+  - Status: long shared-nothing transport has a correctness/stability regression beyond the shorter `128 GiB` gate. Investigate sender close/reset or receiver EOF handling before using long transport runs as a copy baseline.
+- Longer NFS read gate:
+  - Source: `nfs://172.27.255.2-172.27.255.17/volumes/8ed98ee4-b263-4319-be97-2093377beb65/regress-mixed-0043-20260523T191430Z`.
+  - Pipeline: `[MetaReader-NFS-8]->(FileQueue)->[DataReader-NFS-112]->(DataBufQueue)->[BufferDiscarder]`.
+  - Samples: `183.18 Gbit/s` at 10s, `189.16 Gbit/s` at 20s.
+  - Final: `624.65 GB` read in `26.79s`, `186.50 Gbit/s`, `65.34K files/s`, zero failures.
+  - Status: read gate is recovered on a large enough tree and is back in the historical `~190 Gbit/s` band.
+- Longer small-only NFS write gate:
+  - Source: saved profile with `payload=prng&files-per-batch=1024`, filtered with `--max-file-size-bytes 131072`.
+  - Pipeline: `[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue)->[FolderCreation-NFS-8]->(ReadyFileQueue)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]`.
+  - Samples: `80.39K files/s` at 10s, `82.52K files/s` at 20s, `83.02K files/s` at 30s.
+  - Final: `2,499,811` files, `156.52 GB`, zero failures, `30.25s`, `82.63K files/s`, `41.39 Gbit/s`.
+  - Status: small-only writer gate is recovered and stable over a longer run.
+- Longer mixed NFS write gate:
+  - Source: saved profile with `payload=prng&files-per-batch=1024`, current/default queue shape.
+  - Pipeline: `[MetaReader-SYN-96]->[FolderCreation-NFS-8]->[ReadyClassifier+Spillway+Governor]->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64] + medium/large governed lanes`.
+  - Samples: `154.65 Gbit/s` at 30s, `155.09 Gbit/s` at 60s, `154.69 Gbit/s` at 90s.
+  - Final: `5,370,987` files, `1.768 TB`, zero failures, `92.82s`, `152.38 Gbit/s`, `52.02K small files/s`.
+  - Status: mixed is stable but still regressed versus the historical `189.47 Gbit/s` / `61.8K small files/s` gate. Longer runtime does not warm up into the old band; it plateaus near `155 Gbit/s`.
+- Development build bumped to `hypersync 0.0.4.5` for this documentation commit; the tested deployed binary remains `0.0.4.3`.
