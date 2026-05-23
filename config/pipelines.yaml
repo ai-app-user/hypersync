@@ -8,12 +8,134 @@
 # Display convention:
 #   [Job-threads/options]->(Queue-shards/depth)->[Job-threads/options]
 #
+# Composition notation:
+#   [JobName-N/options]       concrete job instance
+#   (QueueName-N/options)     concrete queue or queue family
+#   {PipelineName}            reusable pipeline block with inputs, outputs,
+#                             configuration, and named variations
+#   {{ScenarioName}}          user-facing or benchmark scenario composed from
+#                             pipelines, jobs, and queues
+#
 # Backend suffixes:
 #   NFS: libnfs-backed remote filesystem
 #   SYN: synthetic/profile replay backend
 #   FS: local filesystem backend, not fully implemented yet
 
-version: 1
+version: 2
+
+pipelines:
+  MetaReader:
+    inputs:
+      - "source root(s)"
+    outputs:
+      - "(MetaQueue)"
+      - "(FileQueue) when file records are needed downstream"
+      - "(FolderReadyQueue) when target folder readiness is required"
+    variations:
+      NFS: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-NFS-N]"
+      SYN: "[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-N]"
+      FS: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-FS-N]"
+    description: "Walks source namespace and emits metadata/folder/file records."
+
+  MetaWriter:
+    inputs:
+      - "(MetaQueue)"
+      - "(DiffResultQueue)"
+    outputs:
+      - "summary counters"
+      - "csv/parquet/db partitions"
+    variations:
+      stats_only: "[MetadataStatsDiscarder-1]"
+      partitioned_db: "[MetadataRecordWriter-32]"
+      diff_results: "[DiffWriter-1]"
+      target_metadata: "[MetaWriter-NFS-N]"
+    description: "Consumes metadata or diff records and writes stats, DB/parquet/text output, or target metadata changes."
+
+  DataReader:
+    inputs:
+      - "(FileQueue)"
+      - "(ReadyFileQueue)"
+    outputs:
+      - "(DataBufQueue)"
+      - "direct submit into {DataWriter} for packed small-file NFS writes"
+    variations:
+      NFS: "[DataReader-NFS-N]"
+      SYN: "[DataReader-SYN-N]"
+      FS: "[DataReader-FS-N]"
+    description: "Reads or generates payload buffers."
+
+  Hasher:
+    inputs:
+      - "(DataBufQueue)"
+    outputs:
+      - "(HashResultQueue)"
+      - "(MetaQueue) with hash fields"
+    variations:
+      content_hash: "[DataHasher-N]"
+      sampled_profile_hash: "[DataHasher-N sampled]"
+    description: "Computes content hashes for scan recording, diff comparison, copy verification, or sampled profile validation."
+
+  FolderCreation:
+    inputs:
+      - "(FolderReadyQueue)"
+    outputs:
+      - "(ReadyFileQueue)"
+      - "(SmallReadyFileQueue)/(MediumReadyFileQueue)/(LargeReadyFileQueue) when followed by classification"
+    variations:
+      NFS: "[FolderCreation-NFS-N]"
+      FS: "[FolderCreation-FS-N]"
+      null: "[FolderCreation-NULL-N]"
+    description: "Creates target directories and releases file work only after parent readiness is acknowledged."
+
+  ReadyClassifier:
+    inputs:
+      - "(ReadyFileQueue)"
+    outputs:
+      - "(SmallReadyFileQueue)"
+      - "(MediumReadyFileQueue)"
+      - "(LargeReadyFileQueue)"
+      - "MediumSpillway/LargeSpillway"
+    variations:
+      generator_mixed: "[ReadyClassifier+Spillway+Governor]"
+      target_copy: "[ReadyClassifier-NFS-1 x lanes]"
+    description: "Classifies ready files by size and routes them to priority lanes without blocking the small-file hot path."
+
+  DataWriter:
+    inputs:
+      - "(DataBufQueue)"
+      - "(SmallReadyFileQueue) via direct-submit/reactor path"
+    outputs:
+      - "target files"
+      - "write counters/failures"
+    variations:
+      nfs_reactor_small: "[DataWriter-NFS/reactors=64 window=64]"
+      nfs_bulk: "[DataWriter-NFS-N]"
+      null: "[DataWriter-NULL-N]"
+    description: "Writes payload buffers to the target backend or discards them for isolation."
+
+  Transport:
+    inputs:
+      - "(DataBufQueue)"
+      - "(MetaQueue)"
+    outputs:
+      - "remote queue frames"
+    variations:
+      buffer_stream: "[BufferSender-1 x lanes]->TCP->[BufferReceiver-1 x lanes]"
+      shared_nothing: "[DirectSocketGeneratorSender-1 x lanes]->TCP->[DirectSocketReceiverDiscard-1 x lanes]"
+      priority_copy: "[PrioritySocket]+[DataSocket]"
+    description: "Moves opaque buffers between processes or hosts."
+
+  Profiler:
+    inputs:
+      - "(MetaQueue)"
+      - "(SampleFileQueue)"
+    outputs:
+      - "profile file"
+      - "optional sampled data latency file"
+    variations:
+      metadata: "[ProfileAccumulator-1]"
+      data_sampling: "[ProfileSampler-1]->(SampleFileQueue)->[DataReader-<backend>-N]->[LatencyAccumulator-1]"
+    description: "Builds compact replay profiles from metadata and sampled data-read observations."
 
 global_options:
   hashing:
@@ -29,9 +151,10 @@ global_options:
       generator: "Usually none; can generate deterministic payload hashes for verification tests."
 
 use_cases:
-  scan:
+  Scanner:
     status: "supported"
     purpose: "Scan filesystem metadata; report files, folders, bytes, rates, and optionally persist records in DB/parquet."
+    conceptual: "{{Scanner}}: {MetaReader}->(MetaQueue)->{MetaWriter}"
     primary_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(MetadataBufQueue)->[MetadataRecordWriter-32]"
     stats_only_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(MetadataBufQueue)->[MetadataStatsDiscarder-1]"
     output_options:
@@ -40,24 +163,40 @@ use_cases:
       - "csv/parquet/db"
     hash_option: "If hashes are requested, scan adds a data-read/hash side path and records hash columns with metadata."
 
-  diff:
+  Hash-Scanner:
+    status: "supported by composition; hash cost depends on source/backend"
+    purpose: "Scan metadata and record content hashes for later comparison or audit."
+    conceptual: "{{Hash-Scanner}}: {MetaReader}->(MetaQueue)->{DataReader}->{Hasher}->{MetaWriter}"
+    primary_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(FileQueue)->[DataReader-<backend>-N]->(DataBufQueue)->[DataHasher-N]->(MetadataBufQueue)->[MetadataRecordWriter-32]"
+    hash_option: "Required; hash algorithm and block/file mode are scenario parameters."
+
+  Diff:
     status: "supported, still performance-tuned by scenario"
     purpose: "Compare local and remote filesystems; optionally persist same/changed/source-only/target-only results."
+    conceptual: "{{Diff}}: {MetaReader/source}+{MetaReader/target}->{DiffChecker}->{MetaWriter/diff-results}"
     live_pipeline: "[SourceMetaReader-<backend>-N]->(SourceMetadataQueue)->[DiffChecker-N]<-(TargetMetadataQueue)<-[TargetMetaReader-<backend>-N]->(DiffResultQueue)->[DiffWriter-1]"
     indexed_pipeline: "[SourceIndexReader-1]+[TargetIndexReader-1]->[DiffChecker-N]->(DiffResultQueue)->[DiffWriter-1]"
     hash_option: "Hash compare inserts [DataReader-<backend>]->[DataHasher] for files requiring content verification."
 
-  profile:
+  Hash-Diff:
+    status: "supported by composition; performance-tuned by scenario"
+    purpose: "Compare filesystems and use content hashes when metadata is insufficient or policy requires it."
+    conceptual: "{{Hash-Diff}}: {{Diff}} + changed/unknown candidates->{DataReader}->{Hasher}->{DiffChecker}->{MetaWriter/diff-results}"
+    hash_option: "Required for candidate files selected by compare policy."
+
+  Profile:
     status: "supported for metadata; sampled data profiling added"
     purpose: "Create compact profiles summarizing phases, folder topology, sizes, metadata latency, and sampled read latency."
+    conceptual: "{{Profile}}: {MetaReader}->{Profiler/metadata} + optional {DataReader}->{Profiler/data-sampling}"
     metadata_pipeline: "[FolderSeeder-1]->(FolderQueue)->[MetaReader-<backend>-N]->(ProfileAccumulator-1)->(ProfileOutput)"
     data_sampling_pipeline: "[ProfileSampler-1]->(SampleFileQueue)->[DataReader-<backend>-N]->[LatencyAccumulator-1]"
     phase_rule: "Default phase boundary is one phase per configured file-count block; production profiles commonly use 100M files per phase."
     hash_option: "Optional sampled hashes may be recorded, but profiles should stay compact and reproducible."
 
-  generator:
+  Generator:
     status: "active performance target"
     purpose: "Create synthetic filesystems, optionally replaying a recorded profile, and use this for writer and pipeline validation."
+    conceptual: "{{Generator}}: {MetaReader-SYN}->{FolderCreation}->{ReadyClassifier?}->{DataReader-SYN}->{DataWriter-target}"
     saved_replay_profile: "doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt"
     saved_replay_source_url: "synthetic-profile://doc/profiles/source-nfs-whole-100mphase-data-sampled-20260517T200342Z.profile.txt?payload=prng&files-per-batch=1024"
     small_file_hot_pipeline: "[FolderSeeder/MetaWork-1]->(FolderQueue)->[MetaReader-SYN-96]->(FolderReadyQueue-4096)->[FolderCreation-NFS-8]->(ReadyFileQueue-500000)->[DataReader-SYN-768/direct-submit]->[DataWriter-NFS/reactors=64 window=64]"
@@ -79,9 +218,10 @@ use_cases:
       - "Folder-ready NFS packed writes default to direct-submit, 64 reactors, window 64, and 8 folder-creation threads because those are the recorded best/default generator settings."
       - "Independent small and large generator lanes proved higher aggregate hardware headroom, but integrated mixed mode remains the production-realistic target."
 
-  copy:
+  Copy:
     status: "NFS-to-NFS copy-all acceptance passed; async queue-native source/target commands added; sync/diff copy still in progress"
     purpose: "Copy, sync, or merge source filesystem content into a target filesystem."
+    conceptual: "{{Copy}}: {MetaReader/source}->{FolderCreation/target} + {DataReader/source}->{Transport}->{DataWriter/target}"
     copy_all_acceptance_pipeline: "[SourceMetaReader-NFS]->(PrioritySocket)->[ReceiverMetaWriter-NFS] + [SourceDataReader-NFS]->(DataSocket)->[ReceiverDataWriter-NFS]"
     async_copy_source_pipeline: "[MetaReader-NFS-N]->(FileQueue)->[DataReader-NFS-N]->(DataBufQueue-D x lanes)->[BufferSender-1 x lanes]"
     async_copy_target_pipeline: "[BufferReceiver-1 x lanes]->(DataBufQueue-D x lanes)->[DataWriter-NFS-1 x lanes]"
@@ -94,6 +234,13 @@ use_cases:
       - "2026-05-20 architecture correction: new `copy-source` and `copy-target` commands bypass legacy `copy` and bridge DataBuffer queues over N TCP lanes. This is now the path to tune for high-throughput copy."
       - "Remote NFS large-file copy must stream chunks from NFS into transfer buffers; never materialize whole large source files into FileSpec::content."
       - "Sync should reuse diff results to copy only source-only or changed files, with optional hash comparison when metadata is insufficient."
+
+  Sync:
+    status: "planned/in progress"
+    purpose: "Diff source and target, then copy only source-only or changed files according to policy."
+    conceptual: "{{Sync}}: {{Diff or Hash-Diff}}->(DeltaQueue)->{{Copy/delta-only}}"
+    intended_pipeline: "[MetaReader-source]+[MetaReader-target]->[DiffChecker]->(DeltaQueue)->[DataReader-source]->(DataBufQueue)->[DataWriter-target]"
+    hash_option: "Optional or mandatory depending on compare policy."
 
 test_pipelines:
   metadata_generator_discard:

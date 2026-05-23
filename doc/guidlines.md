@@ -38,6 +38,14 @@ This document defines general development principles for the application. It sho
   pipelines/status output (`-NFS`, `-SYN`, `-FS`). Backend-specific behavior
   belongs in backend adapters selected by the source URL, not in separate
   pipeline job classes for each backend.
+- Use a three-level pipeline vocabulary in documentation and configuration:
+  `[JobName-N/options]` for concrete jobs, `(QueueName-N/options)` for concrete
+  queues, `{PipelineName}` for reusable pipeline blocks with declared inputs,
+  outputs, configuration, and variations, and `{{ScenarioName}}` for full
+  user-facing or benchmark scenarios composed from pipelines, jobs, and queues.
+- Describe scenarios conceptually first with `{Pipeline}` names, then expand to
+  concrete jobs/queues for implementation, debugging, performance gates, and
+  deployment notes.
 - Keep command behavior stable enough for automation.
 - Add configuration only when it has a clear operational purpose.
 - Keep defaults safe for small local tests, with explicit options for high-performance runs.

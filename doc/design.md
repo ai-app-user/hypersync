@@ -43,6 +43,45 @@ using a private non-queue side channel must be converted into normal Jobs or
 removed. Compatibility flags may remain only as aliases for the compliant
 pipeline topology.
 
+#### 0.1.1 Jobs, Queues, Pipelines, and Scenarios
+
+Hypersync diagrams must distinguish concrete implementation from conceptual
+workflow names:
+
+- `[JobName-N/options]` is a concrete job instance. `N` is the worker count,
+  reactor count, lane count, or other concurrency value shown by that job.
+- `(QueueName-N/options)` is a concrete queue or queue family. If `N` is depth,
+  shard count, or lane count, the diagram or surrounding text must make that
+  clear.
+- `{PipelineName}` is a named, reusable pipeline block. It has input(s),
+  output(s), configuration, and variations, but it expands into normal jobs and
+  queues. A pipeline is composition, not a new execution primitive.
+- `{{ScenarioName}}` is a user-facing or benchmark use case composed from
+  pipelines, jobs, and queues.
+
+This lets us describe workflows at the right level. For example:
+
+```text
+{{Scanner}}      : {MetaReader}->(MetaQueue)->{MetaWriter}
+{{Hash-Scanner}} : {MetaReader}->(MetaQueue)->[DataReader]->{Hasher}->{MetaWriter}
+```
+
+`{MetaReader}` may expand differently for NFS, synthetic replay, or local FS,
+but the scenario remains readable. When tuning or debugging, expand the
+pipeline:
+
+```text
+{MetaReader-NFS} = [FolderSeeder-1]->(FolderQueue)->[MetaReader-NFS-96]
+```
+
+Pipeline variations must be named in design or config. Examples:
+`{MetaWriter/stats-only}`, `{MetaWriter/partitioned-parquet}`,
+`{DataWriter-NFS/small-reactor}`, and `{Transport/shared-nothing}`.
+
+The expanded graph is authoritative for implementation. A scenario or pipeline
+name must not hide direct calls between jobs, private non-queue side channels,
+or unbounded buffers.
+
 ### 0.2 Queues Carry Ownership, Not Bytes
 
 Queues store only buffer handles. A queue does not store file records, paths,
