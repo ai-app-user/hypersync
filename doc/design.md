@@ -239,6 +239,23 @@ that host is `transfer1`.
 - If the primary Linux host changes, update this section and record the change
   in performance notes before comparing benchmark results.
 
+### 0.8.1 Project Boundaries
+
+Hypersync is the product and scenario layer. It composes jobs into user-facing
+scenarios, owns CLI commands, profiler policy, scan/diff/copy/sync behavior,
+performance gates, and product configuration.
+
+Reusable lower layers live in sibling projects:
+
+- Piper owns generic pipeline infrastructure: buffer pools, queues, generic
+  jobs, transport helpers, monitoring, and autoscaling.
+- Filer owns filesystem I/O jobs and backend adapters: metadata/data readers,
+  target metadata/data writers, and NFS/NULL backend mechanics.
+
+When a change is purely about filesystem read/write mechanics, prefer moving it
+into Filer. When a change is about how a product scenario combines those jobs,
+keep it in Hypersync.
+
 ### 0.9 Mandatory Generic Instrumentation
 
 Every production Job must be observable through the shared monitor vocabulary.

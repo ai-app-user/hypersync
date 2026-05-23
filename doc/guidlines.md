@@ -76,14 +76,19 @@ The repository should keep top-level concerns clear:
 - `piper/`: reusable asynchronous pipeline infrastructure. It owns generic
   buffer pools, queues, generic job base classes, generic buffer jobs,
   transport helpers, config parsing, and helper monitoring code.
+- `filer/`: reusable filesystem I/O jobs and backend adapters. It owns
+  filesystem metadata/data reader jobs, target metadata/data writer jobs, and
+  NFS/NULL backend mechanics.
 - `hypersync/`: the WSync/Hypersync product. It owns NFS backends, metadata
-  schemas, hashing/sync/copy/scanner jobs, CLI commands, product config,
-  product documentation, and integration/functional/performance tests.
-- `piper/src/` and `hypersync/src/`: production source code for each library or
-  product.
-- `piper/doc/` and `hypersync/doc/`: design, requirements, UX, and operational
-  documentation at the correct ownership boundary.
-- `piper/tests/` and `hypersync/tests/`: tests owned by each component.
+  schemas, hashing/sync/copy/scanner scenarios, profiler logic, CLI commands,
+  product config, product documentation, and integration/functional/performance
+  tests.
+- `piper/src/`, `filer/src/`, and `hypersync/src/`: production source code for
+  each library or product.
+- `piper/doc/`, `filer/doc/`, and `hypersync/doc/`: design, requirements, UX,
+  and operational documentation at the correct ownership boundary.
+- `piper/tests/`, `filer/tests/`, and `hypersync/tests/`: tests owned by each
+  component.
 - `hypersync/config/`: default and example product configuration files.
 - `build/`: generated build output only; never source-of-truth content.
 

@@ -20,6 +20,11 @@
 #   NFS: libnfs-backed remote filesystem
 #   SYN: synthetic/profile replay backend
 #   FS: local filesystem backend, not fully implemented yet
+#
+# Project ownership:
+#   Piper: generic jobs, queues, buffer pools, transport, monitoring
+#   Filer: filesystem I/O jobs/backends such as MetaReader/DataReader/DataWriter
+#   Hypersync: scenarios, profiler policy, diff/copy/sync commands, product config
 
 version: 2
 

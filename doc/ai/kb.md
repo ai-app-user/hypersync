@@ -2375,3 +2375,22 @@ logical size: 335.99 TB
   - Final: `5,370,987` files, `1.768 TB`, zero failures, `92.82s`, `152.38 Gbit/s`, `52.02K small files/s`.
   - Status: mixed is stable but still regressed versus the historical `189.47 Gbit/s` / `61.8K small files/s` gate. Longer runtime does not warm up into the old band; it plateaus near `155 Gbit/s`.
 - Development build bumped to `hypersync 0.0.4.5` for this documentation commit; the tested deployed binary remains `0.0.4.3`.
+
+## 2026-05-23 - Filer Project Extraction
+
+- Created a new sibling GitHub project: `ai-app-user/filer`.
+  - Repository URL: `https://github.com/ai-app-user/filer`.
+  - Branch: `dev`.
+  - Purpose: reusable filesystem I/O jobs and backend adapters.
+- First extraction moved filesystem-facing jobs and backend mechanics out of Hypersync and into Filer:
+  - `core/nfs_backend.*`
+  - `jobs/data_writer/*`
+  - `jobs/nfs_data_reader/*`
+  - `jobs/nfs_meta_reader/*`
+- Profiler logic intentionally remains in Hypersync because it is product/scenario policy, not just a filesystem I/O job.
+- Shared record schemas, codecs, CLI commands, scenario registry, performance gates, and profiler output stay in Hypersync for now.
+- Root workspace build was updated locally to include `filer/src` between `piper/src` and `hypersync/src`; local build passed and reported `hypersync 0.0.4.7`.
+- Filer commits:
+  - `871fedd Initial Filer extraction`
+  - `7e978d1 Add Filer NFS backend core`
+- Hypersync development build bumped to `hypersync 0.0.4.7` for the project-boundary refactor.
