@@ -54,6 +54,10 @@ This document defines general development principles for the application. It sho
   files.
 - Move file payload buffers by ownership between jobs; do not copy data bytes into queue messages.
 - New hot-path pipeline jobs should consume and emit `BufferHandle` values through `BufQueue` and operate on `RawBufferPool` slots. Typed payload interpretation belongs at the element/view level only.
+- A job may have zero, one, or multiple buffer queues as inputs and zero, one,
+  or multiple buffer queues as outputs. Most jobs must treat buffers as opaque
+  bytes and avoid product-specific payload interpretation unless that is their
+  explicit responsibility.
 - Generic discard/sink behavior must use the generic buffer discarder. The
   discarder accepts opaque buffer handles from registered pools and must not
   become record-type-specific.
@@ -64,6 +68,17 @@ This document defines general development principles for the application. It sho
 - Treat buffer payloads as byte wire formats. Encode/decode multi-field
   payload headers with structured copy helpers such as `memcpy`; do not rely on
   reinterpreting byte arrays as aligned C++ structs.
+- Use Piper's generic buffer metadata footer when a raw buffer needs
+  self-description: the final two bytes are magic bytes, the two bytes before
+  that are metadata size including the magic, the two bytes before that are
+  metadata version, and the four bytes before that are logical data size.
+  Metadata can define checksum algorithm, data checksum, metadata checksum, and
+  packed sub-buffer descriptors. `checksum_algorithm=none` or checksum value
+  `0` means that checksum is not used.
+- Current buffer sizing convention is payload space plus metadata reserve, such
+  as `4KiB + 4KiB`, `128KiB + 4KiB`, and `1MiB + 4KiB`. The reserve exists so
+  external APIs can fill data first and later stages can attach metadata without
+  allocating or moving payload bytes.
 - Treat borrowed backend buffers as callback-lifetime data that must not cross job boundaries.
 - When a backend returns borrowed data, copy it at the backend boundary into an owned preallocated slot if another job must process it asynchronously.
 - Benchmark modes that intentionally skip copying payload bytes must be explicit, labeled as invalid for downstream consumers that inspect data, and limited to discard/performance isolation paths.

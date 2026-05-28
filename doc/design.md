@@ -260,6 +260,37 @@ When a change is purely about filesystem read/write mechanics, prefer moving it
 into Filer. When a change is about how a product scenario combines those jobs,
 keep it in Hypersync.
 
+### 0.8.2 Buffer Ownership and Self-Description
+
+Hypersync scenarios must preserve the generic buffer model from Piper. Jobs may
+have zero, one, or many input queues and zero, one, or many output queues, but
+queues move `BufferHandle` ownership rather than typed records or payload bytes.
+Most jobs should not inspect buffer contents.
+
+Raw buffers are preallocated for the process lifetime. Current high-volume
+buffer classes reserve extra metadata space beside payload data, for example:
+
+```text
+4KiB + 4KiB
+128KiB + 4KiB
+1MiB + 4KiB
+```
+
+When a raw buffer must describe its own logical payload, use Piper's generic
+buffer metadata footer. The final bytes are:
+
+```text
+[data_size:u32][metadata_version:u16][metadata_size:u16][magic:u16]
+```
+
+Metadata can define checksum algorithm, data checksum, metadata checksum, and
+packed sub-buffer descriptors. `checksum_algorithm=none` disables checksums;
+an individual checksum value of `0` means that checksum is not used. Metadata
+can also be copied immediately after logical data when reserve space allows a
+shrunk `[data][metadata]` view. Product meanings such as file, NFS, scan, diff,
+copy, sync, parquet, or profiler records must be layered above this generic
+format by codecs.
+
 ### 0.9 Mandatory Generic Instrumentation
 
 Every production Job must be observable through the shared monitor vocabulary.

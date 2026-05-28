@@ -2,6 +2,7 @@
 #define HYPERSYNC_HPP
 
 #include "common/buffer_pool.hpp"
+#include "common/buffer_format.hpp"
 #include "common/config.hpp"
 #include "common/filesystem_utils.hpp"
 #include "common/fixed_string.hpp"

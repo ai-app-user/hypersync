@@ -2752,6 +2752,62 @@ void test_content_hash_matches_standard_vectors_and_streaming_updates() {
     EXPECT_THROW(hypersync::parse_content_hash_algorithm("crc32"));
 }
 
+void test_buffer_metadata_footer_round_trip_and_checksums() {
+    RawBufferPool pool(91, 1, 4096 + 4096);
+    const BufferHandle handle = pool.acquire_wait();
+    std::byte* bytes = pool.data(handle);
+    const std::string payload = "abcdefghijklmnop";
+    std::memcpy(bytes, payload.data(), payload.size());
+
+    hypersync::BufferMetadataInfo info;
+    info.data_size = static_cast<std::uint32_t>(payload.size());
+    info.checksum_algorithm = hypersync::BufferChecksumAlgorithm::fnv1a64;
+    info.sub_buffers.push_back(hypersync::BufferSubBufferInfo{0, 8, 0, 0, 0, 7});
+    info.sub_buffers.push_back(hypersync::BufferSubBufferInfo{8, 8, 0, 0, 0, 11});
+
+    hypersync::write_buffer_metadata(bytes,
+                                     pool.buffer_size_bytes(),
+                                     info,
+                                     hypersync::BufferMetadataWriteOptions{true, true, true});
+
+    EXPECT_TRUE(hypersync::has_buffer_metadata(bytes, pool.buffer_size_bytes()));
+    EXPECT_TRUE(info.data_checksum != 0U);
+    EXPECT_TRUE(info.metadata_checksum != 0U);
+
+    const auto parsed = hypersync::read_buffer_metadata(bytes, pool.buffer_size_bytes());
+    EXPECT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->data_size, info.data_size);
+    EXPECT_EQ(parsed->version, hypersync::kBufferMetadataVersion);
+    EXPECT_EQ(parsed->checksum_algorithm, hypersync::BufferChecksumAlgorithm::fnv1a64);
+    EXPECT_EQ(parsed->data_checksum, info.data_checksum);
+    EXPECT_EQ(parsed->metadata_checksum, info.metadata_checksum);
+    EXPECT_EQ(parsed->sub_buffers.size(), std::size_t{2});
+    EXPECT_EQ(parsed->sub_buffers[0].offset, std::uint32_t{0});
+    EXPECT_EQ(parsed->sub_buffers[1].offset, std::uint32_t{8});
+    EXPECT_TRUE(hypersync::validate_buffer_metadata(bytes, pool.buffer_size_bytes(), *parsed));
+
+    const std::size_t metadata_size = hypersync::buffer_metadata_size_for_sub_buffers(parsed->sub_buffers.size());
+    EXPECT_EQ(std::memcmp(bytes + payload.size(), bytes + pool.buffer_size_bytes() - metadata_size, metadata_size), 0);
+
+    bytes[0] = static_cast<std::byte>('z');
+    EXPECT_FALSE(hypersync::validate_buffer_metadata(bytes, pool.buffer_size_bytes(), *parsed));
+    bytes[0] = static_cast<std::byte>('a');
+
+    hypersync::BufferMetadataInfo no_checksum;
+    no_checksum.data_size = 4;
+    no_checksum.checksum_algorithm = hypersync::BufferChecksumAlgorithm::none;
+    hypersync::write_buffer_metadata(bytes,
+                                     pool.buffer_size_bytes(),
+                                     no_checksum,
+                                     hypersync::BufferMetadataWriteOptions{true, true, true});
+    const auto parsed_no_checksum = hypersync::read_buffer_metadata(bytes, pool.buffer_size_bytes());
+    EXPECT_TRUE(parsed_no_checksum.has_value());
+    EXPECT_EQ(parsed_no_checksum->data_checksum, std::uint64_t{0});
+    EXPECT_EQ(parsed_no_checksum->metadata_checksum, std::uint64_t{0});
+
+    pool.release(handle);
+}
+
 void test_watermark_thresholds() {
     const auto low = hypersync::evaluate_watermarks(10.0, 10.0);
     EXPECT_FALSE(low.soft_throttle);
@@ -4633,7 +4689,7 @@ void test_main_cli_version_smoke() {
     const fs::path stdout_path = output.path / "version.txt";
 
     EXPECT_TRUE(command_succeeds(app + " --version > " + stdout_path.string() + " 2>&1"));
-    EXPECT_EQ(hypersync::read_file_contents(stdout_path), "hypersync 0.0.4.9\n");
+    EXPECT_EQ(hypersync::read_file_contents(stdout_path), "hypersync 0.0.4.10\n");
 }
 
 void test_main_cli_send_and_receive_smoke() {
@@ -5256,6 +5312,9 @@ int main(int argc, char** argv) {
         {"content_hash_matches_standard_vectors_and_streaming_updates",
          TestSuite::unit,
          test_content_hash_matches_standard_vectors_and_streaming_updates},
+        {"buffer_metadata_footer_round_trip_and_checksums",
+         TestSuite::unit,
+         test_buffer_metadata_footer_round_trip_and_checksums},
         {"watermark_thresholds", TestSuite::unit, test_watermark_thresholds},
         {"job_classes_exist_and_process_messages", TestSuite::unit, test_job_classes_exist_and_process_messages},
         {"metadata_stats_discarder_drops_records_and_reports_totals",
