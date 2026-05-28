@@ -6,7 +6,6 @@
 
 #include "common/config.hpp"
 #include "common/path_utils.hpp"
-#include "jobs/job.hpp"
 
 namespace hypersync {
 
@@ -50,33 +49,6 @@ void MetadataStatsDiscarder::start() {
 void MetadataStatsDiscarder::stop() {
     std::lock_guard<std::mutex> lock(mutex_);
     running_ = false;
-}
-
-bool MetadataStatsDiscarder::pull(JobMessage& out) {
-    out = {};
-    return false;
-}
-
-void MetadataStatsDiscarder::push_back(JobMessage message) {
-    if (message.kind == message_kinds::folder_record) {
-        record_folder(message_as<FolderRecord>(message).rel_path);
-        return;
-    }
-    if (message.kind != message_kinds::file_record) {
-        throw std::logic_error("job metadata_stats_discarder does not accept message kind " + message.kind);
-    }
-    discard_record(message_as<RecBuf>(message));
-}
-
-JobStats MetadataStatsDiscarder::stats() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    JobStats result;
-    result.name = "metadata_stats_discarder";
-    result.primary_message_kind = message_kinds::file_record;
-    result.running = running_;
-    result.accepted = accepted_;
-    result.deferred = discarded_;
-    return result;
 }
 
 void MetadataStatsDiscarder::discard_record(const RecBuf& record) {
@@ -185,6 +157,16 @@ MetadataStatsSnapshot MetadataStatsDiscarder::snapshot() const {
     result.records_per_second = elapsed > 0.0 ? static_cast<double>(accepted_) / elapsed : 0.0;
     result.files_per_second = elapsed > 0.0 ? static_cast<double>(result.files_found) / elapsed : 0.0;
     return result;
+}
+
+bool MetadataStatsDiscarder::running() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return running_;
+}
+
+std::size_t MetadataStatsDiscarder::accepted_records() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return accepted_;
 }
 
 const MetadataStatsDiscarderConfig& MetadataStatsDiscarder::config() const {

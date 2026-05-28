@@ -1,9 +1,10 @@
 #ifndef HYPERSYNC_JOBS_CHECKER_HPP
 #define HYPERSYNC_JOBS_CHECKER_HPP
 
+#include <optional>
+
 #include "common/scan_index.hpp"
 #include "common/types.hpp"
-#include "jobs/queue_job.hpp"
 
 #include <cstddef>
 
@@ -26,20 +27,22 @@ struct CheckerConfig {
 
 [[nodiscard]] CheckerConfig load_checker_config(const ConfigStore& config);
 
-class Checker : public TypedQueueJob<RecBuf> {
+class Checker {
 public:
     explicit Checker(CheckerConfig config = {});
 
     void bind_scans(const ScanIndex* source_scan, const ScanIndex* target_scan);
     [[nodiscard]] bool should_skip(const RecBuf& record) const;
-    void queue_checked_record(RecBuf record);
+    [[nodiscard]] std::optional<RecBuf> checked_record(RecBuf record);
 
     [[nodiscard]] const CheckerConfig& config() const;
+    [[nodiscard]] std::size_t deferred_records() const;
 
 private:
     CheckerConfig config_;
     const ScanIndex* source_scan_ = nullptr;
     const ScanIndex* target_scan_ = nullptr;
+    std::size_t deferred_records_ = 0;
 };
 
 }  // namespace hypersync

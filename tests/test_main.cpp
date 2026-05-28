@@ -68,8 +68,6 @@ using hypersync::FileState;
 using hypersync::FolderRecord;
 using hypersync::FolderState;
 using hypersync::InputProvider;
-using hypersync::JobMessage;
-using hypersync::JobStats;
 using hypersync::MetadataFolderRecord;
 using hypersync::MetadataBufferRecordKind;
 using hypersync::MetadataRecordFormat;
@@ -2832,34 +2830,22 @@ void test_watermark_thresholds() {
 }
 
 void test_job_classes_exist_and_process_messages() {
-    EXPECT_EQ(std::string(hypersync::message_kinds::folder_record), "folder_record");
-    EXPECT_EQ(std::string(hypersync::message_kinds::file_record), "file_record");
-    EXPECT_EQ(std::string(hypersync::message_kinds::data_chunk), "data_chunk");
-    EXPECT_EQ(std::string(hypersync::message_kinds::file_snapshot), "file_snapshot");
-
     FolderRecord folder;
     folder.rel_path = "root";
     InputProvider provider({1, 100, 128, "input.csv", "overflow.csv"});
-    provider.start();
-    provider.submit_folder(folder);
-    provider.submit_folder(FolderRecord{});
+    EXPECT_TRUE(provider.submit_folder(folder));
+    EXPECT_FALSE(provider.submit_folder(FolderRecord{}));
 
-    JobMessage message;
-    EXPECT_TRUE(provider.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::folder_record));
-    EXPECT_EQ(hypersync::message_as<FolderRecord>(message).rel_path, "root");
+    const auto provided_folder = provider.take_folder();
+    EXPECT_TRUE(provided_folder.has_value());
+    EXPECT_EQ(provided_folder->rel_path, std::string("root"));
     EXPECT_EQ(provider.overflow_entries(), 1U);
-    const JobStats provider_stats = provider.stats();
-    EXPECT_TRUE(provider_stats.running);
-    EXPECT_EQ(provider_stats.accepted, 1U);
-    EXPECT_EQ(provider_stats.deferred, 1U);
-    provider.stop();
+    EXPECT_EQ(provider.accepted_entries(), 1U);
 
     NfsMetaReader meta_reader;
-    meta_reader.start();
     meta_reader.begin_folder(folder);
     RecBuf rec = hypersync::make_recbuf({"root/file.txt", "payload", 9});
-    meta_reader.publish_record(rec);
+    meta_reader.record_file_seen();
     FolderRecord child_folder;
     child_folder.rel_path = "root/child";
     meta_reader.discover_child_folder(child_folder);
@@ -2867,9 +2853,6 @@ void test_job_classes_exist_and_process_messages() {
     EXPECT_EQ(meta_reader.files_seen(), 1U);
     EXPECT_EQ(meta_reader.folders_completed(), 1U);
     EXPECT_EQ(meta_reader.take_discovered_folders().size(), 1U);
-    EXPECT_TRUE(meta_reader.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::file_record));
-    meta_reader.stop();
 
     FileSpec skip_file{"root/file.txt", "payload", 9};
     ScanIndex source_scan;
@@ -2879,14 +2862,11 @@ void test_job_classes_exist_and_process_messages() {
     Checker checker;
     checker.bind_scans(&source_scan, &target_scan);
     EXPECT_TRUE(checker.should_skip(rec));
-    checker.queue_checked_record(rec);
-    EXPECT_TRUE(checker.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::file_record));
+    EXPECT_TRUE(checker.checked_record(rec).has_value());
 
     Checker discard_checker(CheckerConfig{true});
-    discard_checker.queue_checked_record(rec);
-    EXPECT_FALSE(discard_checker.pull(message));
-    EXPECT_EQ(discard_checker.stats().deferred, 1U);
+    EXPECT_FALSE(discard_checker.checked_record(rec).has_value());
+    EXPECT_EQ(discard_checker.deferred_records(), 1U);
 
     NfsDataReader data_reader({2, 256, 0, 8, 4, 8, 85.0, 70.0, "."});
     const FileSpec large_file{"root/large.bin", "abcdefghijklmnop", 10};
@@ -2894,18 +2874,14 @@ void test_job_classes_exist_and_process_messages() {
     EXPECT_EQ(chunks.size(), 2U);
     EXPECT_TRUE(data_reader.should_pause(90.0));
     EXPECT_TRUE(data_reader.should_resume(70.0));
-    data_reader.publish_file(large_file);
-    EXPECT_TRUE(data_reader.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::data_chunk));
 
-    DataChunk chunk = hypersync::message_as<DataChunk>(message);
+    DataChunk chunk = chunks.front();
     TempDir cache_dir("hypersync_cache_layer");
     DataCacher cacher({EndpointRole::sender, 85.0, 70.0, cache_dir.path.string(), 1, 1});
     EXPECT_TRUE(cacher.should_spill(85.0));
     EXPECT_TRUE(cacher.should_drain(70.0));
-    cacher.cache_chunk(chunk);
-    EXPECT_TRUE(cacher.pull(message));
-    EXPECT_TRUE(hypersync::message_as<DataChunk>(message).cached);
+    chunk = cacher.cache_chunk(chunk);
+    EXPECT_TRUE(chunk.cached);
     const auto cached_ids = cacher.cached_entries_for(chunk.trailer.file_id);
     EXPECT_EQ(cached_ids.size(), 1U);
     EXPECT_TRUE(fs::exists(cacher.cache_path_for(cached_ids.front())));
@@ -2932,34 +2908,24 @@ void test_job_classes_exist_and_process_messages() {
     EXPECT_EQ(cacher.cached_bytes(), 0ULL);
 
     DataSender sender({4, 1024, false});
-    sender.queue_chunk(chunk);
     EXPECT_EQ(sender.dispatch_connection(chunk), chunk.trailer.file_id % 4U);
-    EXPECT_TRUE(sender.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::data_chunk));
 
     DataReceiver receiver({8, 50.0});
     EXPECT_TRUE(receiver.should_refill(49.0));
-    receiver.receive_chunk(chunk);
-    EXPECT_TRUE(receiver.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::data_chunk));
 
     DataWriter writer;
     writer.predeclare_directory("root");
     EXPECT_TRUE(writer.known_directory("root"));
-    writer.queue_chunk(chunks.back());
+    const DataChunk processed_chunk = writer.process_chunk(chunks.back());
     EXPECT_EQ(writer.completed_files(), 1U);
-    EXPECT_TRUE(writer.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::data_chunk));
+    EXPECT_EQ(processed_chunk.trailer.rel_path, chunks.back().trailer.rel_path);
 
     ScanWriter scan_writer;
     const auto snapshot = scan_writer.snapshot_from_chunk(chunks.back());
     EXPECT_TRUE(snapshot.has_value());
-    scan_writer.record_chunk(chunks.back());
+    const auto recorded_snapshot = scan_writer.record_chunk(chunks.back());
+    EXPECT_TRUE(recorded_snapshot.has_value());
     EXPECT_EQ(scan_writer.rows_written(), 1U);
-    EXPECT_TRUE(scan_writer.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::file_snapshot));
-
-    EXPECT_THROW(provider.push_back(JobMessage{hypersync::message_kinds::file_record, RecBuf{}}));
 }
 
 void test_metadata_stats_discarder_drops_records_and_reports_totals() {
@@ -2968,14 +2934,11 @@ void test_metadata_stats_discarder_drops_records_and_reports_totals() {
 
     RecBuf first = hypersync::make_recbuf({"folder/a.txt", "abc", 10});
     RecBuf second = hypersync::make_recbuf({"folder/nested/b.bin", "012345", 11});
-    discarder.push_back(JobMessage{hypersync::message_kinds::file_record, first});
+    discarder.discard_record(first);
     discarder.discard_record(second);
     FolderRecord empty_folder;
     empty_folder.rel_path = "empty";
-    discarder.push_back(JobMessage{hypersync::message_kinds::folder_record, empty_folder});
-
-    JobMessage output;
-    EXPECT_FALSE(discarder.pull(output));
+    discarder.record_folder(empty_folder.rel_path);
 
     const auto snapshot = discarder.snapshot();
     EXPECT_EQ(snapshot.records_discarded, 2U);
@@ -2984,15 +2947,12 @@ void test_metadata_stats_discarder_drops_records_and_reports_totals() {
     EXPECT_EQ(snapshot.logical_size_bytes, 9ULL);
     EXPECT_TRUE(snapshot.records_per_second >= 0.0);
 
-    const JobStats stats = discarder.stats();
-    EXPECT_TRUE(stats.running);
-    EXPECT_EQ(stats.accepted, 3U);
-    EXPECT_EQ(stats.deferred, 2U);
+    EXPECT_TRUE(discarder.running());
+    EXPECT_EQ(discarder.accepted_records(), 3U);
     discarder.stop();
 
     EXPECT_THROW(MetadataStatsDiscarder({true, 0, "stderr"}));
     EXPECT_THROW(MetadataStatsDiscarder({true, 5, "file"}));
-    EXPECT_THROW(discarder.push_back(JobMessage{hypersync::message_kinds::data_chunk, DataChunk{}}));
 }
 
 void test_threaded_job_rethrows_worker_failures_after_joining() {
@@ -3124,30 +3084,6 @@ void test_file_metadata_generator_feeds_metadata_writer() {
     const std::string csv = hypersync::read_file_contents(csv_path);
     EXPECT_TRUE(csv.find("file,synthetic/dir_00000000/file_000000000000.dat") != std::string::npos);
     EXPECT_TRUE(csv.find("folder,synthetic/dir_00000000") != std::string::npos);
-}
-
-void test_queue_job_accepts_custom_message_kinds_without_shared_header_changes() {
-    struct CustomPayload {
-        int number = 0;
-    };
-
-    class CustomJob : public hypersync::TypedQueueJob<CustomPayload> {
-    public:
-        CustomJob() : TypedQueueJob("custom_job", "custom.payload") {}
-
-        void publish_custom(CustomPayload payload) {
-            publish_item(std::move(payload));
-        }
-    };
-
-    CustomJob job;
-    job.start();
-    job.publish_custom({42});
-
-    JobMessage message;
-    EXPECT_TRUE(job.pull(message));
-    EXPECT_EQ(message.kind, "custom.payload");
-    EXPECT_EQ(hypersync::message_as<CustomPayload>(message).number, 42);
 }
 
 void test_spsc_ring_preserves_order_and_handles_cross_thread_transfer() {
@@ -3588,21 +3524,21 @@ void test_nfs_jobs_use_backend_for_local_sources() {
     const auto scanned = meta_reader.scan_tree();
     EXPECT_EQ(scanned.size(), 3U);
     EXPECT_FALSE(meta_reader.using_async_backend());
-    meta_reader.publish_tree();
-
-    JobMessage message;
-    EXPECT_TRUE(meta_reader.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::file_record));
-    EXPECT_TRUE(meta_reader.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::file_record));
-    EXPECT_TRUE(meta_reader.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::file_record));
+    std::vector<RecBuf> streamed_records;
+    std::vector<FolderRecord> streamed_folders;
+    meta_reader.visit_tree(
+        [&](RecBuf record) { streamed_records.push_back(std::move(record)); },
+        [&](FolderRecord folder) { streamed_folders.push_back(std::move(folder)); });
+    EXPECT_EQ(streamed_records.size(), 3U);
 
     NfsMetaReader flat_reader({1, 1'000'000, 1'000'000, true, source.path.string(), true});
     FolderRecord active_folder;
     active_folder.rel_path = "sub";
     flat_reader.begin_folder(active_folder);
-    flat_reader.publish_tree();
+    std::vector<RecBuf> flat_records;
+    flat_reader.visit_tree(
+        [&](RecBuf record) { flat_records.push_back(std::move(record)); },
+        [&](FolderRecord folder) { streamed_folders.push_back(std::move(folder)); });
     EXPECT_EQ(flat_reader.files_seen(), 1U);
     EXPECT_EQ(flat_reader.folders_completed(), 1U);
     const auto completed_folder = flat_reader.active_folder();
@@ -3612,9 +3548,8 @@ void test_nfs_jobs_use_backend_for_local_sources() {
     const auto child_folders = flat_reader.take_discovered_folders();
     EXPECT_EQ(child_folders.size(), 1U);
     EXPECT_EQ(child_folders.front().rel_path, "sub/deeper");
-    EXPECT_TRUE(flat_reader.pull(message));
-    EXPECT_EQ(hypersync::message_as<RecBuf>(message).rel_path.view(), std::string_view("sub/b.bin"));
-    EXPECT_FALSE(flat_reader.pull(message));
+    EXPECT_EQ(flat_records.size(), 1U);
+    EXPECT_EQ(flat_records.front().rel_path.view(), std::string_view("sub/b.bin"));
 
     NfsDataReader data_reader({2, 256, 0, 8, 4, 8, 85.0, 70.0, source.path.string()});
     EXPECT_FALSE(data_reader.using_async_backend());
@@ -3623,9 +3558,7 @@ void test_nfs_jobs_use_backend_for_local_sources() {
     EXPECT_EQ(data_reader.read_file_bytes(loaded), 10ULL);
     const auto chunks = data_reader.read_file("sub/b.bin");
     EXPECT_EQ(chunks.size(), 2U);
-    data_reader.publish_path("a.txt");
-    EXPECT_TRUE(data_reader.pull(message));
-    EXPECT_EQ(message.kind, std::string(hypersync::message_kinds::data_chunk));
+    EXPECT_EQ(data_reader.read_file("a.txt").size(), 1U);
 }
 
 void test_phase1_runtime_transfers_directory_over_tcp() {
@@ -4689,7 +4622,7 @@ void test_main_cli_version_smoke() {
     const fs::path stdout_path = output.path / "version.txt";
 
     EXPECT_TRUE(command_succeeds(app + " --version > " + stdout_path.string() + " 2>&1"));
-    EXPECT_EQ(hypersync::read_file_contents(stdout_path), "hypersync 0.0.4.10\n");
+    EXPECT_EQ(hypersync::read_file_contents(stdout_path), "hypersync 0.0.4.11\n");
 }
 
 void test_main_cli_send_and_receive_smoke() {
@@ -5329,9 +5262,6 @@ int main(int argc, char** argv) {
         {"file_metadata_generator_feeds_metadata_writer",
          TestSuite::unit,
          test_file_metadata_generator_feeds_metadata_writer},
-        {"queue_job_accepts_custom_message_kinds_without_shared_header_changes",
-         TestSuite::unit,
-         test_queue_job_accepts_custom_message_kinds_without_shared_header_changes},
         {"spsc_ring_preserves_order_and_handles_cross_thread_transfer",
          TestSuite::unit,
          test_spsc_ring_preserves_order_and_handles_cross_thread_transfer},

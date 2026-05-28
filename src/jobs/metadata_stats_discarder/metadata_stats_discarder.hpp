@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/types.hpp"
-#include "jobs/job.hpp"
 
 namespace hypersync {
 
@@ -42,15 +41,12 @@ struct MetadataStatsSnapshot {
 
 [[nodiscard]] MetadataStatsDiscarderConfig load_metadata_stats_discarder_config(const ConfigStore& config);
 
-class MetadataStatsDiscarder : public Job {
+class MetadataStatsDiscarder {
 public:
     explicit MetadataStatsDiscarder(MetadataStatsDiscarderConfig config = {});
 
-    void start() override;
-    void stop() override;
-    bool pull(JobMessage& out) override;
-    void push_back(JobMessage message) override;
-    [[nodiscard]] JobStats stats() const override;
+    void start();
+    void stop();
 
     void discard_record(const RecBuf& record);
     void record_folder(std::string folder_path);
@@ -64,6 +60,8 @@ public:
     void print_snapshot() const;
 
     [[nodiscard]] MetadataStatsSnapshot snapshot() const;
+    [[nodiscard]] bool running() const;
+    [[nodiscard]] std::size_t accepted_records() const;
     [[nodiscard]] const MetadataStatsDiscarderConfig& config() const;
 
 private:

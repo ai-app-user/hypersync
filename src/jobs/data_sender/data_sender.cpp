@@ -20,11 +20,7 @@ DataSenderConfig load_data_sender_config(const ConfigStore& config) {
 }
 
 DataSender::DataSender(DataSenderConfig config)
-    : TypedQueueJob("data_sender", message_kinds::data_chunk), config_(std::move(config)) {}
-
-void DataSender::queue_chunk(DataChunk chunk) {
-    publish_item(std::move(chunk));
-}
+    : config_(std::move(config)) {}
 
 std::size_t DataSender::dispatch_connection(const DataChunk& chunk) const {
     if (config_.connection_count == 0) {

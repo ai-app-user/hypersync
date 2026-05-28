@@ -724,6 +724,10 @@ Prohibited hot-path behavior:
 - Combining multiple Job responsibilities in one worker because it is convenient for a command.
 
 Transitional utility types may exist for tests, configuration, command parsing, and backend adapters, but production pipeline edges must be buffer-handle queues.
+Legacy typed queue jobs and `std::any` job messages are removed from the active
+pipeline API; helper classes that still operate on `FileSpec`, `RecBuf`, or
+`DataChunk` are not pipeline jobs unless they are wrapped by a buffer-queue
+job boundary.
 
 ### 3.0.4 Runtime Monitoring
 

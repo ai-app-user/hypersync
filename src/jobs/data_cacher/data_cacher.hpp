@@ -10,7 +10,6 @@
 
 #include "common/slot_pool.hpp"
 #include "common/types.hpp"
-#include "jobs/queue_job.hpp"
 
 namespace hypersync {
 
@@ -35,11 +34,11 @@ struct DataCacherConfig {
 
 [[nodiscard]] DataCacherConfig load_data_cacher_config(const ConfigStore& config);
 
-class DataCacher : public TypedQueueJob<DataChunk> {
+class DataCacher {
 public:
     explicit DataCacher(DataCacherConfig config = {});
 
-    void cache_chunk(DataChunk chunk);
+    [[nodiscard]] DataChunk cache_chunk(DataChunk chunk);
     void cache_slot(const DataSlotPool& pool, const DataSlotHandle& handle);
     [[nodiscard]] bool should_spill(double ram_usage_percent) const;
     [[nodiscard]] bool should_drain(double ram_usage_percent) const;

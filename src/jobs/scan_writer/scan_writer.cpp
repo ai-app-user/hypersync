@@ -20,7 +20,7 @@ ScanWriterConfig load_scan_writer_config(const ConfigStore& config) {
 }
 
 ScanWriter::ScanWriter(ScanWriterConfig config)
-    : TypedQueueJob("scan_writer", message_kinds::file_snapshot), config_(std::move(config)) {}
+    : config_(std::move(config)) {}
 
 std::optional<FileSnapshot> ScanWriter::snapshot_from_chunk(const DataChunk& chunk) const {
     if ((chunk.trailer.flags & kFlagLastChunk) == 0U || (chunk.trailer.flags & kFlagHashValid) == 0U) {
@@ -42,14 +42,13 @@ std::optional<FileSnapshot> ScanWriter::snapshot_from_chunk(const DataChunk& chu
     return snapshot;
 }
 
-void ScanWriter::record_chunk(const DataChunk& chunk) {
+std::optional<FileSnapshot> ScanWriter::record_chunk(const DataChunk& chunk) {
     const auto snapshot = snapshot_from_chunk(chunk);
     if (!snapshot.has_value()) {
-        record_deferred();
-        return;
+        return std::nullopt;
     }
     ++rows_written_;
-    publish_item(*snapshot);
+    return snapshot;
 }
 
 std::size_t ScanWriter::rows_written() const {

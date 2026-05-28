@@ -18,11 +18,7 @@ DataReceiverConfig load_data_receiver_config(const ConfigStore& config) {
 }
 
 DataReceiver::DataReceiver(DataReceiverConfig config)
-    : TypedQueueJob("data_receiver", message_kinds::data_chunk), config_(std::move(config)) {}
-
-void DataReceiver::receive_chunk(DataChunk chunk) {
-    publish_item(std::move(chunk));
-}
+    : config_(std::move(config)) {}
 
 bool DataReceiver::should_refill(double pool_usage_percent) const {
     return pool_usage_percent < config_.refill_below_percent;

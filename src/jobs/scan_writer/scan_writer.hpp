@@ -5,7 +5,6 @@
 #include <optional>
 
 #include "common/types.hpp"
-#include "jobs/queue_job.hpp"
 
 namespace hypersync {
 
@@ -21,12 +20,12 @@ struct ScanWriterConfig {
 
 [[nodiscard]] ScanWriterConfig load_scan_writer_config(const ConfigStore& config);
 
-class ScanWriter : public TypedQueueJob<FileSnapshot> {
+class ScanWriter {
 public:
     explicit ScanWriter(ScanWriterConfig config = {});
 
     [[nodiscard]] std::optional<FileSnapshot> snapshot_from_chunk(const DataChunk& chunk) const;
-    void record_chunk(const DataChunk& chunk);
+    [[nodiscard]] std::optional<FileSnapshot> record_chunk(const DataChunk& chunk);
     [[nodiscard]] std::size_t rows_written() const;
     [[nodiscard]] const ScanWriterConfig& config() const;
 

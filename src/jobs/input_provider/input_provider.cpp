@@ -30,29 +30,47 @@ InputProviderConfig load_input_provider_config(const ConfigStore& config) {
 }
 
 InputProvider::InputProvider(InputProviderConfig config)
-    : TypedQueueJob("input_provider", message_kinds::folder_record), config_(std::move(config)) {}
+    : config_(std::move(config)) {}
 
-void InputProvider::submit_folder(FolderRecord folder) {
-    if (queue_depth() >= config_.max_queue_entries) {
+bool InputProvider::submit_folder(FolderRecord folder) {
+    if (ready_.size() >= config_.max_queue_entries) {
         overflow_.push_back(std::move(folder));
-        record_deferred();
-        return;
+        return false;
     }
-    publish_item(std::move(folder));
+    ready_.push_back(std::move(folder));
+    ++accepted_;
+    return true;
 }
 
 void InputProvider::submit_folders(const std::vector<FolderRecord>& folders) {
     for (const auto& folder : folders) {
-        submit_folder(folder);
+        (void)submit_folder(folder);
     }
+}
+
+std::optional<FolderRecord> InputProvider::take_folder() {
+    if (ready_.empty()) {
+        return std::nullopt;
+    }
+    FolderRecord folder = std::move(ready_.front());
+    ready_.erase(ready_.begin());
+    return folder;
 }
 
 const InputProviderConfig& InputProvider::config() const {
     return config_;
 }
 
+std::size_t InputProvider::accepted_entries() const {
+    return accepted_;
+}
+
 std::size_t InputProvider::overflow_entries() const {
     return overflow_.size();
+}
+
+std::size_t InputProvider::ready_entries() const {
+    return ready_.size();
 }
 
 const std::vector<FolderRecord>& InputProvider::overflow_queue() const {

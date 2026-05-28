@@ -104,9 +104,9 @@ DataCacherConfig load_data_cacher_config(const ConfigStore& config) {
 }
 
 DataCacher::DataCacher(DataCacherConfig config)
-    : TypedQueueJob("data_cacher", message_kinds::data_chunk), config_(std::move(config)) {}
+    : config_(std::move(config)) {}
 
-void DataCacher::cache_chunk(DataChunk chunk) {
+DataChunk DataCacher::cache_chunk(DataChunk chunk) {
     if (config_.cache_path.empty()) {
         throw std::runtime_error("cache path must not be empty");
     }
@@ -162,7 +162,7 @@ void DataCacher::cache_chunk(DataChunk chunk) {
         entries_[chunk.entry_id] = CacheEntry{path, chunk.trailer.file_id, bytes_on_disk};
         cached_bytes_ += bytes_on_disk;
     }
-    publish_item(std::move(chunk));
+    return chunk;
 }
 
 void DataCacher::cache_slot(const DataSlotPool& pool, const DataSlotHandle& handle) {

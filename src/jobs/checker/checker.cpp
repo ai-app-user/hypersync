@@ -31,7 +31,7 @@ CheckerConfig load_checker_config(const ConfigStore& config) {
 }
 
 Checker::Checker(CheckerConfig config)
-    : TypedQueueJob("checker", message_kinds::file_record), config_(std::move(config)) {}
+    : config_(std::move(config)) {}
 
 void Checker::bind_scans(const ScanIndex* source_scan, const ScanIndex* target_scan) {
     source_scan_ = source_scan;
@@ -53,16 +53,20 @@ bool Checker::should_skip(const RecBuf& record) const {
     return target_scan_->metadata_matches(record.rel_path, record.size, record.mtime);
 }
 
-void Checker::queue_checked_record(RecBuf record) {
+std::optional<RecBuf> Checker::checked_record(RecBuf record) {
     if (config_.discard_checked_records) {
-        record_deferred();
-        return;
+        ++deferred_records_;
+        return std::nullopt;
     }
-    publish_item(std::move(record));
+    return record;
 }
 
 const CheckerConfig& Checker::config() const {
     return config_;
+}
+
+std::size_t Checker::deferred_records() const {
+    return deferred_records_;
 }
 
 }  // namespace hypersync

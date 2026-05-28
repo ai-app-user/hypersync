@@ -4,7 +4,6 @@
 #include <cstddef>
 
 #include "common/types.hpp"
-#include "jobs/queue_job.hpp"
 
 namespace hypersync {
 
@@ -20,11 +19,10 @@ struct DataReceiverConfig {
 
 [[nodiscard]] DataReceiverConfig load_data_receiver_config(const ConfigStore& config);
 
-class DataReceiver : public TypedQueueJob<DataChunk> {
+class DataReceiver {
 public:
     explicit DataReceiver(DataReceiverConfig config = {});
 
-    void receive_chunk(DataChunk chunk);
     [[nodiscard]] bool should_refill(double pool_usage_percent) const;
     [[nodiscard]] const DataReceiverConfig& config() const;
 
